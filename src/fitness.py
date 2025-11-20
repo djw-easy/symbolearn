@@ -1,5 +1,7 @@
 import jax
 import optax
+import numpy as np
+from numba import njit
 import jax.numpy as jnp
 from joblib import wrap_non_picklable_objects
 
@@ -33,7 +35,8 @@ class Fitness(object):
 
     """
 
-    def __init__(self, function, greater_is_better):
+    def __init__(self, function, greater_is_better, name):
+        self.name = name
         self.function = function
         self.greater_is_better = greater_is_better
         self.sign = 1 if greater_is_better else -1
@@ -44,7 +47,8 @@ class Fitness(object):
 
 
 
-def mean_square_error(y, y_pred):
+@jax.jit
+def mean_square_error_jax(y, y_pred):
     """Calculate the mean square error."""
     return jnp.average(((y_pred - y) ** 2))
 
@@ -52,9 +56,10 @@ def mean_square_error(y, y_pred):
 
 _fitness_map = {
     # Regression
-    'mse': Fitness(function=mean_square_error, greater_is_better=False), 
+    'mse': Fitness(function=mean_square_error_jax, greater_is_better=False, name='mse'), 
     # Classification
-    'cross_entropy': Fitness(function=optax.softmax_cross_entropy_with_integer_labels, greater_is_better=False)
+    'cross_entropy': Fitness(function=optax.softmax_cross_entropy_with_integer_labels, 
+                             greater_is_better=False, name='cross_entropy')
 }
 
 

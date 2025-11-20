@@ -6,7 +6,7 @@ import numpy as np
 import math
 
 
-from src.node import Constant
+from src.node_jax import Constant
 from src.halloffame import HallOfFame
 from src.utils import check_random_state
 from src.expression import Expression, ExpressionSet

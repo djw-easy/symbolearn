@@ -1,5 +1,8 @@
-import jax.numpy as jnp
-from jax import jit
+import numpy as np
+import numpy.ma as ma
+from typing import Union, Optional, List
+from joblib import wrap_non_picklable_objects
+import random
 
 
 class NodeContent(object):
@@ -34,13 +37,13 @@ class DynamicAggregation(NodeContent):
     __slots__ = ['v_start', 'v_end', 'op_name', 'n_variables', 'valid_op']
 
     _op_map = {
-        'mean': jnp.mean,
-        'max': jnp.max,
-        'min': jnp.min,
-        'median': jnp.median,
-        'std': jnp.std, 
-        'var': jnp.var,
-        'sum': jnp.sum
+        'mean': np.mean,
+        'max': np.max,
+        'min': np.min,
+        'median': np.median,
+        'std': np.std, 
+        'var': np.var,
+        'sum': np.sum
     }
 
     def __init__(self, v_start: int, v_end: int, op_name: str, n_variables: int, valid_op: list = None):
@@ -63,7 +66,7 @@ class DynamicAggregation(NodeContent):
         self.n_variables = n_variables
         self.valid_op = valid_op
 
-    def __call__(self, X: jnp.array):
+    def __call__(self, X: np.ndarray):
         op_func = self._op_map[self.op_name]
         band_slice = X[:, self.v_start: self.v_end + 1]
         return op_func(band_slice, axis=1)
@@ -89,7 +92,7 @@ class DynamicAggregation(NodeContent):
 class Constant(NodeContent):
     __slots__ = ['value']
     def __init__(self, value: float):
-        self.value = jnp.array(value, float)
+        self.value = float(value)
 
     def __call__(self, X):
         return self.value
@@ -129,16 +132,17 @@ class Operator(NodeContent):
         The number of arguments that the ``function`` takes.
 
     """
-    __slots__ = ['function', 'name', 'degree']
-    def __init__(self, function, name, degree):
+    __slots__ = ['function', 'name', 'degree', 'elementwise']
+    def __init__(self, function, name, degree, elementwise):
         self.function = function
         self.name = name
         self.degree = degree
+        self.elementwise = elementwise
 
     def __call__(self, *args):
         try:
-            return self.function(*args)
-        except Exception:
+            return self.function(*args) if self.elementwise else float(self.function(args))
+        except Exception:  # pragma: no cover
             return args[0]
 
     def __eq__(self, other):
@@ -149,69 +153,83 @@ class Operator(NodeContent):
 
 
 
+"""
+NumPy 保护函数 - 普通版本
+提供数值稳定的数学运算函数，不处理 MaskedArray
+"""
+import numpy as np
+from typing import Union
+
+
 def _protected_addition(x1, x2):
     """加法闭包,处理溢出情况"""
-    result = jnp.add(x1, x2)
-    # 检测溢出:结果是否在合理范围内
-    safe_mask = jnp.isfinite(result) & (jnp.abs(result) < 1e10)
-    return jnp.where(safe_mask, result, 0.)
+    with np.errstate(over='ignore', invalid='ignore'):
+        result = np.add(x1, x2)
+        # 检测溢出:结果是否在合理范围内
+        safe_mask = np.isfinite(result) & (np.abs(result) < 1e10)
+        return np.where(safe_mask, result, 0.)
 
 
 def _protected_subtraction(x1, x2):
     """减法闭包,处理溢出情况"""
-    result = jnp.subtract(x1, x2)
-    # 检测溢出:结果是否在合理范围内
-    safe_mask = jnp.isfinite(result) & (jnp.abs(result) < 1e10)
-    return jnp.where(safe_mask, result, 0.)
+    with np.errstate(over='ignore', invalid='ignore'):
+        result = np.subtract(x1, x2)
+        # 检测溢出:结果是否在合理范围内
+        safe_mask = np.isfinite(result) & (np.abs(result) < 1e10)
+        return np.where(safe_mask, result, 0.)
 
 
 def _protected_multiplication(x1, x2):
     """乘法闭包,处理溢出情况"""
-    # 预先检查是否会溢出
-    safe_mask = (jnp.abs(x1) < 1e10) & (jnp.abs(x2) < 1e10)
-    # 对于可能溢出的情况,进一步检查乘积
-    result = jnp.where(safe_mask, jnp.multiply(x1, x2), 0.)
-    # 再次验证结果是否有限
-    result = jnp.where(jnp.isfinite(result) & (jnp.abs(result) < 1e10), result, 0.)
-    return result
+    with np.errstate(over='ignore', under='ignore', invalid='ignore'):
+        # 预先检查是否会溢出
+        safe_mask = (np.abs(x1) < 1e10) & (np.abs(x2) < 1e10)
+        # 对于可能溢出的情况,进一步检查乘积
+        result = np.where(safe_mask, np.multiply(x1, x2), 0.)
+        # 再次验证结果是否有限
+        result = np.where(np.isfinite(result) & (np.abs(result) < 1e10), result, 0.)
+        return result
 
 def _protected_division(x1, x2):
     """除法闭包，处理零除数情况"""
-    safe_mask = (jnp.abs(x2) > 0.0001) & (jnp.abs(x1 / x2) < 1e10)
-    return jnp.where(safe_mask, jnp.divide(x1, x2), 1.)
+    with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+        safe_mask = (np.abs(x2) > 0.0001) & (np.abs(x1 / x2) < 1e10)
+        return np.where(safe_mask, np.divide(x1, x2), 1.)
 
 
 def _protected_sqrt(x1):
     """平方根闭包，处理负数参数"""
-    return jnp.sqrt(jnp.abs(x1))
+    return np.sqrt(np.abs(x1))
 
 
 def _protected_log(x1):
     """对数闭包，处理零和负数参数"""
-    return jnp.where(jnp.abs(x1) > 0.001, jnp.log(jnp.abs(x1)), 0.)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        return np.where(np.abs(x1) > 0.001, np.log(np.abs(x1)), 0.)
 
 
 def _protected_inverse(x1):
     """倒数闭包，处理零参数"""
-    return jnp.where(jnp.abs(x1) > 0.001, 1. / x1, 0.)
+    with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+        return np.where(np.abs(x1) > 0.001, 1. / x1, 0.)
 
 
 def _protected_exp(x1):
     """指数闭包，限制大参数避免溢出"""
-    clipped_x1 = jnp.clip(x1, a_min=None, a_max=700.)
-    return jnp.exp(clipped_x1)
+    with np.errstate(over='ignore', under='ignore'):
+        clipped_x1 = np.clip(x1, a_min=None, a_max=700.)
+        return np.exp(clipped_x1)
 
 
 def _protected_expsq(x1):
     """高斯函数闭包，处理大参数避免溢出"""
-    # 限制输入范围，防止指数部分过大
-    clipped_x1 = jnp.clip(x1, a_min=-30., a_max=30.)
-    return jnp.exp(-jnp.square(clipped_x1))
+    with np.errstate(over='ignore', under='ignore'):
+        # 限制输入范围，防止指数部分过大
+        clipped_x1 = np.clip(x1, a_min=-30., a_max=30.)
+        return np.exp(-np.square(clipped_x1))
 
 
-
-@jit
-def _sigmoid(x: jnp.ndarray) -> jnp.ndarray:
+def _sigmoid(x: np.ndarray) -> np.ndarray:
     """
     计算数值稳定的 Sigmoid 函数
     
@@ -225,115 +243,132 @@ def _sigmoid(x: jnp.ndarray) -> jnp.ndarray:
     
     返回:
         与输入同形状的 sigmoid 计算结果
+    
+    示例:
+        >>> x = np.array([-1, 0, 1])
+        >>> _sigmoid(x)
+        array([0.26894142, 0.5, 0.73105858])
     """
+    if not isinstance(x, np.ndarray):
+        raise TypeError("输入必须是 np.ndarray")
+    
     EXP_LOWER_BOUND = -88.0
     EXP_UPPER_BOUND = 88.0
     
-    x_clipped = jnp.clip(x, EXP_LOWER_BOUND, EXP_UPPER_BOUND)
-    pos_mask = (x_clipped >= 0)
-    neg_mask = ~pos_mask
-    
-    # 使用 lax.cond 或 jnp.where 来处理分支
-    def pos_case(x_val):
-        return 1.0 / (1.0 + jnp.exp(-x_val))
-    
-    def neg_case(x_val):
-        z = jnp.exp(x_val)
-        return z / (1.0 + z)
-    
-    # 使用向量化的 where
-    result = jnp.where(pos_mask, pos_case(x_clipped), neg_case(x_clipped))
-    
-    # 处理极端值
-    result = jnp.where(x <= EXP_LOWER_BOUND, 0.0, result)
-    result = jnp.where(x >= EXP_UPPER_BOUND, 1.0, result)
-    
-    return result.astype(x.dtype)
+    with np.errstate(over='ignore', under='ignore', invalid='ignore'):
+        x_clipped = np.clip(x, EXP_LOWER_BOUND, EXP_UPPER_BOUND)
+        pos_mask = (x_clipped >= 0)
+        neg_mask = ~pos_mask
+        
+        result = np.empty_like(x, dtype=np.float64)
+        
+        # 正值部分
+        result[pos_mask] = 1.0 / (1.0 + np.exp(-x_clipped[pos_mask]))
+        
+        # 负值部分
+        z = np.exp(x_clipped[neg_mask])
+        result[neg_mask] = z / (1.0 + z)
+        
+        # 处理极端值
+        result[x <= EXP_LOWER_BOUND] = 0.0
+        result[x >= EXP_UPPER_BOUND] = 1.0
+        
+        return result.astype(x.dtype)
 
 
 
-@jit
-def _softplus(x: jnp.ndarray) -> jnp.ndarray:
+def _softplus(x: np.ndarray) -> np.ndarray:
     """
     Softplus 激活函数
     
     f(x) = ln(1 + exp(x))
     ReLU 的平滑近似
+    
+    参数:
+        x: 输入数组
+    
+    返回:
+        Softplus 激活后的结果
+    
+    示例:
+        >>> x = np.array([-2, -1, 0, 1, 2])
+        >>> _softplus(x)
+        array([0.12692801, 0.31326169, 0.69314718, 1.31326169, 2.12692801])
     """
-    x_clipped = jnp.clip(x, -88, 88)
-    return jnp.log(1.0 + jnp.exp(x_clipped))
+    with np.errstate(over='ignore', under='ignore'):
+        x_clipped = np.clip(x, -88, 88)
+        return np.log(1.0 + np.exp(x_clipped))
 
 
-@jit
-def _softmax(x: jnp.ndarray, axis: int = 1) -> jnp.ndarray:
+def _softmax(x: np.ndarray, axis: int = 1) -> np.ndarray:
     """
     计算数值稳定的 Softmax 函数
     
     沿指定轴对输入数组计算 softmax 值：
     softmax(x_i) = exp(x_i - max(x)) / sum(exp(x_j - max(x)))
     通过减去最大值保证数值稳定性，避免指数运算溢出
+    
+    参数:
+        x: 输入数组，通常为二维矩阵（样本数×类别数）
+        axis: 计算轴，默认为1（按行计算，每行和为1）
+    
+    返回:
+        与输入同形状的 softmax 计算结果，每行（或列）的和为1
+    
+    示例:
+        >>> x = np.array([[1, 2, 3], [1, 2, 1]])
+        >>> _softmax(x, axis=1)
+        array([[0.09003057, 0.24472847, 0.66524096],
+               [0.21194156, 0.57611688, 0.21194156]])
     """
+    if not isinstance(x, np.ndarray):
+        raise TypeError("输入必须是 np.ndarray")
     if axis not in (0, 1):
         raise ValueError("axis 必须是 0 或 1")
     
-    x_max = jnp.max(x, axis=axis, keepdims=True)
-    x_shifted = x - x_max
-    
-    # 对极端值进行保护
-    x_shifted = jnp.clip(x_shifted, -700, 700)
-    
-    exps = jnp.exp(x_shifted)
-    sum_exps = jnp.sum(exps, axis=axis, keepdims=True)
-    
-    # 处理 sum_exps 为 0 的情况
-    safe_sum = jnp.where(sum_exps == 0, 1.0, sum_exps)
-    result = exps / safe_sum
-    
-    return result
+    with np.errstate(over='ignore', under='ignore', invalid='ignore'):
+        x_max = np.max(x, axis=axis, keepdims=True)
+        x_shifted = x - x_max
+        
+        # 对极端值进行保护
+        x_shifted = np.clip(x_shifted, -700, 700)
+        
+        exps = np.exp(x_shifted)
+        sum_exps = np.sum(exps, axis=axis, keepdims=True)
+        
+        # 处理 sum_exps 为 0 的情况
+        safe_sum = np.where(sum_exps == 0, 1.0, sum_exps)
+        result = exps / safe_sum
+        
+        return result
 
 
 
-# 可选：创建所有函数的 JIT 编译版本
-protected_functions = {
-    'addition': jit(_protected_addition),
-    'subtraction': jit(_protected_subtraction),
-    'multiplication': jit(_protected_multiplication),
-    'division': jit(_protected_division),
-    'sqrt': jit(_protected_sqrt),
-    'log': jit(_protected_log),
-    'inverse': jit(_protected_inverse),
-    'exp': jit(_protected_exp),
-    'expsq': jit(_protected_expsq),
-    'sigmoid': _sigmoid,  # 已经 JIT
-    'softplus': _softplus,
-    'softmax': _softmax
-}
+add2 = Operator(function=_protected_addition, name='add', degree=2, elementwise=True)
+sub2 = Operator(function=_protected_subtraction, name='sub', degree=2, elementwise=True)
+mul2 = Operator(function=_protected_multiplication, name='mul', degree=2, elementwise=True)
+div2 = Operator(function=_protected_division, name='div', degree=2, elementwise=True)
+sqrt1 = Operator(function=_protected_sqrt, name='sqrt', degree=1, elementwise=True)
+log1 = Operator(function=_protected_log, name='log', degree=1, elementwise=True)
+neg1 = Operator(function=np.negative, name='neg', degree=1, elementwise=True)
+inv1 = Operator(function=_protected_inverse, name='inv', degree=1, elementwise=True)
+max2 = Operator(function=np.max, name='max', degree=1, elementwise=False)
+abs1 = Operator(function=np.abs, name='abs', degree=1, elementwise=True)
+maximum2 = Operator(function=np.maximum, name='maximum', degree=2, elementwise=True)
+min2 = Operator(function=np.min, name='min', degree=1, elementwise=False)
+minimum2 = Operator(function=np.minimum, name='minimum', degree=2, elementwise=True)
+sin1 = Operator(function=np.sin, name='sin', degree=1, elementwise=True)
+cos1 = Operator(function=np.cos, name='cos', degree=1, elementwise=True)
+tan1 = Operator(function=np.tan, name='tan', degree=1, elementwise=True)
+sinh1 = Operator(function=np.sinh, name='sinh', degree=1, elementwise=True)
+cosh1 = Operator(function=np.cosh, name='cosh', degree=1, elementwise=True)
+tanh1 = Operator(function=np.tanh, name='tanh', degree=1, elementwise=True)
+exp1 = Operator(function=_protected_exp, name='exp', degree=1, elementwise=True)
+expsq1 = Operator(function=_protected_expsq, name='expsq', degree=1, elementwise=True)
 
-
-
-add2 = Operator(function=protected_functions['addition'], name='add', degree=2)
-sub2 = Operator(function=protected_functions['subtraction'], name='sub', degree=2)
-mul2 = Operator(function=protected_functions['multiplication'], name='mul', degree=2)
-div2 = Operator(function=protected_functions['division'], name='div', degree=2)
-sqrt1 = Operator(function=protected_functions['sqrt'], name='sqrt', degree=1)
-log1 = Operator(function=protected_functions['log'], name='log', degree=1)
-neg1 = Operator(function=jnp.negative, name='neg', degree=1)
-inv1 = Operator(function=protected_functions['inverse'], name='inv', degree=1)
-abs1 = Operator(function=jnp.abs, name='abs', degree=1)
-maximum2 = Operator(function=jnp.maximum, name='maximum', degree=2)
-minimum2 = Operator(function=jnp.minimum, name='minimum', degree=2)
-sin1 = Operator(function=jnp.sin, name='sin', degree=1)
-cos1 = Operator(function=jnp.cos, name='cos', degree=1)
-tan1 = Operator(function=jnp.tan, name='tan', degree=1)
-sinh1 = Operator(function=jnp.sinh, name='sinh', degree=1)
-cosh1 = Operator(function=jnp.cosh, name='cosh', degree=1)
-tanh1 = Operator(function=jnp.tanh, name='tanh', degree=1)
-exp1 = Operator(function=protected_functions['exp'], name='exp', degree=1)
-expsq1 = Operator(function=protected_functions['expsq'], name='expsq', degree=1)
-
-sigmoid = Operator(function=protected_functions['sigmoid'], name='sigmoid', degree=1)
-softplus = Operator(function=protected_functions['softplus'], name='softplus', degree=1)
-softmax = Operator(function=protected_functions['softmax'], name='softmax', degree=2)
+sigmoid = Operator(function=_sigmoid, name='sigmoid', degree=1, elementwise=True)
+softplus = Operator(function=_softplus, name='softplus', degree=1, elementwise=True)
+softmax = Operator(function=_softmax, name='softmax', degree=2, elementwise=True)
 
 _operator_map = {
     '+': add2, 
@@ -363,3 +398,7 @@ _operator_map = {
     'expsq': expsq1,
     'softplus': softplus
 }
+
+
+
+

@@ -8,12 +8,10 @@ from scipy.optimize import minimize
 from typing import Union, Optional, List, Tuple, Iterator
 
 
-from src.node import Operator, Constant, Variable, _operator_map, NodeContent, DynamicAggregation
-from src.node_np import _operator_np_map
+from src.node import Operator, Constant, Variable, NodeContent, DynamicAggregation
+from src.node_jax import DynamicAggregation as DynamicAggregation_jax
+from src.node_jax import _operator_jax_map
 from src.fitness import Fitness
-
-
-
 
 
 
@@ -141,8 +139,7 @@ class Expression(object):
         self.complexity_of_aggregations = complexity_of_aggregations or 1
         
         # 预分析表达式结构
-        self._constant_indices = [i for i, g in enumerate(genes) if isinstance(g, Constant)]
-        self._has_constants = len(self._constant_indices) > 0
+        self._constant_indices = None
         
         # 懒编译梯度函数（只在需要时编译一次）
         self._grad_fn_compiled = None
@@ -175,6 +172,13 @@ class Expression(object):
             return False
         
         return True
+
+    @property
+    def constant_indices(self):
+        if self._constant_indices is not None:
+            return self._constant_indices
+        self._constant_indices = [i for i, g in enumerate(self.genes) if isinstance(g, Constant)]
+        return self._constant_indices
 
     def _count_scalar_constants(self) -> int:
         """Recursively counts the number of scalar constants in the tree."""
@@ -281,7 +285,7 @@ class Expression(object):
     def __repr__(self):
         return f"Expression(size={self.size}, formula='{self}')"
     
-    def __getitem__(self, index):
+    def __getitem__(self, index) -> NodeContent:
         return self.genes[index]
     
     def copy(self) -> 'Expression':
@@ -290,94 +294,7 @@ class Expression(object):
             self.genes.copy(), out_func=self.out_func, metric=self.metric
         )
 
-    # def _execute_for_grad(self, X: jnp.ndarray, constants: jnp.ndarray = None) -> jnp.ndarray:
-    #     stack = []
-        
-    #     constant_indice = 0
-    #     for gene in self.genes:
-    #         if gene.degree == 0:
-    #             # Variable, Constant, or DynamicAggregation
-    #             if isinstance(gene, Constant):
-    #                 stack.append(constants[constant_indice])
-    #                 constant_indice += 1
-    #             else:
-    #                 stack.append(gene(X))
-    #         else:
-    #             # Operator
-    #             if len(stack) < gene.degree:
-    #                 raise ValueError("Invalid RPN expression: stack underflow.")
-                
-    #             # Pop operands in reverse order
-    #             operands = [stack.pop() for _ in range(gene.degree)]
-    #             operands.reverse()
-                
-    #             result = gene(*operands)
-    #             stack.append(result)
-        
-    #     if len(stack) != 1:
-    #         raise ValueError("Invalid RPN expression: final stack size is not 1.")
-        
-    #     final_result = stack[0]
-
-    #     # If the result is a scalar constant, broadcast it to the shape of the input.
-    #     if hasattr(final_result, 'ndim') and final_result.ndim == 0:
-    #         final_result = jnp.full(X.shape[0], final_result)
-
-    #     if self.out_func is not None:
-    #         return self.out_func(final_result)
-        
-    #     return final_result
-
-    # def _fitness_for_grad(self, X: jnp.ndarray, y: jnp.ndarray, constants: jnp.ndarray = None) -> float:
-    #     """Evaluate the raw fitness of the expression according to X, y."""
-    #     y_pred = self._execute_for_grad(X, constants)
-    #     raw_fitness = self.metric(y, y_pred)
-    #     return raw_fitness
-
-    # def execute(self, X) -> jnp.ndarray:
-    #     stack = []
-        
-    #     for gene in self.genes:
-    #         if gene.degree == 0:
-    #             # Variable, Constant, or DynamicAggregation
-    #             stack.append(gene(X))
-    #         else:
-    #             # Operator
-    #             if len(stack) < gene.degree:
-    #                 raise ValueError("Invalid RPN expression: stack underflow.")
-                
-    #             # Pop operands in reverse order
-    #             operands = [stack.pop() for _ in range(gene.degree)]
-    #             operands.reverse()
-                
-    #             result = gene(*operands)
-    #             stack.append(result)
-        
-    #     if len(stack) != 1:
-    #         raise ValueError("Invalid RPN expression: final stack size is not 1.")
-        
-    #     final_result = stack[0]
-
-    #     # If the result is a scalar constant, broadcast it to the shape of the input.
-    #     if hasattr(final_result, 'ndim') and final_result.ndim == 0:
-    #         final_result = jnp.full(X.shape[0], final_result)
-
-    #     if self.out_func is not None:
-    #         return self.out_func(final_result)
-        
-    #     return final_result
-
-    # def fitness(self, X: jnp.ndarray, y: jnp.ndarray) -> float:
-    #     """Evaluate the raw fitness of the expression according to X, y."""
-    #     y_pred = self.execute(X)
-    #     raw_fitness = self.metric(y, y_pred)
-    #     return raw_fitness
-
     def execute(self, X: np.ndarray) -> np.ndarray:
-        """
-        使用NumPy执行（快速路径）
-        避免JAX编译开销
-        """
         stack = []
         
         for gene in self.genes:
@@ -392,9 +309,7 @@ class Expression(object):
                 # Operator
                 operands = [stack.pop() for _ in range(gene.degree)]
                 operands.reverse()
-                
-                # 使用NumPy版本的函数
-                result = self._apply_operator_numpy(gene, operands)
+                result = gene(*operands)
                 stack.append(result)
         
         result = stack[0]
@@ -409,44 +324,61 @@ class Expression(object):
         
         return result
     
-    def _apply_operator_numpy(self, operator, operands):
-        """将JAX操作转换为NumPy操作"""
-        operator_np = _operator_np_map[operator.name]
-        
-        return operator_np(*operands)
-    
     def fitness(self, X: np.ndarray, y: np.ndarray) -> float:
-        """快速适应度评估（NumPy）"""
+        """Evaluate the raw fitness of the expression according to X, y."""
         y_pred = self.execute(X)
         
-        # 调用metric（可能是JAX函数，但在NumPy数组上也能工作）
         raw_fitness = float(self.metric(y, y_pred))
         return raw_fitness
 
     # ============ JAX梯度计算（仅用于常量优化） ============
+    def _genes_to_jax_executable(self):
+        """
+        将基因列表转换为JAX可执行版本（仅在需要梯度时调用）
+        关键优化：使用静态结构避免动态循环
+        """
+        genes = []
+        for gene in self.genes:
+            if gene.degree > 0:
+                genes.append(_operator_jax_map[gene.name])
+            elif isinstance(gene, DynamicAggregation):
+                genes.append(
+                    DynamicAggregation(
+                        v_start=gene.v_start, 
+                        v_end=gene.v_end, 
+                        op_name=gene.op_name, 
+                        n_variables=gene.n_variables,
+                        valid_op=gene.valid_op
+                    )
+                )
+                genes.append(gene)
+            else:
+                genes.append(gene)
+        return genes
+
     def _build_jax_executable(self):
         """
         构建JAX可执行版本（仅在需要梯度时调用）
         关键优化：使用静态结构避免动态循环
         """
-        genes = self.genes
-        constant_indices = self._constant_indices
+        genes = self._genes_to_jax_executable()
+        
         out_func = self.out_func
+        out_func = _operator_jax_map[out_func.name] if out_func is not None else None
         
         # 提取常量索引映射
+        constant_indices = self.constant_indices
         const_idx_map = {idx: i for i, idx in enumerate(constant_indices)}
         
         def _execute_with_constants(X_jax, constants):
             """JAX执行函数（可微分）"""
             stack = []
-            const_counter = 0
             
             for i, gene in enumerate(genes):
                 if gene.degree == 0:
                     if i in const_idx_map:
                         # 使用可优化的常量
-                        stack.append(constants[const_counter])
-                        const_counter += 1
+                        stack.append(constants[const_idx_map[i]])
                     else:
                         # Variable或DynamicAggregation
                         stack.append(gene(X_jax))
@@ -475,13 +407,14 @@ class Expression(object):
         """懒编译梯度函数"""
         if self._grad_fn_compiled is None:
             executable = self._build_jax_executable()
+            metric = self.metric
             
             def loss_fn(constants, X_jax, y_jax):
                 """损失函数（用于计算梯度）"""
                 y_pred = executable(X_jax, constants)
-                loss = self.metric(y_jax, y_pred)
+                loss = metric(y_jax, y_pred)
                 # 如果是最大化指标，取负数
-                if self.metric.greater_is_better:
+                if metric.greater_is_better:
                     loss = -loss
                 return loss
             
@@ -495,7 +428,7 @@ class Expression(object):
         计算常量的梯度（使用JAX）
         返回：(梯度数组, 当前损失值)
         """
-        if not self._has_constants:
+        if not (len(self.constant_indices) > 0):
             return None, None
         
         # 转换为JAX数组
@@ -504,7 +437,7 @@ class Expression(object):
         
         # 提取当前常量值
         current_constants = jnp.array([
-            self.genes[idx].value for idx in self._constant_indices
+            self.genes[idx].value for idx in self.constant_indices
         ])
         
         # 计算梯度
@@ -522,14 +455,14 @@ class Expression(object):
     
     def update_constants(self, new_values: np.ndarray):
         """更新常量值"""
-        if len(new_values) != len(self._constant_indices):
-            raise ValueError(f"Expected {len(self._constant_indices)} values, got {len(new_values)}")
+        if len(new_values) != len(self.constant_indices):
+            raise ValueError(f"Expected {len(self.constant_indices)} values, got {len(new_values)}")
         
-        new_genes = self.genes.copy()
-        for i, idx in enumerate(self._constant_indices):
-            new_genes[idx] = Constant(float(new_values[i]))
+        new_expr = self.copy()
+        for i, idx in enumerate(self.constant_indices):
+            new_expr.genes[idx] = Constant(float(new_values[i]))
         
-        return Expression(new_genes, self.out_func, self.metric)
+        return new_expr
 
 
 
@@ -553,7 +486,7 @@ class ExpressionSet(object):
         """Returns the number of expressions in the set."""
         return len(self.expressions)
     
-    def __getitem__(self, key: int) -> 'ExpressionSet':
+    def __getitem__(self, key: int) -> 'Expression':
         return self.expressions[key]
 
     def __str__(self) -> str:
@@ -597,33 +530,142 @@ class ExpressionSet(object):
             raw_fitness = self.metric(y, y_pred)
         return raw_fitness
 
-    def _execute_for_grad(self, X: jnp.ndarray, constants: jnp.ndarray, 
-                          expr_constants_num: List[int] = None) -> jnp.ndarray:
-        """Execute the expression set for gradient calculation."""
-        if expr_constants_num is None:
-            expr_constants_num = [expr._count_scalar_constants() for expr in self.expressions 
-                                  if expr is not None]
-        outputs = []
-        for i, expr in enumerate(self.expressions):
-            if expr is not None:
-                start_idx = sum(expr_constants_num[:i])
-                end_idx = sum(expr_constants_num[:i+1])
-                outputs.append(expr._execute_for_grad(X, constants[start_idx: end_idx]).reshape(-1, 1))
+    # ============ JAX梯度计算（仅用于常量优化） ============
+    def _build_jax_executable(self):
+        """
+        构建JAX可执行版本（仅在需要梯度时调用）
+        关键优化：使用静态结构避免动态循环
+        """
+        expr_set = [expr for expr in self.expressions if expr is not None]
+        const_counter = 0
+        expr_set_genes = []
+        expr_set_const_idx_map = {}
+        for expr_idx, expr in enumerate(expr_set):
+            genes = expr._genes_to_jax_executable()
+            expr_set_genes.append(genes)
+            constant_indices = expr.constant_indices
+            if constant_indices:
+                expr_const_idx_map = {(expr_idx, idx): i+const_counter for i, idx in enumerate(constant_indices)}
+                expr_set_const_idx_map[expr_idx] = expr_const_idx_map
+                const_counter += len(constant_indices)
+            else:
+                expr_set_const_idx_map[expr_idx] = {}
         
-        if not outputs:
-            return jnp.array([]).reshape(X.shape[0], 0)
+        out_func = self.out_func
+        out_func = _operator_jax_map[out_func.name] if out_func is not None else None
+        
+        def _execute_with_constants(X_jax, constants):
+            def _execute_expr_with_constants(genes, X_jax, constants, expr_idx, const_idx_map):
+                """JAX执行函数（可微分）"""
+                stack = []
+                
+                for i, gene in enumerate(genes):
+                    if gene.degree == 0:
+                        if (expr_idx, i) in const_idx_map:
+                            # 使用可优化的常量
+                            stack.append(constants[const_idx_map[(expr_idx, i)]])
+                        else:
+                            # Variable或DynamicAggregation
+                            stack.append(gene(X_jax))
+                    else:
+                        # Operator
+                        operands = [stack.pop() for _ in range(gene.degree)]
+                        operands.reverse()
+                        result = gene(*operands)
+                        stack.append(result)
+                
+                result = stack[0]
+                
+                # 处理标量
+                if result.ndim == 0:
+                    result = jnp.full(X_jax.shape[0], result)
+                
+                return result
+            
+            results = []
+            for expr_idx, expr_genes in enumerate(expr_set_genes):
+                result = _execute_expr_with_constants(
+                    expr_genes, X_jax, constants, expr_idx, expr_set_const_idx_map[expr_idx]
+                )
+                results.append(result)
+            results = jnp.hstack(results)
+            # 应用输出函数
+            if out_func is not None:
+                results = out_func(results)
+        
+            return results
+        
+        return _execute_with_constants
 
-        result = jnp.hstack(outputs)
-        return result if self.out_func is None else self.out_func(result)
+    def _get_gradient_function(self):
+        """懒编译梯度函数"""
+        if self._grad_fn_compiled is None:
+            executable = self._build_jax_executable()
+            metric = self.metric
+            
+            def loss_fn(constants, X_jax, y_jax):
+                """损失函数（用于计算梯度）"""
+                y_pred = executable(X_jax, constants)
+                loss = metric(y_jax, y_pred)
+                # 如果是最大化指标，取负数
+                if metric.greater_is_better:
+                    loss = -loss
+                return loss
+            
+            # JIT编译梯度函数
+            self._grad_fn_compiled = jax.jit(jax.grad(loss_fn, argnums=0))
+        
+        return self._grad_fn_compiled
 
-    def _fitness_for_grad(self, X: jnp.ndarray, y: jnp.ndarray, constants: jnp.ndarray, 
-                          expr_constants_num: List[int] = None) -> float:
-        """Evaluate the raw fitness of the expression set according to X, y."""
-        y_pred = self._execute_for_grad(X, constants, expr_constants_num)
-        if y is None:
-            raw_fitness = self.metric(X, y_pred)
-        else:
-            raw_fitness = self.metric(y, y_pred)
-        return raw_fitness
+    def compute_constant_gradient(self, X: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, float]:
+        """
+        计算常量的梯度（使用JAX）
+        返回：(梯度数组, 当前损失值)
+        """
+        constant_indices = []
+        for expr_idx, expr in enumerate(self.expressions):
+            if expr is not None:
+                constant_indices.extend([
+                    (expr_idx, gene_idx) for gene_idx in expr.constant_indices
+                ])
+        
+        # 转换为JAX数组
+        X_jax = jnp.array(X)
+        y_jax = jnp.array(y)
+        
+        # 提取当前常量值
+        current_constants = jnp.array([
+            self[expr_idx][gene_idx].value for (expr_idx, gene_idx) in constant_indices
+        ])
+        
+        # 计算梯度
+        grad_fn = self._get_gradient_function()
+        gradients = grad_fn(current_constants, X_jax, y_jax)
+        
+        # 计算当前损失
+        executable = self._build_jax_executable()
+        y_pred = executable(X_jax, current_constants)
+        loss = float(self.metric(y_jax, y_pred))
+        if self.metric.greater_is_better:
+            loss = -loss
+        
+        return np.array(gradients), loss
 
+    def update_constants(self, new_values: np.ndarray):
+        """更新常量值"""
+        constant_indices = []
+        for expr_idx, expr in enumerate(self.expressions):
+            if expr is not None:
+                constant_indices.extend([
+                    (expr_idx, gene_idx) for gene_idx in expr.constant_indices
+                ])
+        
+        if len(new_values) != len(constant_indices):
+            raise ValueError(f"Expected {len(constant_indices)} values, got {len(new_values)}")
+        
+        new_expr_set = self.copy()
+        for i, (expr_idx, gene_idx) in enumerate(constant_indices):
+            new_expr_set.expressions[expr_idx][gene_idx] = Constant(float(new_values[i]))
+        
+        return new_expr_set
 

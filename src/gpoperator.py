@@ -1242,7 +1242,7 @@ class ExpressionGP:
 
     def optimize_constants(
         self,
-        expr: Expression, 
+        parent: Expression, 
         X: np.ndarray, 
         y: np.ndarray,
         optimizer_algorithm='L-BFGS-B',
@@ -1255,16 +1255,16 @@ class ExpressionGP:
         - 适应度评估：NumPy（避免重复编译）
         """
         # 检查是否有常量
-        if not expr._has_constants:
-            return expr, False, expr.fitness(X, y)
+        if not (len(parent.constant_indices) > 0):
+            return parent, False, np.nan
         
         # 获取初始常量
         initial_constants = np.array([
-            expr.genes[idx].value for idx in expr._constant_indices
+            parent.genes[idx].value for idx in parent._constant_indices
         ])
         
         # 预编译JAX梯度函数（只编译一次）
-        grad_fn = expr._get_gradient_function()
+        grad_fn = parent._get_gradient_function()
         X_jax = jnp.array(X)
         y_jax = jnp.array(y)
         
@@ -1276,9 +1276,9 @@ class ExpressionGP:
             grad = grad_fn(constants_jax, X_jax, y_jax)
             
             # 计算损失（使用快速的NumPy执行）
-            temp_expr = expr.update_constants(constants_np)
+            temp_expr = parent.update_constants(constants_np)
             fitness = temp_expr.fitness(X, y)
-            loss = -fitness if expr.metric.greater_is_better else fitness
+            loss = -fitness if parent.metric.greater_is_better else fitness
             
             return float(loss), np.array(grad)
         
@@ -1287,23 +1287,32 @@ class ExpressionGP:
         best_constants = initial_constants.copy()
         
         for restart in range(optimizer_nrestarts):
-            # 初始点
+            # 第一次使用原始值，后续添加噪声
             if restart == 0:
                 x0 = initial_constants.copy()
             else:
+                # 噪声强度递减（避免后期扰动过大）
                 noise_scale = 0.05 / np.sqrt(restart)
+                # restart=1: 5%, restart=2: 3.5%, restart=3: 2.9%
                 noise = self.random_state.normal(0, noise_scale, size=len(initial_constants))
-                constants_scale = np.abs(initial_constants) + 1e-6
+                constants_scale = np.abs(initial_constants) + 1e-6  # 处理零值
                 x0 = initial_constants + noise * constants_scale
             
             # 执行优化
-            result = minimize(
-                objective_and_grad,
-                x0,
-                method=optimizer_algorithm,
-                jac=True,
-                options={'maxiter': optimizer_iterations}
-            )
+            if optimizer_algorithm in METHODS_WITH_EPS:
+                result = minimize(
+                    objective_and_grad, x0,
+                    method=optimizer_algorithm, jac=True,
+                    options={'maxiter': optimizer_iterations, 
+                             'eps': self.constants_tolerance
+                    }
+                )
+            else:
+                result = minimize(
+                    objective_and_grad, x0,
+                    method=optimizer_algorithm, jac=True,
+                    options={'maxiter': optimizer_iterations}
+                )
             
             # 更新最佳结果
             if result.fun < best_loss:
@@ -1311,10 +1320,10 @@ class ExpressionGP:
                 best_constants = result.x
         
         # 创建优化后的表达式
-        optimized_expr = expr.update_constants(best_constants)
+        optimized_expr = parent.update_constants(best_constants)
         
-        # 计算最终适应度
-        final_fitness = optimized_expr.fitness(X, y)
+        # 最终适应度
+        final_fitness = -best_loss if parent.metric.greater_is_better else best_loss
         
         return optimized_expr, True, final_fitness
 
@@ -2260,9 +2269,9 @@ class ExpressionSetGP:
     def optimize_constants(self, parent: ExpressionSet, X, y, 
                            optimizer_algorithm='L-BFGS-B', optimizer_nrestarts=3, 
                            optimizer_iterations=10) -> Tuple[Optional['ExpressionSet'], bool]:
-        # 1. 收集所有常量节点，提取初始常量值
+        # 收集所有常量节点，提取初始常量值
         constant_indices = []
-        for expr_idx, expr in enumerate(new_expr_set.expressions):
+        for expr_idx, expr in enumerate(parent.expressions):
             if expr is not None:
                 constant_indices.extend([
                     (expr_idx, gene_idx) for gene_idx, gene in enumerate(expr.genes) 
@@ -2272,27 +2281,34 @@ class ExpressionSetGP:
         if not constant_indices:
             return None, False
         
-        # 2. 提取初始常量值（NumPy 数组以便向量化操作）
-        expr_constants_num = [expr._count_scalar_constants() for expr in parent.expressions 
-                              if expr is not None]
-        initial_constants = np.array([self.expressions[expr_idx].genes[gene_idx].value 
-                                      for expr_idx, gene_idx in constant_indices])
+        # 转换为JAX数组
+        X_jax = jnp.array(X)
+        y_jax = jnp.array(y)
         
-        # 3. 定义目标函数
-        def objective(constants: List[jnp.ndarray]):
-            fitness = parent._fitness_for_grad(X, y, constants, expr_constants_num)
+        # 提取初始常量值（NumPy 数组以便向量化操作）
+        initial_constants = jnp.array([
+            self[expr_idx][gene_idx].value for (expr_idx, gene_idx) in constant_indices
+        ])
+        
+        # 预编译JAX梯度函数（只编译一次）
+        grad_fn = parent._get_gradient_function()
+        X_jax = jnp.array(X)
+        y_jax = jnp.array(y)
+
+        # 定义优化目标（使用预编译的梯度）
+        def objective_and_grad(constants_np):
+            constants_jax = jnp.array(constants_np)
+            
+            # 计算梯度（使用预编译的函数）
+            grad = grad_fn(constants_jax, X_jax, y_jax)
+            
+            # 计算损失（使用快速的NumPy执行）
+            temp_expr = parent.update_constants(constants_np)
+            fitness = temp_expr.fitness(X, y)
             loss = -fitness if parent.metric.greater_is_better else fitness
-            return loss
-
-        # JIT编译梯度计算
-        grad_fn = jax.jit(jax.grad(objective))
-
-        def scipy_wrapper(x):
-            x_jax = jnp.array(x)
-            return float(objective(x_jax)), np.array(grad_fn(x_jax))
         
-        # 4. 多次重启优化（寻找全局最优）
-        best_loss = objective(initial_constants)
+        # 多次重启优化
+        best_loss = float('inf')
         best_constants = initial_constants.copy()
         
         for restart in range(optimizer_nrestarts):
@@ -2310,7 +2326,7 @@ class ExpressionSetGP:
             # 执行优化
             if optimizer_algorithm in METHODS_WITH_EPS:
                 result = minimize(
-                    scipy_wrapper, x0,
+                    objective_and_grad, x0,
                     method=optimizer_algorithm, jac=True,
                     options={
                         'maxiter': optimizer_iterations,
@@ -2319,7 +2335,7 @@ class ExpressionSetGP:
                 )
             else:
                 result = minimize(
-                    scipy_wrapper, x0,
+                    objective_and_grad, x0,
                     method=optimizer_algorithm, jac=True,
                     options={'maxiter': optimizer_iterations}
                 )
@@ -2329,15 +2345,13 @@ class ExpressionSetGP:
                 best_loss = result.fun
                 best_constants = result.x
         
-        # 5. 应用最佳常量值
-        new_expr_set = parent.copy()
-        for i, (expr_idx, gene_idx) in enumerate(constant_indices):
-            new_expr_set.expressions[expr_idx].genes[gene_idx] = Constant(best_constants[i])
+        # 创建优化后的表达式
+        optimized_expr_set = parent.update_constants(best_constants)
         
-        # 6. 更新适应度
-        raw_fitness = -best_loss if parent.metric.greater_is_better else best_loss
+        # 最终适应度
+        final_fitness = -best_loss if parent.metric.greater_is_better else best_loss
         
-        return new_expr_set, True, raw_fitness
+        return optimized_expr_set, True, final_fitness
 
     def optimize_aggregations(
         self, parent: ExpressionSet, X, y, 

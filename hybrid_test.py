@@ -2,7 +2,7 @@ import jax
 import numpy as np
 import jax.numpy as jnp
 from typing import List, Tuple
-from src.node import Operator, Constant, Variable, NodeContent, DynamicAggregation
+from src.node_jax import Operator, Constant, Variable, NodeContent, DynamicAggregation
 
 
 class HybridExpression:
@@ -290,7 +290,7 @@ def optimize_constants_hybrid(
 def benchmark_comparison():
     """比较不同实现的性能"""
     import time
-    from src.node import Variable, Constant, add2, mul2
+    from src.node_jax import Variable, Constant, add2, mul2
     from src.fitness import _fitness_map
     
     # 创建测试表达式: (x1 + 2.5) * x2
