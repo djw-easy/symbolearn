@@ -481,6 +481,9 @@ class ExpressionSet(object):
             raise ValueError("All items in expressions must be GeneticExpression objects.")
         
         self.expressions = expressions
+        
+        # 懒编译梯度函数（只在需要时编译一次）
+        self._grad_fn_compiled = None
 
     def __len__(self) -> int:
         """Returns the number of expressions in the set."""
@@ -509,19 +512,19 @@ class ExpressionSet(object):
     def copy(self) -> 'ExpressionSet':
         """Returns a copy of the expression set."""
         return ExpressionSet(
-            [expr.copy() for expr in self.expressions], 
+            [expr.copy() if expr is not None else None for expr in self.expressions], 
             out_func=self.out_func, metric=self.metric
         )
 
-    def execute(self, X: jnp.ndarray) -> jnp.ndarray:
+    def execute(self, X: np.ndarray) -> np.ndarray:
         outputs = [expr.execute(X).reshape(-1, 1) for expr in self.expressions if expr is not None]
         if not outputs:
-            return jnp.array([]).reshape(X.shape[0], 0)
+            return np.array([]).reshape(X.shape[0], 0)
 
-        result = jnp.hstack(outputs)
+        result = np.hstack(outputs)
         return result if self.out_func is None else self.out_func(result)
 
-    def fitness(self, X: jnp.ndarray, y: jnp.ndarray) -> float:
+    def fitness(self, X: np.ndarray, y: np.ndarray) -> float:
         """Evaluate the raw fitness of the expression set according to X, y."""
         y_pred = self.execute(X)
         if y is None:
@@ -587,7 +590,7 @@ class ExpressionSet(object):
                 result = _execute_expr_with_constants(
                     expr_genes, X_jax, constants, expr_idx, expr_set_const_idx_map[expr_idx]
                 )
-                results.append(result)
+                results.append(result.reshape(-1, 1))
             results = jnp.hstack(results)
             # 应用输出函数
             if out_func is not None:
@@ -665,7 +668,7 @@ class ExpressionSet(object):
         
         new_expr_set = self.copy()
         for i, (expr_idx, gene_idx) in enumerate(constant_indices):
-            new_expr_set.expressions[expr_idx][gene_idx] = Constant(float(new_values[i]))
+            new_expr_set.expressions[expr_idx].genes[gene_idx] = Constant(float(new_values[i]))
         
         return new_expr_set
 

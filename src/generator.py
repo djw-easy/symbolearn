@@ -390,8 +390,8 @@ class ExprSetGenerator(ExprGenerator):
             minorder, maxorder = order
             if not (isinstance(minorder, int) and isinstance(maxorder, int)):
                 raise ValueError("minorder and maxorder must be integers.")
-            if minorder > maxorder:
-                raise ValueError(f"minorder ({minorder}) must be <= maxorder ({maxorder}).")
+            if not (minorder < maxorder):
+                raise ValueError(f"minorder ({minorder}) must be < maxorder ({maxorder}).")
             if minorder < 1:
                 raise ValueError("minorder must be at least 1.")
             

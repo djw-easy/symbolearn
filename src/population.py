@@ -133,12 +133,15 @@ class Population:
         self.fitnesses = np.zeros(self.population_size)
         for i in range(self.population_size):
             X_batch, y_batch = self._get_batch(X, y, random_state)
-            new_expr = self.generator.generate_random_expr()
-            raw_fitness_ = new_expr.fitness(X_batch, y_batch)
-            self.individuals.append(new_expr)
-            self.sizes[i] = new_expr.size
+            if isinstance(self.generator, ExprSetGenerator):
+                new_individual = self.generator.generate_random_exprset()
+            else:
+                new_individual = self.generator.generate_random_expr()
+            raw_fitness_ = new_individual.fitness(X_batch, y_batch)
+            self.individuals.append(new_individual)
+            self.sizes[i] = new_individual.size
             self.fitnesses[i] = raw_fitness_
-            self.hall_of_fame.add(new_expr, raw_fitness_)
+            self.hall_of_fame.add(new_individual, raw_fitness_)
         sorted_indices = np.argsort(-self.fitnesses) if self.greater_is_better else np.argsort(self.fitnesses)
         self.birthes = np.empty_like(sorted_indices)
         self.birthes[sorted_indices] = np.arange(len(self.fitnesses))

@@ -2,7 +2,8 @@ from sklearn.model_selection import train_test_split
 from sklearn.utils.random import check_random_state
 from sklearn.preprocessing import StandardScaler
 from scipy.io import loadmat
-import pandas as pd
+import jax.numpy as jnp
+from numba import njit
 import numpy as np
 import jax
 
@@ -34,49 +35,50 @@ y_train_multi = np.stack(
 
 
 
-print(f"{'-'*23} Testing Single Expression for Symbolic Regression {'-'*23}")
+# print(f"{'-'*23} Testing Single Expression for Symbolic Regression {'-'*23}")
 
-sr_single = SymbolicRegressor(
-    maxsize=15, 
-    niterations=10, 
-    populations=31,
-    population_size=27, 
-    use_constant=True,
-    initial_constants=10,
-    add_node=0.0, use_aggregation=True,
-    # stopping_criteria=0.0001,
-    ncycles_per_iteration=380,
-    should_optimize_constants=True,
-    n_jobs=1, verbose=1, random_state=42)
-sr_single.fit(X_train, y_train_single)
-print("\nPareto Front:")
-df = sr_single.get_hof()
-print(df)
-
-
-
-
-# print(f"{'-'*23} Testing ExpressionSet for Symbolic Regression {'-'*23}")
-
-# def mse_loss(y_true, y_pred, w):
-#     y_pred = np.sum(y_pred, axis=1)
-#     y_true = np.sum(y_true, axis=1)
-#     return np.mean((y_true - y_pred) ** 2)
-# mse_fitness = Fitness(mse_loss, greater_is_better=False)
-
-# sr_multi = SymbolicRegressor(
+# sr_single = SymbolicRegressor(
+#     maxsize=15, 
 #     niterations=10, 
 #     populations=31,
 #     population_size=27, 
-#     metric=mse_fitness,
 #     use_constant=True,
-#     maxsize=9, order=(1, 4),
+#     initial_constants=10,
+#     add_node=0.0, use_aggregation=True,
 #     # stopping_criteria=0.0001,
 #     ncycles_per_iteration=380,
-#     # optimizer_algorithm='fast-gd',
+#     should_optimize_constants=True,
 #     n_jobs=1, verbose=1, random_state=42)
-# sr_multi.fit(X_train, y_train_multi)
+# sr_single.fit(X_train, y_train_single)
 # print("\nPareto Front:")
-# df = sr_multi.get_hof()
+# df = sr_single.get_hof()
 # print(df)
+
+
+
+
+print(f"{'-'*30} Testing ExpressionSet for Symbolic Regression {'-'*30}")
+
+@njit
+def mse_loss(y_true, y_pred):
+    y_pred = np.sum(y_pred, axis=1)
+    y_true = np.sum(y_true, axis=1)
+    return np.mean((y_true - y_pred) ** 2)
+mse_fitness = Fitness(mse_loss, greater_is_better=False, name="mse_n")
+
+sr_multi = SymbolicRegressor(
+    niterations=10, 
+    populations=31,
+    population_size=27, 
+    metric=mse_fitness,
+    add_node=0.0, use_constant=True,
+    maxsize=9, order=(2, 4),
+    # stopping_criteria=0.0001,
+    ncycles_per_iteration=380,
+    should_optimize_constants=False,
+    n_jobs=1, verbose=1, random_state=42)
+sr_multi.fit(X_train, y_train_multi)
+print("\nPareto Front:")
+df = sr_multi.get_hof()
+print(df)
 

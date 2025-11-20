@@ -664,7 +664,8 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
             gpoperator=expr_gpoperator,
             random_state=random_state,
             set_mutation_weights=self.set_mutation_weights,
-            set_crossover_method=self.set_crossover_probability,
+            set_crossover_method=self.set_crossover_method,
+            set_crossover_probability=self.set_crossover_probability
         )
         return expr_set_generator, expr_set_gpoperator
 

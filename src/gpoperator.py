@@ -1963,6 +1963,7 @@ class ExpressionSetGP:
                  gpoperator: ExpressionGP,
                  set_mutation_weights: dict = None,
                  set_crossover_method: str = 'single_point',
+                 set_crossover_probability: float = 0.0369,
                  random_state: Union[int, np.random.Generator] = None):
         self.generator = generator
         self.gpoperator = gpoperator
@@ -1970,6 +1971,7 @@ class ExpressionSetGP:
         self.set_mutation_weights = set_mutation_weights
         self.set_crossover_method = set_crossover_method
         self.random_state = check_random_state(random_state)
+        self.set_crossover_probability = set_crossover_probability
 
     def reproduce(self, expressions) -> 'ExpressionSet':
         """Returns a list of nodes in the tree in pre-order."""
@@ -2046,7 +2048,7 @@ class ExpressionSetGP:
             if exprset.order >= self.generator.maxorder:
                 weights['add_expr'] = 0.0
             # If at min order, no deleting
-            if exprset.order <= self.minorder:
+            if exprset.order <= self.generator.minorder:
                 weights['delete_expr'] = 0.0
         
         if exprset.order < 2:
@@ -2060,7 +2062,7 @@ class ExpressionSetGP:
         This method acts as a dispatcher, selecting one of several mutation
         strategies based on pre-defined weights and executing it.
         """
-        conditioned_weights = self._condition_mutation_weights()
+        conditioned_weights = self._condition_mutation_weights(parent)
         mutation_name = weighted_random_choice(conditioned_weights, self.random_state)
         
         # Dispatch to the correct mutation method
@@ -2096,7 +2098,7 @@ class ExpressionSetGP:
         mutation_point = self.random_state.choice(valid_points)
         parent_expr = parent.expressions[mutation_point]
         
-        mutated_expr, mutation_succeeded = self.gpoperator.mutation(parent_expr)
+        mutated_expr, mutation_succeeded, _ = self.gpoperator.mutation(parent_expr)
         
         # 1. 提早失败
         if not mutation_succeeded:
@@ -2127,7 +2129,7 @@ class ExpressionSetGP:
         parent_expr = parent.expressions[mutation_point]
 
         # 2. 尝试突变
-        mutated_expr, mutation_succeeded = self.gpoperator.mutation(parent_expr)
+        mutated_expr, mutation_succeeded = self.gpoperator.mutate_constant(parent_expr)
 
         if not mutation_succeeded:
             return None, False
@@ -2165,7 +2167,7 @@ class ExpressionSetGP:
         )
         
         # 4. 创建副本
-        new_expr_set = self.reproduce(new_exprs, self.random_state)
+        new_expr_set = self.reproduce(new_exprs)
         
         return new_expr_set, True
 
@@ -2252,7 +2254,7 @@ class ExpressionSetGP:
         point_to_add = self.random_state.choice(empty_indices)
         
         # 2. 生成新表达式
-        new_expr = self.gpoperator.generate_random_expr()
+        new_expr = self.generator.generate_random_expr()
         
         # 3. 构建新列表
         new_exprs = (
@@ -2279,7 +2281,7 @@ class ExpressionSetGP:
                 ])
         
         if not constant_indices:
-            return None, False
+            return None, False, np.nan
         
         # 转换为JAX数组
         X_jax = jnp.array(X)
@@ -2287,7 +2289,7 @@ class ExpressionSetGP:
         
         # 提取初始常量值（NumPy 数组以便向量化操作）
         initial_constants = jnp.array([
-            self[expr_idx][gene_idx].value for (expr_idx, gene_idx) in constant_indices
+            parent[expr_idx][gene_idx].value for (expr_idx, gene_idx) in constant_indices
         ])
         
         # 预编译JAX梯度函数（只编译一次）
@@ -2306,6 +2308,8 @@ class ExpressionSetGP:
             temp_expr = parent.update_constants(constants_np)
             fitness = temp_expr.fitness(X, y)
             loss = -fitness if parent.metric.greater_is_better else fitness
+            
+            return float(loss), np.array(grad)
         
         # 多次重启优化
         best_loss = float('inf')
