@@ -301,9 +301,6 @@ class Expression(object):
             if gene.degree == 0:
                 # Variable, Constant, DynamicAggregation
                 result = gene(X)
-                # 转换为NumPy（如果是JAX数组）
-                if hasattr(result, 'device'):
-                    result = np.array(result)
                 stack.append(result)
             else:
                 # Operator
@@ -320,7 +317,7 @@ class Expression(object):
         
         # 应用输出函数
         if self.out_func is not None:
-            result = self._apply_operator_numpy(self.out_func, [result])
+            result = self.out_func(result)
         
         return result
     
@@ -328,7 +325,7 @@ class Expression(object):
         """Evaluate the raw fitness of the expression according to X, y."""
         y_pred = self.execute(X)
         
-        raw_fitness = float(self.metric(y, y_pred))
+        raw_fitness = np.float32(self.metric(y, y_pred))
         return raw_fitness
 
     # ============ JAX梯度计算（仅用于常量优化） ============
@@ -469,7 +466,11 @@ class Expression(object):
 
 class ExpressionSet(object):
     """
-    A collection of `Expression` objects, representing a system of equations.
+    优化后的表达式集合
+    关键改进：
+    1. 预计算常量索引映射（扁平化）
+    2. 静态执行计划（避免动态查找）
+    3. 向量化处理多个表达式
     """
     def __init__(self, 
                  expressions: List[Expression | None], 
@@ -477,16 +478,20 @@ class ExpressionSet(object):
                  metric: Fitness | None = None):
         self.out_func = out_func
         self.metric = metric
+        
         if not all(isinstance(expr, (type(None), Expression)) for expr in expressions):
-            raise ValueError("All items in expressions must be GeneticExpression objects.")
+            raise ValueError("All items in expressions must be Expression objects.")
         
         self.expressions = expressions
         
-        # 懒编译梯度函数（只在需要时编译一次）
+        # 懒编译梯度函数
         self._grad_fn_compiled = None
+        
+        # 预计算的执行计划（缓存）
+        self._execution_plan = None
+        self._constant_info = None
 
     def __len__(self) -> int:
-        """Returns the number of expressions in the set."""
         return len(self.expressions)
     
     def __getitem__(self, key: int) -> 'Expression':
@@ -501,22 +506,21 @@ class ExpressionSet(object):
 
     @property
     def size(self) -> int:
-        """The total size of all expression trees in the set."""
         return sum(expr.size for expr in self if expr is not None)
 
     @property
     def order(self) -> int:
-        non_none_count = sum([1 if expr is not None else 0 for expr in self.expressions])
-        return non_none_count
+        return sum(1 if expr is not None else 0 for expr in self.expressions)
 
     def copy(self) -> 'ExpressionSet':
-        """Returns a copy of the expression set."""
         return ExpressionSet(
             [expr.copy() if expr is not None else None for expr in self.expressions], 
-            out_func=self.out_func, metric=self.metric
+            out_func=self.out_func, 
+            metric=self.metric
         )
 
     def execute(self, X: np.ndarray) -> np.ndarray:
+        """NumPy快速执行路径"""
         outputs = [expr.execute(X).reshape(-1, 1) for expr in self.expressions if expr is not None]
         if not outputs:
             return np.array([]).reshape(X.shape[0], 0)
@@ -525,81 +529,180 @@ class ExpressionSet(object):
         return result if self.out_func is None else self.out_func(result)
 
     def fitness(self, X: np.ndarray, y: np.ndarray) -> float:
-        """Evaluate the raw fitness of the expression set according to X, y."""
         y_pred = self.execute(X)
         if y is None:
             raw_fitness = self.metric(X, y_pred)
         else:
             raw_fitness = self.metric(y, y_pred)
-        return raw_fitness
+        return np.float32(raw_fitness)
 
-    # ============ JAX梯度计算（仅用于常量优化） ============
+    # ============ 优化的常量信息预处理 ============
+    def _build_constant_info(self):
+        """
+        预计算常量信息，避免运行时查找
+        返回：扁平化的常量索引映射
+        """
+        if self._constant_info is not None:
+            return self._constant_info
+        
+        # 扁平化所有常量
+        flat_constant_indices = []  # [(expr_idx, gene_idx), ...]
+        expr_constant_ranges = []   # [(start, end), ...] 每个表达式的常量在扁平数组中的范围
+        
+        global_const_idx = 0
+        for expr_idx, expr in enumerate(self.expressions):
+            if expr is None:
+                expr_constant_ranges.append(None)
+                continue
+            
+            const_indices = expr.constant_indices
+            if const_indices:
+                start_idx = global_const_idx
+                end_idx = global_const_idx + len(const_indices)
+                expr_constant_ranges.append((start_idx, end_idx))
+                
+                # 记录每个常量的位置
+                for gene_idx in const_indices:
+                    flat_constant_indices.append((expr_idx, gene_idx))
+                
+                global_const_idx = end_idx
+            else:
+                expr_constant_ranges.append(None)
+        
+        self._constant_info = {
+            'flat_indices': flat_constant_indices,
+            'ranges': expr_constant_ranges,
+            'total_constants': global_const_idx
+        }
+        
+        return self._constant_info
+
+    # ============ 优化的执行计划 ============
+    def _build_execution_plan(self):
+        """
+        构建静态执行计划，避免运行时动态处理
+        """
+        if self._execution_plan is not None:
+            return self._execution_plan
+        
+        const_info = self._build_constant_info()
+        
+        # 为每个表达式构建指令序列
+        expr_plans = []
+        for expr_idx, expr in enumerate(self.expressions):
+            if expr is None:
+                expr_plans.append(None)
+                continue
+            
+            genes_jax = expr._genes_to_jax_executable()
+            const_range = const_info['ranges'][expr_idx]
+            
+            # 预处理：为每个基因标记类型和常量索引
+            instructions = []
+            local_const_idx = 0
+            
+            for gene_idx, gene in enumerate(genes_jax):
+                if gene.degree == 0:
+                    # 检查是否是常量
+                    if const_range is not None and gene_idx in expr.constant_indices:
+                        # 常量：记录在全局常量数组中的位置
+                        global_const_idx = const_range[0] + local_const_idx
+                        instructions.append(('const', global_const_idx))
+                        local_const_idx += 1
+                    else:
+                        # 变量或聚合
+                        instructions.append(('term', gene))
+                else:
+                    # 操作符
+                    instructions.append(('op', gene))
+            
+            expr_plans.append({
+                'instructions': tuple(instructions),
+                'genes': genes_jax
+            })
+        
+        # 转换输出函数
+        out_func_jax = None
+        if self.out_func is not None:
+            out_func_jax = _operator_jax_map[self.out_func.name]
+        
+        self._execution_plan = {
+            'expr_plans': expr_plans,
+            'out_func': out_func_jax,
+            'const_info': const_info
+        }
+        
+        return self._execution_plan
+
+    # ============ 高效的JAX执行 ============
     def _build_jax_executable(self):
         """
-        构建JAX可执行版本（仅在需要梯度时调用）
-        关键优化：使用静态结构避免动态循环
+        构建优化的JAX可执行版本
+        关键改进：
+        1. 使用预计算的执行计划
+        2. 扁平化常量数组（避免嵌套索引）
+        3. 静态指令序列（避免动态查找）
         """
-        expr_set = [expr for expr in self.expressions if expr is not None]
-        const_counter = 0
-        expr_set_genes = []
-        expr_set_const_idx_map = {}
-        for expr_idx, expr in enumerate(expr_set):
-            genes = expr._genes_to_jax_executable()
-            expr_set_genes.append(genes)
-            constant_indices = expr.constant_indices
-            if constant_indices:
-                expr_const_idx_map = {(expr_idx, idx): i+const_counter for i, idx in enumerate(constant_indices)}
-                expr_set_const_idx_map[expr_idx] = expr_const_idx_map
-                const_counter += len(constant_indices)
-            else:
-                expr_set_const_idx_map[expr_idx] = {}
+        plan = self._build_execution_plan()
+        expr_plans = plan['expr_plans']
+        out_func = plan['out_func']
         
-        out_func = self.out_func
-        out_func = _operator_jax_map[out_func.name] if out_func is not None else None
+        def _execute_single_expr(instructions, X_jax, constants):
+            """执行单个表达式（优化版）"""
+            stack = []
+            
+            for instr_type, instr_data in instructions:
+                if instr_type == 'const':
+                    # 直接从扁平常量数组中取值
+                    stack.append(constants[instr_data])
+                elif instr_type == 'term':
+                    # 变量或聚合
+                    stack.append(instr_data(X_jax))
+                elif instr_type == 'op':
+                    # 操作符
+                    gene = instr_data
+                    operands = [stack.pop() for _ in range(gene.degree)]
+                    operands.reverse()
+                    result = gene(*operands)
+                    stack.append(result)
+            
+            result = stack[0]
+            
+            # 处理标量
+            if result.ndim == 0:
+                result = jnp.full(X_jax.shape[0], result)
+            
+            return result
         
         def _execute_with_constants(X_jax, constants):
-            def _execute_expr_with_constants(genes, X_jax, constants, expr_idx, const_idx_map):
-                """JAX执行函数（可微分）"""
-                stack = []
-                
-                for i, gene in enumerate(genes):
-                    if gene.degree == 0:
-                        if (expr_idx, i) in const_idx_map:
-                            # 使用可优化的常量
-                            stack.append(constants[const_idx_map[(expr_idx, i)]])
-                        else:
-                            # Variable或DynamicAggregation
-                            stack.append(gene(X_jax))
-                    else:
-                        # Operator
-                        operands = [stack.pop() for _ in range(gene.degree)]
-                        operands.reverse()
-                        result = gene(*operands)
-                        stack.append(result)
-                
-                result = stack[0]
-                
-                # 处理标量
-                if result.ndim == 0:
-                    result = jnp.full(X_jax.shape[0], result)
-                
-                return result
-            
+            """执行整个表达式集合"""
             results = []
-            for expr_idx, expr_genes in enumerate(expr_set_genes):
-                result = _execute_expr_with_constants(
-                    expr_genes, X_jax, constants, expr_idx, expr_set_const_idx_map[expr_idx]
+            
+            for expr_plan in expr_plans:
+                if expr_plan is None:
+                    continue
+                
+                result = _execute_single_expr(
+                    expr_plan['instructions'], 
+                    X_jax, 
+                    constants
                 )
                 results.append(result.reshape(-1, 1))
+            
+            if not results:
+                return jnp.array([]).reshape(X_jax.shape[0], 0)
+            
             results = jnp.hstack(results)
+            
             # 应用输出函数
             if out_func is not None:
                 results = out_func(results)
-        
+            
             return results
         
         return _execute_with_constants
 
+    # ============ 梯度计算 ============
     def _get_gradient_function(self):
         """懒编译梯度函数"""
         if self._grad_fn_compiled is None:
@@ -607,10 +710,8 @@ class ExpressionSet(object):
             metric = self.metric
             
             def loss_fn(constants, X_jax, y_jax):
-                """损失函数（用于计算梯度）"""
                 y_pred = executable(X_jax, constants)
                 loss = metric(y_jax, y_pred)
-                # 如果是最大化指标，取负数
                 if metric.greater_is_better:
                     loss = -loss
                 return loss
@@ -622,23 +723,21 @@ class ExpressionSet(object):
 
     def compute_constant_gradient(self, X: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, float]:
         """
-        计算常量的梯度（使用JAX）
-        返回：(梯度数组, 当前损失值)
+        计算常量的梯度（优化版）
         """
-        constant_indices = []
-        for expr_idx, expr in enumerate(self.expressions):
-            if expr is not None:
-                constant_indices.extend([
-                    (expr_idx, gene_idx) for gene_idx in expr.constant_indices
-                ])
+        const_info = self._build_constant_info()
+        
+        if const_info['total_constants'] == 0:
+            return None, None
         
         # 转换为JAX数组
         X_jax = jnp.array(X)
         y_jax = jnp.array(y)
         
-        # 提取当前常量值
+        # 提取当前常量值（扁平化）
         current_constants = jnp.array([
-            self[expr_idx][gene_idx].value for (expr_idx, gene_idx) in constant_indices
+            self.expressions[expr_idx].genes[gene_idx].value 
+            for expr_idx, gene_idx in const_info['flat_indices']
         ])
         
         # 计算梯度
@@ -655,19 +754,18 @@ class ExpressionSet(object):
         return np.array(gradients), loss
 
     def update_constants(self, new_values: np.ndarray):
-        """更新常量值"""
-        constant_indices = []
-        for expr_idx, expr in enumerate(self.expressions):
-            if expr is not None:
-                constant_indices.extend([
-                    (expr_idx, gene_idx) for gene_idx in expr.constant_indices
-                ])
+        """更新常量值（优化版）"""
+        const_info = self._build_constant_info()
         
-        if len(new_values) != len(constant_indices):
-            raise ValueError(f"Expected {len(constant_indices)} values, got {len(new_values)}")
+        if len(new_values) != const_info['total_constants']:
+            raise ValueError(
+                f"Expected {const_info['total_constants']} values, got {len(new_values)}"
+            )
         
         new_expr_set = self.copy()
-        for i, (expr_idx, gene_idx) in enumerate(constant_indices):
+        
+        # 使用扁平化索引快速更新
+        for i, (expr_idx, gene_idx) in enumerate(const_info['flat_indices']):
             new_expr_set.expressions[expr_idx].genes[gene_idx] = Constant(float(new_values[i]))
         
         return new_expr_set

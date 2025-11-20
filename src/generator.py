@@ -138,7 +138,7 @@ class ExprGenerator:
     def _init_constants(self, n_variables):
         if not self.use_constants: return []
         constants = [Constant(self.random_state.normal(0, 3)) for _ in range(
-                min(1, math.ceil(n_variables/2))
+                max(1, math.ceil(n_variables/2))
             )]
 
         return constants

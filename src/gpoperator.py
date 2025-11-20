@@ -18,40 +18,52 @@ from src.fitness import Fitness
 METHODS_WITH_EPS = ['CG', 'BFGS', 'Newton-CG', 'L-BFGS-B', 'SLSQP']
 
 
-def weighted_random_choice(weights_dict: dict, random_state: np.random.RandomState) -> str:
-    """
-    根据权重字典随机选择一个键。
-    
-    Args:
-        weights_dict: 键值对字典，值为权重
-        random_state: 随机状态
-        
-    Returns:
-        str: 被选中的键
-    """
+def weighted_random_choice_expr(weights_dict: dict, random_state: np.random.RandomState) -> str:
     random_state = check_random_state(random_state)
     
     # 将字典转换为可哈希的元组用于缓存
     weights_tuple = tuple(sorted(weights_dict.items()))
-    names, cumulative_probs = _get_cumulative_probs(weights_tuple)
+    names, cumulative_probs = _get_cumulative_probs_expr(weights_tuple)
     
     # 轮盘赌选择
     random_value = random_state.uniform()
-    idx = jnp.searchsorted(cumulative_probs, random_value, side='right')
+    idx = np.searchsorted(cumulative_probs, random_value, side='right')
     return names[idx]
 
 
 @lru_cache(maxsize=128)
-def _get_cumulative_probs(weights_tuple):
-    """
-    计算累积概率（带缓存）。
+def _get_cumulative_probs_expr(weights_tuple):
+    names, weights = zip(*weights_tuple)
+    weights_array = np.array(weights, dtype=np.float64)
     
-    Args:
-        weights_tuple: 排序后的 (name, weight) 元组
-        
-    Returns:
-        tuple: (names列表, 累积概率数组)
-    """
+    # 归一化并计算累积概率
+    total_weight = weights_array.sum()
+    if total_weight <= 0:
+        raise ValueError("总权重必须为正数")
+    
+    probabilities = weights_array / total_weight
+    cumulative_probs = np.cumsum(probabilities)
+    cumulative_probs[-1] = 1.0  # 修正浮点误差
+    
+    return names, cumulative_probs
+
+
+
+def weighted_random_choice_expr_set(weights_dict: dict, random_state: np.random.RandomState) -> str:
+    random_state = check_random_state(random_state)
+    
+    # 将字典转换为可哈希的元组用于缓存
+    weights_tuple = tuple(sorted(weights_dict.items()))
+    names, cumulative_probs = _get_cumulative_probs_expr_set(weights_tuple)
+    
+    # 轮盘赌选择
+    random_value = random_state.uniform()
+    idx = np.searchsorted(cumulative_probs, random_value, side='right')
+    return names[idx]
+
+
+@lru_cache(maxsize=128)
+def _get_cumulative_probs_expr_set(weights_tuple):
     names, weights = zip(*weights_tuple)
     weights_array = np.array(weights, dtype=np.float64)
     
@@ -292,7 +304,7 @@ class ExpressionGP:
         # Get dynamically adjusted weights
         conditioned_weights = self._condition_mutation_weights(parent)
         # Select a mutation
-        mutation_name = weighted_random_choice(conditioned_weights, self.random_state)
+        mutation_name = weighted_random_choice_expr(conditioned_weights, self.random_state)
         if mutation_name == 'rotate_tree':
             new_expr, mutation_succeeded = self.rotate_tree(parent)
         elif mutation_name == 'add_node':
@@ -962,38 +974,102 @@ class ExpressionGP:
         op_idx = self.random_state.choice(operator_indices)
         op_gene = parent.genes[op_idx]
         
-        # 3. 找到这个 'subtree' 的起始位置
-        start_idx = self._find_subexpr_start(parent.genes, op_idx)
+        # 3. 确定该操作符的 'degree' 个操作数子表达式的边界
+        # RPN 结构: [ ..., OP_N, ..., OP_2, OP_1, CURRENT_OP_AT_op_idx ]
+        # 我们需要从 CURRENT_OP_AT_op_idx 往前倒推，找到 op_gene.degree 个操作数子表达式。
         
-        # 4. 找到其所有 '子节点' (操作数) 的边界
         child_boundaries = []
-        current_start = start_idx
-        # 迭代直到我们到达操作符之前
-        while current_start < op_idx:
-            # 找到当前子表达式的结束位置
-            current_end = self._find_first_subexpr_end(parent.genes, current_start)
-            child_boundaries.append((current_start, current_end))
-            current_start = current_end + 1
+        current_pos_end = op_idx - 1 # 从操作符的前一个位置开始
         
+        for _ in range(op_gene.degree):
+            if current_pos_end < 0:
+                # 栈不足，RPN 结构无效
+                return None, False
+            
+            # 找到当前操作数子表达式的起始位置
+            child_start = self._find_subexpr_start(parent.genes, current_pos_end)
+            
+            # 添加到列表中，由于是倒序查找，所以插入到列表的头部以保持正序
+            child_boundaries.insert(0, (child_start, current_pos_end))
+            
+            # 移动到下一个操作数子表达式的结束位置
+            current_pos_end = child_start - 1
+            
         if len(child_boundaries) != op_gene.degree:
-            # RPN 表达式无效 (理论上不应发生)
+            # 理论上，如果上述循环没有返回 None，这里应该匹配
+            # 这是一个额外的安全检查
             return None, False
         
-        # 5. 随机选择一个 '子节点' (subsubtree) 来提升
+        # 4. 随机选择一个 '子节点' (subsubtree) 来提升
+        # 这个 'subsubtree' 将替换整个操作符及其所有操作数。
         selected_idx = self.random_state.choice(len(child_boundaries))
         hoist_start, hoist_end = child_boundaries[selected_idx]
         hoisted_genes = parent.genes[hoist_start : hoist_end + 1]
         
-        # 6. 构建新基因 (用 'subsubtree' 替换 'subtree')
-        new_genes = (
-            parent.genes[:start_idx] + 
-            hoisted_genes + 
-            parent.genes[op_idx + 1:]
+        # 5. 构建新基因 (用 'subsubtree' 替换 'subtree')
+        # 整个被提升的子树是从第一个操作数子表达式的起始位置到操作符自身。
+        # 也就是 parent.genes[child_boundaries[0][0] : op_idx + 1] 这段将被替换。
+        
+        full_subtree_start = child_boundaries[0][0] # 整个子树的起始位置
+        
+        new_genes_list = (
+            parent.genes[:full_subtree_start] + # 前缀部分
+            hoisted_genes +                     # 被提升的子表达式
+            parent.genes[op_idx + 1:]           # 操作符之后的部分 (如果存在)
         )
         
-        # 7. 复制和验证
-        new_expr = self.reproduce(genes=new_genes)
+        # 6. 复制和验证
+        # 假设 Expression 构造函数会调用 _is_valid 进行验证
+        new_expr = Expression(genes=new_genes_list, metric=parent.metric)
+        if not new_expr._is_valid():
+            # 如果新表达式无效，则返回 None
+            return None, False 
+            
         return new_expr, True
+
+    # def hoist_tree(self, parent: Expression) -> Tuple[Optional['Expression'], bool]:
+    #     """提升子树 (RPN version)"""
+    #     # 1. 找到所有非叶子 '节点' (操作符)
+    #     operator_indices = [i for i, gene in enumerate(parent.genes) if gene.degree > 0]
+    #     if not operator_indices:
+    #         return None, False
+        
+    #     # 2. 随机选择一个操作符 (作为 'subtree' 的根)
+    #     op_idx = self.random_state.choice(operator_indices)
+    #     op_gene = parent.genes[op_idx]
+        
+    #     # 3. 找到这个 'subtree' 的起始位置
+    #     start_idx = self._find_subexpr_start(parent.genes, op_idx)
+        
+    #     # 4. 找到其所有 '子节点' (操作数) 的边界
+    #     child_boundaries = []
+    #     current_start = start_idx
+    #     # 迭代直到我们到达操作符之前
+    #     while current_start < op_idx:
+    #         # 找到当前子表达式的结束位置
+    #         current_end = self._find_first_subexpr_end(parent.genes, current_start)
+    #         child_boundaries.append((current_start, current_end))
+    #         current_start = current_end + 1
+        
+    #     if len(child_boundaries) != op_gene.degree:
+    #         # RPN 表达式无效 (理论上不应发生)
+    #         return None, False
+        
+    #     # 5. 随机选择一个 '子节点' (subsubtree) 来提升
+    #     selected_idx = self.random_state.choice(len(child_boundaries))
+    #     hoist_start, hoist_end = child_boundaries[selected_idx]
+    #     hoisted_genes = parent.genes[hoist_start : hoist_end + 1]
+        
+    #     # 6. 构建新基因 (用 'subsubtree' 替换 'subtree')
+    #     new_genes = (
+    #         parent.genes[:start_idx] + 
+    #         hoisted_genes + 
+    #         parent.genes[op_idx + 1:]
+    #     )
+        
+    #     # 7. 复制和验证
+    #     new_expr = self.reproduce(genes=new_genes)
+    #     return new_expr, True
 
     def do_nothing_tree(self, parent: Expression) -> Tuple[Optional['Expression'], bool]:
         """返回一个新的、相同的表达式，表示没有变化。"""
@@ -2063,7 +2139,7 @@ class ExpressionSetGP:
         strategies based on pre-defined weights and executing it.
         """
         conditioned_weights = self._condition_mutation_weights(parent)
-        mutation_name = weighted_random_choice(conditioned_weights, self.random_state)
+        mutation_name = weighted_random_choice_expr_set(conditioned_weights, self.random_state)
         
         # Dispatch to the correct mutation method
         if mutation_name == 'mutate_expr':
@@ -2098,10 +2174,14 @@ class ExpressionSetGP:
         mutation_point = self.random_state.choice(valid_points)
         parent_expr = parent.expressions[mutation_point]
         
-        mutated_expr, mutation_succeeded, _ = self.gpoperator.mutation(parent_expr)
+        mutated_expr, mutation_succeeded, mutation_name = self.gpoperator.mutation(parent_expr)
         
         # 1. 提早失败
         if not mutation_succeeded:
+            return None, False
+        
+        if not mutated_expr._is_valid():
+            print(f"Invalid mutation: {mutated_expr}")
             return None, False
         
         # 2. 构建一个全新的列表
@@ -2271,47 +2351,41 @@ class ExpressionSetGP:
     def optimize_constants(self, parent: ExpressionSet, X, y, 
                            optimizer_algorithm='L-BFGS-B', optimizer_nrestarts=3, 
                            optimizer_iterations=10) -> Tuple[Optional['ExpressionSet'], bool]:
-        # 收集所有常量节点，提取初始常量值
-        constant_indices = []
-        for expr_idx, expr in enumerate(parent.expressions):
-            if expr is not None:
-                constant_indices.extend([
-                    (expr_idx, gene_idx) for gene_idx, gene in enumerate(expr.genes) 
-                        if isinstance(gene, Constant)
-                ])
+        """优化表达式集合的所有常量"""
         
-        if not constant_indices:
+        # 1. 获取常量信息（只构建一次）
+        const_info = parent._build_constant_info()
+        if const_info['total_constants'] == 0:
             return None, False, np.nan
         
-        # 转换为JAX数组
+        # 2. 准备JAX数组（只转换一次）
         X_jax = jnp.array(X)
         y_jax = jnp.array(y)
         
-        # 提取初始常量值（NumPy 数组以便向量化操作）
-        initial_constants = jnp.array([
-            parent[expr_idx][gene_idx].value for (expr_idx, gene_idx) in constant_indices
-        ])
-        
-        # 预编译JAX梯度函数（只编译一次）
+        # 3. 预编译梯度函数（只编译一次）
         grad_fn = parent._get_gradient_function()
-        X_jax = jnp.array(X)
-        y_jax = jnp.array(y)
-
-        # 定义优化目标（使用预编译的梯度）
-        def objective_and_grad(constants_np):
-            constants_jax = jnp.array(constants_np)
+        
+        # 4. 定义优化目标
+        def objective_and_grad(constants):
+            constants_jax = jnp.array(constants)
             
-            # 计算梯度（使用预编译的函数）
+            # 计算梯度（复用编译）
             grad = grad_fn(constants_jax, X_jax, y_jax)
             
             # 计算损失（使用快速的NumPy执行）
-            temp_expr = parent.update_constants(constants_np)
-            fitness = temp_expr.fitness(X, y)
+            temp_expr_set = parent.update_constants(constants)
+            fitness = temp_expr_set.fitness(X, y)
             loss = -fitness if parent.metric.greater_is_better else fitness
             
             return float(loss), np.array(grad)
         
-        # 多次重启优化
+        # 5. 提取初始常量
+        initial_constants = np.array([
+            parent.expressions[expr_idx].genes[gene_idx].value
+            for expr_idx, gene_idx in const_info['flat_indices']
+        ])
+        
+        # 6. 执行优化
         best_loss = float('inf')
         best_constants = initial_constants.copy()
         
@@ -2349,13 +2423,100 @@ class ExpressionSetGP:
                 best_loss = result.fun
                 best_constants = result.x
         
-        # 创建优化后的表达式
+        # 7. 返回优化后的表达式集合
         optimized_expr_set = parent.update_constants(best_constants)
-        
-        # 最终适应度
         final_fitness = -best_loss if parent.metric.greater_is_better else best_loss
         
         return optimized_expr_set, True, final_fitness
+
+    # def optimize_constants(self, parent: ExpressionSet, X, y, 
+    #                        optimizer_algorithm='L-BFGS-B', optimizer_nrestarts=3, 
+    #                        optimizer_iterations=10) -> Tuple[Optional['ExpressionSet'], bool]:
+    #     # 收集所有常量节点，提取初始常量值
+    #     constant_indices = []
+    #     for expr_idx, expr in enumerate(parent.expressions):
+    #         if expr is not None:
+    #             constant_indices.extend([
+    #                 (expr_idx, gene_idx) for gene_idx, gene in enumerate(expr.genes) 
+    #                     if isinstance(gene, Constant)
+    #             ])
+        
+    #     if not constant_indices:
+    #         return None, False, np.nan
+        
+    #     # 转换为JAX数组
+    #     X_jax = jnp.array(X)
+    #     y_jax = jnp.array(y)
+        
+    #     # 提取初始常量值（NumPy 数组以便向量化操作）
+    #     initial_constants = jnp.array([
+    #         parent[expr_idx][gene_idx].value for (expr_idx, gene_idx) in constant_indices
+    #     ])
+        
+    #     # 预编译JAX梯度函数（只编译一次）
+    #     grad_fn = parent._get_gradient_function()
+    #     X_jax = jnp.array(X)
+    #     y_jax = jnp.array(y)
+
+    #     # 定义优化目标（使用预编译的梯度）
+    #     def objective_and_grad(constants_np):
+    #         constants_jax = jnp.array(constants_np)
+            
+    #         # 计算梯度（使用预编译的函数）
+    #         grad = grad_fn(constants_jax, X_jax, y_jax)
+            
+    #         # 计算损失（使用快速的NumPy执行）
+    #         temp_expr = parent.update_constants(constants_np)
+    #         fitness = temp_expr.fitness(X, y)
+    #         loss = -fitness if parent.metric.greater_is_better else fitness
+            
+    #         return float(loss), np.array(grad)
+        
+    #     # 多次重启优化
+    #     best_loss = float('inf')
+    #     best_constants = initial_constants.copy()
+        
+    #     for restart in range(optimizer_nrestarts):
+    #         # 第一次使用原始值，后续添加噪声
+    #         if restart == 0:
+    #             x0 = initial_constants.copy()
+    #         else:
+    #             # 噪声强度递减（避免后期扰动过大）
+    #             noise_scale = 0.05 / np.sqrt(restart)
+    #             # restart=1: 5%, restart=2: 3.5%, restart=3: 2.9%
+    #             noise = self.random_state.normal(0, noise_scale, size=len(initial_constants))
+    #             constants_scale = np.abs(initial_constants) + 1e-6  # 处理零值
+    #             x0 = initial_constants + noise * constants_scale
+            
+    #         # 执行优化
+    #         if optimizer_algorithm in METHODS_WITH_EPS:
+    #             result = minimize(
+    #                 objective_and_grad, x0,
+    #                 method=optimizer_algorithm, jac=True,
+    #                 options={
+    #                     'maxiter': optimizer_iterations,
+    #                     'eps': self.gpoperator.constants_tolerance
+    #                 }
+    #             )
+    #         else:
+    #             result = minimize(
+    #                 objective_and_grad, x0,
+    #                 method=optimizer_algorithm, jac=True,
+    #                 options={'maxiter': optimizer_iterations}
+    #             )
+            
+    #         # 更新最佳结果
+    #         if result.fun < best_loss:
+    #             best_loss = result.fun
+    #             best_constants = result.x
+        
+    #     # 创建优化后的表达式
+    #     optimized_expr_set = parent.update_constants(best_constants)
+        
+    #     # 最终适应度
+    #     final_fitness = -best_loss if parent.metric.greater_is_better else best_loss
+        
+    #     return optimized_expr_set, True, final_fitness
 
     def optimize_aggregations(
         self, parent: ExpressionSet, X, y, 

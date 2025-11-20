@@ -130,7 +130,7 @@ class Population:
         self.individuals = []
         random_state = check_random_state(seed)
         self.sizes = np.zeros(self.population_size)
-        self.fitnesses = np.zeros(self.population_size)
+        self.fitnesses = np.zeros(self.population_size, dtype=np.float32)
         for i in range(self.population_size):
             X_batch, y_batch = self._get_batch(X, y, random_state)
             if isinstance(self.generator, ExprSetGenerator):

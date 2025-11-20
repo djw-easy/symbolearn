@@ -220,7 +220,7 @@ class SymbolicClassifier(BaseSymbolic, ClassifierMixin):
         else:
             raise ValueError("The number of classes should be greater than 1.")
         
-        return self._run(X, y_new, sample_weight, variable_names)
+        return self._run(X, y_new, variable_names)
 
     def predict(self, X):
         """Perform classification on test vectors X.
