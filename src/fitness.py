@@ -1,3 +1,4 @@
+import jax
 import optax
 import jax.numpy as jnp
 from joblib import wrap_non_picklable_objects
@@ -39,6 +40,7 @@ class Fitness(object):
 
     def __call__(self, *args, **kwargs):
         return self.function(*args, **kwargs)
+
 
 
 

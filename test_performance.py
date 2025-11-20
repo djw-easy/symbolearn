@@ -22,31 +22,26 @@ def generate_data_for_expression(expression_type, n_samples=1000, noise_std=0.1,
         # y = 2.5*x0 + 1.3*x1 - 0.8
         y_true = X[:, 0] * 2.5 + X[:, 1] * 1.3 - 0.8
         true_params = jnp.array([2.5, 1.3, -0.8])
-        
     elif expression_type == "with_interaction":
         # y = 1.8*x0 + 0.9*x1 + 0.5*x0*x1 - 1.2
         y_true = X[:, 0] * 1.8 + X[:, 1] * 0.9 + X[:, 0] * X[:, 1] * 0.5 - 1.2
         true_params = jnp.array([1.8, 0.9, 0.5, -1.2])
-        
     elif expression_type == "nonlinear_simple":
         # y = tanh(1.5*x0 + 0.3) + 0.8*x1
         y_true = jnp.tanh(X[:, 0] * 1.5 + 0.3) + X[:, 1] * 0.8
         true_params = jnp.array([1.5, 0.3, 0.8])
-        
     elif expression_type == "polynomial_with_tanh":
         # y = (1.2*x0 + 0.7*x1) * 0.9 + tanh(0.5*x2 - 0.2)
         linear_part = (X[:, 0] * 1.2 + X[:, 1] * 0.7) * 0.9
         nonlinear_part = jnp.tanh(X[:, 2] * 0.5 - 0.2)
         y_true = linear_part + nonlinear_part
         true_params = jnp.array([1.2, 0.7, 0.9, 0.5, -0.2])
-        
     elif expression_type == "nested_division":
         # y = 2.0*(x0 + 0.5*x1) / (1.0 + sigmoid(1.5*x2 - 0.8))
         numerator = 2.0 * (X[:, 0] + 0.5 * X[:, 1])
         denominator = 1.0 + 1.0 / (1.0 + jnp.exp(-(1.5 * X[:, 2] - 0.8)))
         y_true = numerator / denominator
         true_params = jnp.array([2.0, 0.5, 1.0, 1.5, -0.8])
-        
     elif expression_type == "multi_var_combination":
         # y = softplus(0.8*x0) + 1.2*x1*x2 - 0.6/(x3 + 0.3)
         term1 = jnp.log(1.0 + jnp.exp(0.8 * X[:, 0]))  # softplus
@@ -54,7 +49,6 @@ def generate_data_for_expression(expression_type, n_samples=1000, noise_std=0.1,
         term3 = 0.6 / (X[:, 3] + 0.3)
         y_true = term1 + term2 - term3
         true_params = jnp.array([0.8, 1.2, 0.6, 0.3])
-        
     elif expression_type == "transformation_chain":
         # y = tanh(1.1*(x0 - 0.4)) * sigmoid(0.9*x1 + 0.2) + 1.3*x2
         term1 = jnp.tanh(1.1 * (X[:, 0] - 0.4))
@@ -62,7 +56,6 @@ def generate_data_for_expression(expression_type, n_samples=1000, noise_std=0.1,
         term3 = 1.3 * X[:, 2]
         y_true = term1 * term2 + term3
         true_params = jnp.array([1.1, 0.4, 0.9, 0.2, 1.3])
-        
     else:
         raise ValueError(f"未知的表达式类型: {expression_type}")
     
@@ -235,6 +228,7 @@ def optimize_constants(parent: Expression, X, y,
     
     return new_expr, True, raw_fitness
 
+
 def optimize_constants_jax(parent: Expression, X, y,
                            learning_rate=0.1, optimizer_iterations=50,
                            optimizer_nrestarts=3, random_state: np.random.RandomState = None):
@@ -312,6 +306,86 @@ def optimize_constants_jax(parent: Expression, X, y,
     return new_expr, True, float(raw_fitness)
 
 
+def optimize_constants_hybrid(
+    expr: Expression, 
+    X: np.ndarray, 
+    y: np.ndarray,
+    optimizer_algorithm='L-BFGS-B',
+    optimizer_nrestarts=3,
+    optimizer_iterations=10, 
+    random_state: np.random.RandomState = None
+):
+    """
+    混合策略的常量优化
+    - 梯度计算：JAX（快速自动微分）
+    - 适应度评估：NumPy（避免重复编译）
+    """
+    # 检查是否有常量
+    if not expr._has_constants:
+        return expr, False, expr.fitness(X, y)
+    random_state = check_random_state(random_state)
+    
+    # 获取初始常量
+    initial_constants = np.array([
+        expr.genes[idx].value for idx in expr._constant_indices
+    ])
+    
+    # 预编译JAX梯度函数（只编译一次）
+    grad_fn = expr._get_gradient_function()
+    X_jax = jnp.array(X)
+    y_jax = jnp.array(y)
+    
+    # 定义优化目标（使用预编译的梯度）
+    def objective_and_grad(constants_np):
+        constants_jax = jnp.array(constants_np)
+        
+        # 计算梯度（使用预编译的函数）
+        grad = grad_fn(constants_jax, X_jax, y_jax)
+        
+        # 计算损失（使用快速的NumPy执行）
+        temp_expr = expr.update_constants(constants_np)
+        fitness = temp_expr.fitness(X, y)
+        loss = -fitness if expr.metric.greater_is_better else fitness
+        
+        return float(loss), np.array(grad)
+    
+    # 多次重启优化
+    best_loss = float('inf')
+    best_constants = initial_constants.copy()
+    
+    for restart in range(optimizer_nrestarts):
+        # 初始点
+        if restart == 0:
+            x0 = initial_constants.copy()
+        else:
+            noise_scale = 0.05 / np.sqrt(restart)
+            noise = random_state.normal(0, noise_scale, size=len(initial_constants))
+            constants_scale = np.abs(initial_constants) + 1e-6
+            x0 = initial_constants + noise * constants_scale
+        
+        # 执行优化
+        result = minimize(
+            objective_and_grad,
+            x0,
+            method=optimizer_algorithm,
+            jac=True,
+            options={'maxiter': optimizer_iterations}
+        )
+        
+        # 更新最佳结果
+        if result.fun < best_loss:
+            best_loss = result.fun
+            best_constants = result.x
+    
+    # 创建优化后的表达式
+    optimized_expr = expr.update_constants(best_constants)
+    
+    # 计算最终适应度
+    final_fitness = optimized_expr.fitness(X, y)
+    
+    return optimized_expr, True, final_fitness
+
+
 def expr_with_constants(expr: Expression, constants: np.ndarray):
     constant_indices = [i for i, gene in enumerate(expr.genes) 
                         if isinstance(gene, Constant)]
@@ -330,6 +404,7 @@ for expr_name in raw_expressions.keys():
     X, y, y_true, true_params = generate_data_for_expression(
         expr_name, n_samples=1000, noise_std=0.05
     )
+    X, y = np.array(X), np.array(y)
     start_time = time.time()
     n_iterations = 1000
     for i in range(n_iterations):
@@ -353,8 +428,9 @@ for expr_name in raw_expressions.keys():
     X, y, y_true, true_params = generate_data_for_expression(
         expr_name, n_samples=1000, noise_std=0.05
     )
+    X, y = np.array(X), np.array(y)
     print(f'模板表达式: {expr_with_constants(expression, true_params)}')
-    new_expr, _, _ = optimize_constants(expression, X, y)
+    new_expr, _, _ = optimize_constants_hybrid(expression, X, y)
     print(f'优化表达式: {new_expr}')
 end_time = time.time()
 print(f"全部评估耗时: {end_time - start_time:.3f} 秒")
@@ -369,11 +445,12 @@ for expr_name in raw_expressions.keys():
     X, y, y_true, true_params = generate_data_for_expression(
         expr_name, n_samples=1000, noise_std=0.05
     )
+    X, y = np.array(X), np.array(y)
     start_time = time.time()
     n_iterations = 100
     for i in range(n_iterations):
         expression = Expression(genes=raw_expressions[expr_name]["genes"], metric=_fitness_map['mse'])
-        new_expr, _, _ = optimize_constants_jax(expression, X, y, optimizer_iterations=50)
+        new_expr, _, _ = optimize_constants_hybrid(expression, X, y)
     end_time = time.time()
     avg_time = (end_time - start_time) / n_iterations * 1000
     throughput = n_iterations / (end_time - start_time)

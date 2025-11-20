@@ -83,7 +83,7 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
             else:
                 X, y = check_X_y(X, y.ravel(), y_numeric=True)
         
-        X, y = jnp.array(X), jnp.array(y)
+        # X, y = jnp.array(X), jnp.array(y)
         return self._run(X, y, variable_names)
     
     def predict(self, X):

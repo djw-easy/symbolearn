@@ -1240,180 +1240,83 @@ class ExpressionGP:
         
         return new_expr, True
 
-    def optimize_constants(self, parent: Expression, X, y,
-                           optimizer_algorithm='L-BFGS-B', learning_rate=0.1, 
-                           optimizer_iterations=50, optimizer_nrestarts=3):
+    def optimize_constants(
+        self,
+        expr: Expression, 
+        X: np.ndarray, 
+        y: np.ndarray,
+        optimizer_algorithm='L-BFGS-B',
+        optimizer_nrestarts=3,
+        optimizer_iterations=10
+    ):
         """
-        使用 JAX 原生优化器 (optax) 加速常量优化。
+        混合策略的常量优化
+        - 梯度计算：JAX（快速自动微分）
+        - 适应度评估：NumPy（避免重复编译）
         """
-        # 1. 收集常量信息
-        constant_indices = [i for i, gene in enumerate(parent.genes) if isinstance(gene, Constant)]
-        if not constant_indices:
-            return parent, False, np.nan
-
-        initial_constants = jnp.array([parent.genes[i].value for i in constant_indices])
-
-        # 2. 定义 JAX 原生的目标函数
-        def objective(constants: jnp.ndarray):
-            fitness = parent._fitness_for_grad(X, y, constants)
-            loss = -fitness if parent.metric.greater_is_better else fitness
-            return loss
-
-        # 3. 定义并 JIT 编译整个优化步骤
-        # 使用 value_and_grad 可以同时计算损失和梯度，更高效
-        grad_fn = jax.value_and_grad(objective)
-
-        # 选择一个 optax 优化器，Adam 是一个很好的默认选择
-        optimizer = optax.adam(learning_rate)
-
-        @jax.jit
-        def optimization_step(params, opt_state):
-            """执行单步优化，这个函数将被 JIT 编译"""
-            loss, grads = grad_fn(params)
-            updates, new_opt_state = optimizer.update(grads, opt_state)
-            new_params = optax.apply_updates(params, updates)
-            return new_params, new_opt_state, loss
-
-        # 4. 多次重启优化
-        best_loss = jnp.inf
-        best_constants = initial_constants
-
+        # 检查是否有常量
+        if not expr._has_constants:
+            return expr, False, expr.fitness(X, y)
+        
+        # 获取初始常量
+        initial_constants = np.array([
+            expr.genes[idx].value for idx in expr._constant_indices
+        ])
+        
+        # 预编译JAX梯度函数（只编译一次）
+        grad_fn = expr._get_gradient_function()
+        X_jax = jnp.array(X)
+        y_jax = jnp.array(y)
+        
+        # 定义优化目标（使用预编译的梯度）
+        def objective_and_grad(constants_np):
+            constants_jax = jnp.array(constants_np)
+            
+            # 计算梯度（使用预编译的函数）
+            grad = grad_fn(constants_jax, X_jax, y_jax)
+            
+            # 计算损失（使用快速的NumPy执行）
+            temp_expr = expr.update_constants(constants_np)
+            fitness = temp_expr.fitness(X, y)
+            loss = -fitness if expr.metric.greater_is_better else fitness
+            
+            return float(loss), np.array(grad)
+        
+        # 多次重启优化
+        best_loss = float('inf')
+        best_constants = initial_constants.copy()
+        
         for restart in range(optimizer_nrestarts):
-            # 初始化参数和优化器状态
+            # 初始点
             if restart == 0:
-                current_constants = initial_constants
+                x0 = initial_constants.copy()
             else:
                 noise_scale = 0.05 / np.sqrt(restart)
                 noise = self.random_state.normal(0, noise_scale, size=len(initial_constants))
                 constants_scale = np.abs(initial_constants) + 1e-6
-                current_constants = initial_constants + noise * constants_scale
-                current_constants = jnp.array(current_constants)
-
-            opt_state = optimizer.init(current_constants)
-
-            # 运行优化循环
-            # 注意：这里的 for 循环在 Python 中运行，但每次循环调用的是一个
-            # 已经 JIT 编译好的高效函数 optimization_step。
-            for _ in range(optimizer_iterations):
-                current_constants, opt_state, _ = optimization_step(current_constants, opt_state)
-
-            # 评估本次重启的结果
-            final_loss = objective(current_constants)
-            if final_loss < best_loss:
-                best_loss = final_loss
-                best_constants = current_constants
-
-        # 5. 应用最佳常量
-        new_genes = parent.genes.copy()
-        for idx, const_idx in enumerate(constant_indices):
-            new_genes[const_idx] = Constant(best_constants[idx])
-        new_expr = Expression(genes=new_genes, metric=parent.metric)
-
-        # 6. 计算最终适应度
-        raw_fitness = -best_loss if new_expr.metric.greater_is_better else best_loss
-
-        return new_expr, True, raw_fitness
-
-    # def optimize_constants(self, parent: Expression, X, y, 
-    #                        optimizer_algorithm='L-BFGS-B', optimizer_nrestarts=3,
-    #                        optimizer_iterations=10) -> Tuple[Optional['Expression'], bool]:
-    #     """
-    #     使用数值优化方法优化表达式中的所有常量
-        
-    #     参数
-    #     ----------
-    #     X : array-like, shape (n_samples, n_features)
-    #         输入特征
-    #     y : array-like, shape (n_samples,)
-    #         目标变量
-    #     sample_weight : array-like, shape (n_samples,)
-    #         样本权重
-    #     optimizer_algorithm : str
-    #         优化算法（scipy.optimize.minimize 支持的方法）
-    #         推荐: 'L-BFGS-B', 'BFGS', 'CG', 'SLSQP'
-    #     optimizer_nrestarts : int
-    #         多次重启次数（避免局部最优）
-    #     optimizer_iterations : int
-    #         每次优化的最大迭代次数
-        
-    #     返回
-    #     -------
-    #     new_expr : AdvancedLinearExpression
-    #         优化后的表达式
-    #     success : bool
-    #         优化是否成功
-        
-    #     时间复杂度：O(nrestarts * iterations * n_samples)
-    #     """
-    #     # 1. 收集所有常量的索引（一次遍历）
-    #     constant_indices = [i for i, gene in enumerate(parent.genes) 
-    #                        if isinstance(gene, Constant)]
-        
-    #     if not constant_indices:
-    #         return None, False, np.nan
-        
-    #     # 2. 提取初始常量值
-    #     initial_constants = jnp.array([parent.genes[i].value for i in constant_indices])
-        
-    #     # 3. 定义目标函数
-    #     @jax.jit
-    #     def objective(constants: jnp.ndarray):
-    #         fitness = parent._fitness_for_grad(X, y, constants)
-    #         loss = -fitness if parent.metric.greater_is_better else fitness
-    #         return loss
-        
-    #     # JIT编译梯度计算
-    #     grad_fn = jax.jit(jax.grad(objective))
-
-    #     def scipy_wrapper(x):
-    #         x_jax = jnp.array(x)
-    #         return float(objective(x_jax)), np.array(grad_fn(x_jax))
-        
-    #     # 4. 多次重启优化（寻找全局最优）
-    #     best_loss = objective(initial_constants)
-    #     best_constants = initial_constants.copy()
-        
-    #     for restart in range(optimizer_nrestarts):
-    #         # 第一次使用原始值，后续添加噪声
-    #         if restart == 0:
-    #             x0 = initial_constants.copy()
-    #         else:
-    #             # 噪声强度递减（避免后期扰动过大）
-    #             noise_scale = 0.05 / np.sqrt(restart)
-    #             # restart=1: 5%, restart=2: 3.5%, restart=3: 2.9%
-    #             noise = self.random_state.normal(0, noise_scale, size=len(initial_constants))
-    #             constants_scale = np.abs(initial_constants) + 1e-6  # 处理零值
-    #             x0 = initial_constants + noise * constants_scale
+                x0 = initial_constants + noise * constants_scale
             
-    #         # 执行优化
-    #         if optimizer_algorithm in METHODS_WITH_EPS:
-    #             result = minimize(
-    #                 scipy_wrapper, x0,
-    #                 method=optimizer_algorithm, jac=True,
-    #                 options={'maxiter': optimizer_iterations, 'eps': self.constants_tolerance}
-    #             )
-    #         else:
-    #             result = minimize(
-    #                 scipy_wrapper, x0,
-    #                 method=optimizer_algorithm, jac=True,
-    #                 options={'maxiter': optimizer_iterations}
-    #             )
+            # 执行优化
+            result = minimize(
+                objective_and_grad,
+                x0,
+                method=optimizer_algorithm,
+                jac=True,
+                options={'maxiter': optimizer_iterations}
+            )
             
-    #         # 更新最佳结果
-    #         if result.fun < best_loss:
-    #             best_loss = result.fun
-    #             best_constants = result.x
+            # 更新最佳结果
+            if result.fun < best_loss:
+                best_loss = result.fun
+                best_constants = result.x
         
-    #     # 5. 应用最佳常量
-    #     new_genes = parent.genes.copy()
-    #     for idx, const_idx in enumerate(constant_indices):
-    #         new_genes[const_idx] = Constant(best_constants[idx])
-    #     new_expr = self.reproduce(genes=new_genes)
+        # 创建优化后的表达式
+        optimized_expr = expr.update_constants(best_constants)
         
-    #     # 6. 更新适应度
-    #     raw_fitness = -best_loss if new_expr.metric.greater_is_better else best_loss
+        # 计算最终适应度
+        final_fitness = optimized_expr.fitness(X, y)
         
-    #     return new_expr, True, raw_fitness
+        return optimized_expr, True, final_fitness
 
     def optimize_aggregations(self, parent: Expression, X, y, 
                               optimizer_iterations=10, max_shift_ratio=0.1, 

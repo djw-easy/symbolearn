@@ -47,7 +47,7 @@ sr_single = SymbolicRegressor(
     add_node=0.0,
     # stopping_criteria=0.0001,
     ncycles_per_iteration=380,
-    should_optimize_constants=False,
+    should_optimize_constants=True,
     n_jobs=1, verbose=1, random_state=42)
 sr_single.fit(X_train, y_train_single)
 print("\nPareto Front:")
