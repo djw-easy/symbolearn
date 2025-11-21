@@ -46,24 +46,23 @@ y_train_multi = np.stack(
 
 
 
-# print(f"{'-'*23} Testing Single Expression for Symbolic Regression {'-'*23}")
+print(f"{'-'*23} Testing Single Expression for Symbolic Regression {'-'*23}")
 
-# sr_single = SymbolicRegressor(
-#     maxsize=15, 
-#     niterations=10, 
-#     populations=31,
-#     population_size=27, 
-#     use_constant=True,
-#     initial_constants=10,
-#     add_node=0.0, use_aggregation=True,
-#     # stopping_criteria=0.0001,
-#     ncycles_per_iteration=380,
-#     should_optimize_constants=True,
-#     n_jobs=1, verbose=1, random_state=42)
-# sr_single.fit(X_train, y_train_single)
-# print("\nPareto Front:")
-# df = sr_single.get_hof()
-# print(df)
+sr_single = SymbolicRegressor(
+    maxsize=15, 
+    niterations=10, 
+    populations=64,
+    population_size=27, 
+    use_constant=True,
+    use_aggregation=False,
+    ncycles_per_iteration=380,
+    should_optimize_constants=True,
+    should_optimize_aggregations=True,
+    n_jobs=1, verbose=1, random_state=42)
+sr_single.fit(X_train, y_train_single)
+print("\nPareto Front:")
+df = sr_single.get_hof()
+print(df)
 
 
 
@@ -82,7 +81,7 @@ y_train_multi = np.stack(
 #     populations=31,
 #     population_size=27, 
 #     metric=mse_fitness,
-#     add_node=0.0, use_constant=True,
+#     use_constant=True,
 #     maxsize=21, order=4,
 #     # stopping_criteria=0.0001,
 #     ncycles_per_iteration=380,
@@ -95,52 +94,52 @@ y_train_multi = np.stack(
 
 
 
-if __name__ == '__main__':
-    print("--- Testing ExpressionSet for Symbolic Classifier ---")
+# if __name__ == '__main__':
+#     print(f"{'-'*34} Testing ExpressionSet for Symbolic Regression {'-'*34}")
 
-    selected_dataset = 'Pavia University'
-    dataset_info = datasets_info[selected_dataset]
+#     selected_dataset = 'Pavia University'
+#     dataset_info = datasets_info[selected_dataset]
 
-    # Load data
-    root_dir = os.getcwd()
-    X = loadmat(os.path.join(root_dir, f'data/hyperspectral/{selected_dataset}/{dataset_info[0]}.mat'))
-    X = X[dataset_info[1]]
-    y = loadmat(os.path.join(root_dir, f'data/hyperspectral/{selected_dataset}/{dataset_info[2]}.mat'))
-    y = y[dataset_info[3]]
-    X = X[y != 0, :]
-    y = y[y != 0]
+#     # Load data
+#     root_dir = os.getcwd()
+#     X = loadmat(os.path.join(root_dir, f'data/hyperspectral/{selected_dataset}/{dataset_info[0]}.mat'))
+#     X = X[dataset_info[1]]
+#     y = loadmat(os.path.join(root_dir, f'data/hyperspectral/{selected_dataset}/{dataset_info[2]}.mat'))
+#     y = y[dataset_info[3]]
+#     X = X[y != 0, :]
+#     y = y[y != 0]
 
-    # Standardize data
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
+#     # Standardize data
+#     scaler = StandardScaler()
+#     X_scaled = scaler.fit_transform(X)
 
-    # Split data
-    X_train, X_test, y_train, y_test = train_test_split(
-        X_scaled, y, train_size=200*dataset_info[-1], random_state=42, stratify=y
-    )
+#     # Split data
+#     X_train, X_test, y_train, y_test = train_test_split(
+#         X_scaled, y, train_size=200*dataset_info[-1], random_state=42, stratify=y
+#     )
     
-    sc_classifier = SymbolicClassifier(
-        maxsize=17,
-        add_node=0.0,
-        niterations=10,
-        populations=31,
-        population_size=27,
-        use_constant=True,
-        use_variable=True,
-        use_aggregation=False,
-        ncycles_per_iteration=38,
-        batching=False, batch_size=512,
-        should_optimize_aggregations=True,
-        n_jobs=16, verbose=1, random_state=42,
-        metric='cross_entropy', out_func='softmax',
-        aggregation_operators=('mean', 'min', 'max'),
-        operators=('+', '*', 'sigmoid', 'tanh', 'softplus')
-    )
-    sc_classifier.fit(X_train, y_train)
-    # print(sc_classifier.get_best().expression.fitness(X_train, y_train-1))
-    print("TrainSet模型准确率:", sc_classifier.score(X_train, y_train))
-    print("TestSet模型准确率:", sc_classifier.score(X_test, y_test))
-    print("\nPareto Front:")
-    df = sc_classifier.get_hof()
-    print(df)
+#     sc_classifier = SymbolicClassifier(
+#         maxsize=17,
+#         add_node=0.0,
+#         niterations=10,
+#         populations=31,
+#         population_size=27,
+#         use_constant=True,
+#         use_variable=True,
+#         use_aggregation=False,
+#         ncycles_per_iteration=38,
+#         batching=False, batch_size=512,
+#         should_optimize_aggregations=True,
+#         n_jobs=16, verbose=1, random_state=42,
+#         metric='cross_entropy', out_func='softmax',
+#         aggregation_operators=('mean', 'min', 'max'),
+#         operators=('+', '*', 'sigmoid', 'tanh', 'softplus')
+#     )
+#     sc_classifier.fit(X_train, y_train)
+#     # print(sc_classifier.get_best().expression.fitness(X_train, y_train-1))
+#     print("TrainSet模型准确率:", sc_classifier.score(X_train, y_train))
+#     print("TestSet模型准确率:", sc_classifier.score(X_test, y_test))
+#     print("\nPareto Front:")
+#     df = sc_classifier.get_hof()
+#     print(df)
 

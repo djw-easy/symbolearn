@@ -7,7 +7,7 @@ from typing import Union, Optional, List, Tuple, Callable
 
 
 from src.node import Operator, Constant, Variable, _operator_map, NodeContent, DynamicAggregation
-from src.tree import count_trees, generate_random_tree, get_mth_tree
+from src.tree import count_trees, generate_random_tree, get_mth_tree, SymbolicNode, PreOrderIter
 from src.expression import Expression, ExpressionSet
 from src.fitness import Fitness, _fitness_map
 from src.utils import check_random_state
@@ -216,50 +216,55 @@ class ExprGenerator:
     # ------------------------------------------------------------------------
 
     def generate_random_expr(self, size: Optional[int] = None):
-        genes = self.build_tree(size)
+        tree = self.build_tree(size)
         expression = Expression(
-            genes=genes, metric=self.metric, out_func=self.out_func
+            tree=tree, metric=self.metric, out_func=self.out_func
         )
         return expression
 
-    def build_tree(self, size: Optional[int] = None) -> List[NodeContent]:
+    def build_tree(self, size: Optional[int] = None) -> SymbolicNode:
         """根据大小限制，公平地生成一个随机符号树。"""
         # 使用全局缓存的 count_memo
         count_memo = ExprGenerator._global_count_memo.setdefault(self._cache_key, {})
+        
         if size is None:
-            size = self.random_state.choice(
-                list(self.size_prob.keys()), p=list(self.size_prob.values())
-            )
+            size = self.random_state.choice(list(self.size_prob.keys()), p=list(self.size_prob.values()))
         
         if self.maxsize <= 31:
             tree_index = self.random_state.randint(self.size_tree_counts[size], dtype=np.int64)
-            genes_degree = get_mth_tree(size, self.valid_degrees, tree_index, count_memo)
+            tree = get_mth_tree(size, self.valid_degrees, tree_index, count_memo)
         else:
-            genes_degree = generate_random_tree(size, self.valid_degrees, count_memo, self.random_state)
+            tree = generate_random_tree(size, self.valid_degrees, count_memo, self.random_state)
         
-        genes = []
-        for degree in genes_degree:
-            if degree > 0:
-                genes.append(self._get_random_operator(degree))
-            elif degree == 0:
-                genes.append(self._get_random_leaf())
+        # 递归生成树
+        for node in PreOrderIter(tree):
+            if node.degree > 0:
+                node.node_content = self._get_random_operator(node.degree)
+            elif node.degree == 0:
+                node.node_content = self._get_random_leaf()
             else:
                 raise ValueError("Invalid degree")
         
-        return genes
+        return tree
 
-    def _get_random_operator(self, degree=None) -> Operator:
+    def _get_random_operator(self, degree: Optional[int] = None, exclude: Operator = None) -> Operator:
         """Helper to get a random operator (non-leaf)."""
         if degree is None:
-            operator = self.random_state.choice(self.operators)
+            options = [operator for operator in self.operators if operator != exclude]
         elif isinstance(degree, int) and degree in self._degree_operators:
-            operator = self.random_state.choice(self._degree_operators[degree])
+            options = [operator for operator in self._degree_operators[degree] if operator != exclude]
         else:
             raise ValueError("Invalid degree")
-        return operator
-    
-    def _get_random_leaf(self) -> NodeContent:
+        if not options: return None
+        return self.random_state.choice(options)
+
+    def _get_random_leaf(self, exclude: Optional[Variable] = None) -> NodeContent:
         """Gets a random leaf node (variable or constant)."""
+        if exclude is not None:
+            if isinstance(exclude, Variable):
+                options = [var for var in self.variables if var != exclude]
+                return self.random_state.choice(options)
+        
         probs = np.array([
             2 if self.use_variables else 0,
             1 if self.use_constants else 0,

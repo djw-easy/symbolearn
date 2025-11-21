@@ -8,11 +8,13 @@ from scipy.optimize import minimize
 from typing import Union, Optional, List, Tuple, Iterator
 
 
-from src.node import Operator, Constant, Variable, _operator_map, NodeContent, DynamicAggregation
+from src.tree import PreOrderIter, PostOrderIter, SymbolicNode, clone_tree, RenderTree
+from src.node import Operator, Constant, Variable, NodeContent, DynamicAggregation
 from src.generator import ExprGenerator, ExprSetGenerator
 from src.expression import Expression, ExpressionSet
 from src.utils import check_random_state
-from src.fitness import Fitness
+from src.fitness import _fitness_jax_map
+
 
 
 METHODS_WITH_EPS = ['CG', 'BFGS', 'Newton-CG', 'L-BFGS-B', 'SLSQP']
@@ -81,6 +83,14 @@ def _get_cumulative_probs_expr_set(weights_tuple):
 
 
 class ExpressionGP:
+    """
+    优化后的遗传编程类
+    
+    关键改进:
+    1. 移除不必要的get_node_by_index调用
+    2. 直接对复制后的树进行操作
+    3. 简化逻辑，提高效率
+    """
     def __init__(self,
                  generator: ExprGenerator,
                  mutation_weights: dict = None,
@@ -96,142 +106,162 @@ class ExpressionGP:
         self.random_state = check_random_state(random_state)
         self.probability_negate_constant = probability_negate_constant
 
-    def _get_valid_cut_points(self, genes) -> List[int]:
-        """
-        获取所有合法切点
-        
-        合法切点定义：切割后左右两边都能形成完整表达式
-        
-        方法：从左到右模拟栈，记录栈深度为1的位置
-        """
-        valid_points = []
-        stack_depth = 0
-        
-        for i, gene in enumerate(genes):
-            if gene.degree == 0:
-                stack_depth += 1
-            else:
-                stack_depth = stack_depth - gene.degree + 1
-            
-            # 栈深度为1表示一个完整子表达式结束
-            if stack_depth == 1:
-                valid_points.append(i + 1)
-        
-        return valid_points
+    def _contains_forbidden_patterns(self, tree: SymbolicNode) -> bool:
+        """检查树是否包含禁止模式如 x-x, x/x, *0, /0"""
+        for node in PreOrderIter(tree):
+            if node.degree == 2:
+                left, right = node.children[0], node.children[1]
+                op_name = node.node_content.name
+                # 检查相同子树的减法或除法
+                if op_name in ['sub', 'div'] and Expression._trees_are_equal(left, right):
+                    return True
+                # 检查乘以0或除以0
+                if op_name in ['mul', 'div']:
+                    for child in [left, right]:
+                        if isinstance(child.node_content, Constant) and abs(child.node_content.value) < self.constants_tolerance:
+                            return True
+            if node.degree == 0:
+                if isinstance(node.node_content, Constant) and not self.generator.use_constants:
+                    return True
+                if isinstance(node.node_content, Variable) and not self.generator.use_variables:
+                    return True
+                if isinstance(node.node_content, DynamicAggregation) and not self.generator.use_aggregations:
+                    return True
+        return False
 
-    def _find_operands_start(self, genes, op_pos: int, degree: int) -> int:
-        """
-        找到操作符的第一个操作数的起始位置
-        
-        方法：从 op_pos 向前扫描，计算需要消耗的表达式数量
-        """
-        needed = degree
-        pos = op_pos - 1
-        
-        while needed > 0 and pos >= 0:
-            gene = genes[pos]
-            if gene.degree == 0:
-                needed -= 1
-            else:
-                needed = needed + gene.degree - 1
-            pos -= 1
-        
-        return pos + 1
-    
-    def _find_first_subexpr_end(self, genes, start: int) -> int:
-        """找到从 start 开始的第一个完整子表达式的结束位置"""
-        stack_depth = 0
-        for i in range(start, len(genes)):
-            gene = genes[i]
-            if gene.degree == 0:
-                stack_depth += 1
-            else:
-                stack_depth = stack_depth - gene.degree + 1
-            
-            if stack_depth == 1:
-                return i
-        
-        return len(genes) - 1
+    def _get_random_operator(self, degree: Optional[int] = None, exclude: Operator = None):
+        return self.generator._get_random_operator(degree, exclude)
 
-    def _find_subexpr_start(self, genes, end_idx: int) -> int:
-        """
-        找到在 end_idx 处结束的子表达式的起始索引。
-        (这是 _find_operands_start 的 RPN 泛化)
-        
-        示例: [A, B, +]
-        end_idx = 2 (at '+') -> returns 0
-        
-        示例: [A, B, C, +, *]
-        end_idx = 3 (at '+') -> returns 1
-        end_idx = 4 (at '*') -> returns 0
-        """
-        gene = genes[end_idx]
-        if gene.degree == 0:
-            # 叶子节点, 子表达式就是它自己
-            return end_idx
-        
-        # 我们需要找到 'gene.degree' 个完整的表达式
-        needed = gene.degree
-        pos = end_idx - 1
-        
-        while needed > 0 and pos >= 0:
-            g = genes[pos]
-            # 每遇到一个节点，栈深度变化为 (g.degree - 1)
-            # 我们从 'needed' 开始倒推
-            needed = needed - 1 + g.degree
-            pos -= 1
-        
-        # pos 是最后一个被消耗的基因的索引
-        # 所以起始位置是 pos + 1
-        return pos + 1
+    def _get_random_leaf(self, exclude: Optional[Variable] = None):
+        return self.generator._get_random_leaf(exclude)
 
-    def reproduce(self, genes) -> Expression:
-        """创建副本（浅拷贝基因数组）"""
+    def get_subtree(self, tree: Optional[SymbolicNode], 
+                    not_root: bool = False, not_leaf: bool = False):
+        """
+        获取一个随机子树
+        
+        Returns:
+            node: 返回选中的节点（直接返回节点对象）
+        """
+        nodes = []
+        for node in PreOrderIter(tree):
+            if not_leaf and node.is_leaf:
+                continue
+            if not_root and node.is_root:
+                continue
+            nodes.append(node)
+        
+        if not nodes:
+            return None
+        
+        selected_idx = self.random_state.randint(len(nodes))
+        return nodes[selected_idx]
+
+    @staticmethod
+    def _crossover(parent_subtree: SymbolicNode, donor_subtree: SymbolicNode):
+        """替换父节点的子节点"""
+        if parent_subtree.is_root:
+            raise ValueError('Cannot crossover the root node.')
+        
+        parent_node = parent_subtree.parent
+        children_list = list(parent_node.children)
+        replace_index = children_list.index(parent_subtree)
+        children_list[replace_index] = donor_subtree
+        parent_node.children = children_list
+
+    def reproduce(self, parent: Expression) -> Expression:
+        """创建副本（深拷贝树）"""
         new_expr = Expression(
-            genes=genes, 
+            tree=clone_tree(parent.tree), 
             metric=self.generator.metric, 
             out_func=self.generator.out_func
         )
-        
         return new_expr
 
-    def crossover(self, parent: Expression, donor: Expression):
+    def crossover(self, parent: Expression, donor: Expression) -> Tuple[Expression, Expression, bool]:
         """
-        单点交叉（保证合法性）
+        执行交叉操作（优化版）
         
-        策略：
-        1. 在两个表达式中选择合法切点
-        2. 交换后验证是否合法
-        3. 检查大小限制
-        
-        时间复杂度：O(n) 其中 n 是表达式长度
+        关键改进：
+        1. 先在原树上选择交叉点
+        2. 检查大小约束
+        3. 复制树
+        4. 重新在新树上找到对应位置的节点
+        5. 执行交叉
         """
+        # 1. 提前检查：如果父代相同，直接返回失败
         if parent == donor:
             return None, None, False
-        
-        # 获取合法切点
-        valid_cuts_self = self._get_valid_cut_points(parent.genes)
-        valid_cuts_donor = self._get_valid_cut_points(donor.genes)
-        
-        if not valid_cuts_self or not valid_cuts_donor:
+
+        # 2. 在原树上选择交叉点
+        point1 = self.get_subtree(parent.tree)
+        point2 = self.get_subtree(donor.tree)
+        if point1 is None or point2 is None:
             return None, None, False
-        
-        # 随机选择切点
-        cut1 = self.random_state.choice(valid_cuts_self)
-        cut2 = self.random_state.choice(valid_cuts_donor)
-        
-        # 执行交叉
-        genes1 = parent.genes[:cut1] + donor.genes[cut2:]
-        genes2 = donor.genes[:cut2] + parent.genes[cut1:]
-        
-        # 检查大小
-        if len(genes1) > self.maxsize or len(genes2) > self.maxsize:
+
+        # 3. 提前检查大小约束
+        new_size1 = parent.size - point1.size + point2.size
+        new_size2 = donor.size - point2.size + point1.size
+        if new_size1 > self.maxsize or new_size2 > self.maxsize:
             return None, None, False
+
+        # 4. 通过检查后再创建副本
+        offspring1 = self.reproduce(parent)
+        offspring2 = self.reproduce(donor)
+
+        # 5. 在新树上找到对应节点（通过路径匹配）
+        new_point1 = self._find_corresponding_node(offspring1.tree, point1)
+        new_point2 = self._find_corresponding_node(offspring2.tree, point2)
+
+        if new_point1 is None or new_point2 is None:
+            return None, None, False
+
+        # 6. 执行交叉
+        point1_clone = clone_tree(new_point1)
+        point2_clone = clone_tree(new_point2)
         
-        # 创建后代
-        offspring1 = self.reproduce(genes=genes1)
-        offspring2 = self.reproduce(genes=genes2)
+        if new_point1.is_root:
+            offspring1.tree = point2_clone
+        else:
+            self._crossover(new_point1, point2_clone)
+        
+        if new_point2.is_root:
+            offspring2.tree = point1_clone
+        else:
+            self._crossover(new_point2, point1_clone)
+
         return offspring1, offspring2, True
+
+    def _find_corresponding_node(self, new_tree: SymbolicNode, 
+                                  old_node: SymbolicNode) -> SymbolicNode:
+        """
+        在新树中找到与旧节点对应的节点
+        
+        策略：通过路径（从根到节点的子节点索引序列）匹配
+        """
+        # 特殊情况：如果旧节点就是根节点
+        if old_node.parent is None:
+            return new_tree
+        
+        # 1. 计算旧节点的路径
+        path = []
+        current = old_node
+        while current.parent is not None:
+            parent = current.parent
+            child_index = list(parent.children).index(current)
+            path.append(child_index)
+            current = parent
+        
+        path.reverse()  # 从根到节点的路径
+        
+        # 2. 在新树中按路径查找
+        current = new_tree
+        for child_index in path:
+            if child_index >= len(current.children):
+                return None
+            current = current.children[child_index]
+        
+        return current
 
     def _condition_mutation_weights(self, expr: Expression) -> dict:
         """
@@ -247,7 +277,7 @@ class ExpressionGP:
             weights['delete_node'] = 0.0
             weights['simplify_tree'] = 0.0
             weights['hoist_tree'] = 0.0
-            if not isinstance(expr[0], Constant):
+            if not isinstance(expr.tree.node_content, Constant):
                 weights['mutate_constant'] = 0.0
 
         # Handle no binary operators
@@ -305,873 +335,322 @@ class ExpressionGP:
         conditioned_weights = self._condition_mutation_weights(parent)
         # Select a mutation
         mutation_name = weighted_random_choice_expr(conditioned_weights, self.random_state)
-        if mutation_name == 'rotate_tree':
-            new_expr, mutation_succeeded = self.rotate_tree(parent)
-        elif mutation_name == 'add_node':
-            new_expr, mutation_succeeded = self.add_node(parent)
-        elif mutation_name == 'delete_node':
-            new_expr, mutation_succeeded = self.delete_node(parent)
-        elif mutation_name == 'mutate_aggregation':
-            new_expr, mutation_succeeded = self.mutate_aggregation(parent)
-        elif mutation_name == 'mutate_operator':
-            new_expr, mutation_succeeded = self.mutate_operator(parent)
-        elif mutation_name == 'do_nothing_tree':
-            new_expr, mutation_succeeded = self.do_nothing_tree(parent)
-        elif mutation_name == 'swap_operands':
-            new_expr, mutation_succeeded = self.swap_operands(parent)
-        elif mutation_name == 'mutate_constant':
-            new_expr, mutation_succeeded = self.mutate_constant(parent)
-        elif mutation_name == 'mutate_variable':
-            new_expr, mutation_succeeded = self.mutate_variable(parent)
-        elif mutation_name == 'insert_node':
-            new_expr, mutation_succeeded = self.insert_node(parent)
-        elif mutation_name == 'simplify_tree':
-            new_expr, mutation_succeeded = self.simplify(parent)
-        elif mutation_name == 'hoist_tree':
-            new_expr, mutation_succeeded = self.hoist_tree(parent)
-        elif mutation_name == 'randomize_tree':
-            new_expr, mutation_succeeded = self.randomize_tree(parent)
-        else:
-            raise ValueError(f'Invalid mutation name: {mutation_name}')
+        try:
+            if mutation_name == 'rotate_tree':
+                new_expr, mutation_succeeded = self.rotate_tree(parent)
+            elif mutation_name == 'add_node':
+                new_expr, mutation_succeeded = self.add_node(parent)
+            elif mutation_name == 'delete_node':
+                new_expr, mutation_succeeded = self.delete_node(parent)
+            elif mutation_name == 'mutate_aggregation':
+                new_expr, mutation_succeeded = self.mutate_aggregation(parent)
+            elif mutation_name == 'mutate_operator':
+                new_expr, mutation_succeeded = self.mutate_operator(parent)
+            elif mutation_name == 'do_nothing_tree':
+                new_expr, mutation_succeeded = self.do_nothing_tree(parent)
+            elif mutation_name == 'swap_operands':
+                new_expr, mutation_succeeded = self.swap_operands(parent)
+            elif mutation_name == 'mutate_constant':
+                new_expr, mutation_succeeded = self.mutate_constant(parent)
+            elif mutation_name == 'mutate_variable':
+                new_expr, mutation_succeeded = self.mutate_variable(parent)
+            elif mutation_name == 'insert_node':
+                new_expr, mutation_succeeded = self.insert_node(parent)
+            elif mutation_name == 'simplify_tree':
+                new_expr, mutation_succeeded = self.simplify(parent)
+            elif mutation_name == 'hoist_tree':
+                new_expr, mutation_succeeded = self.hoist_tree(parent)
+            elif mutation_name == 'randomize_tree':
+                new_expr, mutation_succeeded = self.randomize_tree(parent)
+            else:
+                raise ValueError(f'Invalid mutation name: {mutation_name}')
+        except Exception as e:
+            print(f"Error in {mutation_name}: {e}")
+            print(f"Parent tree: {str(parent)}")
+            print(f"Parent tree size: {parent.size}")
+            for pre, fill, node in RenderTree(parent.tree):
+                print(f"{pre}{node.name}")
+            raise ValueError
         
         return new_expr, mutation_succeeded, mutation_name
 
-    def insert_node(self, parent) -> Tuple[Optional['Expression'], bool]:
+    def add_node(self, parent: Expression):
         """
-        插入突变：在随机位置插入一个操作符和必要的操作数
+        添加节点突变（优化版）
         
-        策略：
-        1. 选择插入位置（合法切点）
-        2. 插入一个操作符 + 补充操作数
-        3. 验证合法性
+        改进：
+        1. 先选择节点和算子
+        2. 检查大小限制
+        3. 复制树
+        4. 直接在新树上找到对应节点并修改
         """
-        if parent.size >= self.maxsize - 1:
+        # 1. 提前检查大小限制
+        min_new_size = parent.tree.size + 2
+        if min_new_size > self.maxsize:
             return None, False
         
-        valid_points = self._get_valid_cut_points(parent.genes)
-        if not valid_points:
-            return None, False
+        # 2. 确定操作策略
+        should_replace_root = (self.random_state.random() < 0.5) or (parent.tree.size == 1)
         
-        insert_pos = self.random_state.choice(valid_points)
-        
-        # 选择一个操作符
-        new_op = self.generator._get_random_operator()
-        
-        # 计算需要补充的操作数（new_op.degree - 1）
-        operands_needed = new_op.degree - 1
-        
-        if parent.size + 1 + operands_needed > self.maxsize:
-            return None, False
-        
-        # 生成新操作数
-        new_operands = [self.generator._get_random_leaf() for _ in range(operands_needed)]
-        # 构建新基因序列
-        new_genes = (parent.genes[:insert_pos] + new_operands + [new_op] + parent.genes[insert_pos:])
-        
-        new_expr = self.reproduce(new_genes)
-        return new_expr, True
-
-    def delete_node(self, parent, random_state = None) -> Tuple[Optional['Expression'], bool]:
-        """
-        删除突变：删除一个操作符及其子表达式
-        
-        策略：
-        1. 选择一个非叶子基因
-        2. 删除该基因及其操作数
-        3. 保留其中一个操作数（提升）
-        """
-        if parent.size <= 1:
-            return None, False
-        random_state = check_random_state(random_state) if random_state is not None else self.random_state
-        
-        # 找到所有操作符位置
-        op_positions = [i for i, gene in enumerate(parent.genes) if gene.degree > 0]
-        if not op_positions:
-            return None, False
-        
-        # 随机选择一个操作符
-        op_pos = random_state.choice(op_positions)
-        op = parent.genes[op_pos]
-        
-        # 找到该操作符的操作数范围
-        # 在后缀表达式中，操作符前面的 op.degree 个完整子表达式是它的操作数
-        operand_start = self._find_operands_start(parent.genes, op_pos, op.degree)
-        
-        # 随机保留一个操作数
-        # 简化：保留第一个操作数
-        preserved_end = self._find_first_subexpr_end(parent.genes, operand_start)
-        
-        # 构建新基因序列
-        new_genes = (parent.genes[:operand_start] + 
-                     parent.genes[operand_start:preserved_end + 1] + 
-                     parent.genes[op_pos + 1:])
-        
-        new_expr = self.reproduce(new_genes)
-        return new_expr, True
-
-    def rotate_tree(self, parent: Expression) -> Tuple[Optional['Expression'], bool]:
-        """
-        增强的树旋转突变（完整版本）
-        
-        支持的旋转模式：
-        
-        1. **标准左旋** (Standard Left Rotation)
-        树: A(B(...), C) -> B(..., A(..., C))
-        效果: 父节点与左子节点交换位置
-        
-        2. **标准右旋** (Standard Right Rotation)  
-        树: A(C, B(...)) -> B(A(C, ...), ...)
-        效果: 父节点与右子节点交换位置
-        
-        3. **深度左旋** (Deep Left Rotation)
-        树: A(B(D, E), C) -> B(D, A(E, C))
-        效果: 提升左子树的左子节点
-        
-        4. **深度右旋** (Deep Right Rotation)
-        树: A(C, B(D, E)) -> B(A(C, D), E)
-        效果: 提升右子树的右子节点
-        
-        5. **交换子树** (Swap Subtrees)
-        树: A(left_tree, right_tree) -> A(right_tree, left_tree)
-        效果: 交换二元操作符的左右子树
-        
-        关键实现：
-        - 通过栈模拟识别子表达式边界
-        - 精确提取和重组子表达式
-        - 保证旋转后的语义正确性
-        """
-        if parent.size < 3:  # 至少需要: leaf, leaf, op
-            return None, False
-        
-        # 1. 识别所有可旋转的操作符位置
-        rotation_candidates = self._find_rotation_candidates(parent.genes)
-        
-        if not rotation_candidates:
-            return None, False
-        
-        # 2. 随机选择一个候选
-        candidate = self.random_state.choice(rotation_candidates)
-        rotation_type = candidate['type']
-        op_pos = candidate['position']
-        
-        # 3. 根据旋转类型执行旋转
-        if rotation_type == 'standard_left':
-            new_genes, _ = self._standard_left_rotation(parent.genes, op_pos)
-        elif rotation_type == 'standard_right':
-            new_genes, _ = self._standard_right_rotation(parent.genes, op_pos)
-        elif rotation_type == 'deep_left':
-            new_genes, _ = self._deep_left_rotation(parent.genes, op_pos)
-        elif rotation_type == 'deep_right':
-            new_genes, _ = self._deep_right_rotation(parent.genes, op_pos)
-        elif rotation_type == 'swap_subtrees':
-            new_genes, _ = self._swap_subtrees(parent.genes, op_pos)
+        # 3. 选择目标节点
+        if should_replace_root:
+            target_node = None
         else:
-            return None, False
-        
-        # 4. 验证并创建新表达式
-        if new_genes is None:
-            return None, False
-        
-        new_expr = self.reproduce(genes=new_genes)
-        return new_expr, True
-
-    def _find_rotation_candidates(self, genes) -> List[dict]:
-        """
-        识别所有可旋转的操作符位置
-        
-        返回格式：
-        [
-            {'type': 'standard_left', 'position': idx, 'details': {...}},
-            {'type': 'standard_right', 'position': idx, 'details': {...}},
-            ...
-        ]
-        """
-        candidates = []
-        
-        # 遍历所有操作符
-        for i, gene in enumerate(genes):
-            if gene.degree < 2:
-                continue
-            
-            # 找到该操作符的所有操作数边界
-            operands = self._find_operands_ranges(genes, i)
-            
-            if len(operands) < gene.degree:
-                continue  # 数据不完整，跳过
-            
-            # 检查标准左旋：左操作数必须是一个子表达式（以操作符结尾）
-            left_operand = operands[0]
-            if genes[left_operand['end']].degree > 0:
-                candidates.append({
-                    'type': 'standard_left',
-                    'position': i,
-                    'details': {
-                        'left_op_end': left_operand['end'],
-                        'operands': operands
-                    }
-                })
-            
-            # 检查标准右旋：右操作数必须是一个子表达式（以操作符结尾）
-            if gene.degree == 2:
-                right_operand = operands[1]
-                if genes[right_operand['end']].degree > 0:
-                    candidates.append({
-                        'type': 'standard_right',
-                        'position': i,
-                        'details': {
-                            'right_op_end': right_operand['end'],
-                            'operands': operands
-                        }
-                    })
-            
-            # 检查深度旋转：需要嵌套的操作符
-            if genes[left_operand['end']].degree >= 2:
-                candidates.append({
-                    'type': 'deep_left',
-                    'position': i,
-                    'details': {
-                        'left_op_end': left_operand['end'],
-                        'operands': operands
-                    }
-                })
-            
-            if gene.degree == 2 and genes[operands[1]['end']].degree >= 2:
-                candidates.append({
-                    'type': 'deep_right',
-                    'position': i,
-                    'details': {
-                        'right_op_end': operands[1]['end'],
-                        'operands': operands
-                    }
-                })
-            
-            # 检查交换子树：二元操作符
-            if gene.degree == 2:
-                candidates.append({
-                    'type': 'swap_subtrees',
-                    'position': i,
-                    'details': {'operands': operands}
-                })
-        
-        return candidates
-
-    def _find_operands_ranges(self, genes, op_pos: int) -> List[dict]:
-        """
-        找到操作符的所有操作数的范围 [start, end]
-        
-        算法：从操作符位置向前模拟栈，识别每个操作数的边界
-        
-        返回：
-        [
-            {'start': start1, 'end': end1},  # 第一个操作数
-            {'start': start2, 'end': end2},  # 第二个操作数
-            ...
-        ]
-        
-        注意：返回顺序与计算顺序相同（左到右）
-        """
-        op = genes[op_pos]
-        needed = op.degree
-        
-        if needed == 0:
-            return []
-        
-        operands = []
-        pos = op_pos - 1
-        stack_depth = 0
-        current_end = op_pos - 1
-        
-        # 向前扫描，识别操作数边界
-        while pos >= 0 and len(operands) < needed:
-            gene = genes[pos]
-            
-            if gene.degree == 0:
-                stack_depth += 1
+            leaves = [node for node in PreOrderIter(parent.tree) if node.is_leaf]
+            if not leaves:
+                should_replace_root = True
+                target_node = None
             else:
-                stack_depth = stack_depth - gene.degree + 1
+                target_node = self.random_state.choice(leaves)
+        
+        # 4. 选择算子并检查大小
+        new_operator = self._get_random_operator()
+        new_size = parent.tree.size + 1 + (new_operator.degree - 1)
+        if new_size > self.maxsize:
+            return None, False
+        
+        # 5. 通过检查后再复制
+        new_expr = self.reproduce(parent)
+        
+        # 6. 在新树上执行操作
+        if should_replace_root:
+            # 替换根节点
+            original_root = new_expr.tree
+            new_root = SymbolicNode(node_content=new_operator)
             
-            # 当栈深度为 1 时，找到一个完整的操作数
-            if stack_depth == 1:
-                operands.append({
-                    'start': pos,
-                    'end': current_end
-                })
-                stack_depth = 0
-                current_end = pos - 1
+            children = [original_root]
+            for _ in range(new_operator.degree - 1):
+                other_child = SymbolicNode(node_content=self._get_random_leaf())
+                children.append(other_child)
             
-            pos -= 1
-        
-        # 反转以保持正确顺序（从左到右）
-        return operands[::-1]
-
-    def _standard_left_rotation(self, genes, op_pos: int) -> Tuple[Optional[List], str]:
-        """
-        标准左旋：A(B(...), C) -> B(..., A(..., C))
-        
-        RPN 示例：
-        原: [D, E, +, C, *]  表示 mul(add(D,E), C)
-        后: [D, E, C, *, +]  表示 add(D, mul(E,C))
-        
-        步骤：
-        1. 提取左操作数 B(...)
-        2. 提取 B 的子操作数和 A 的其他操作数
-        3. 重组: [B的左子] + [A的其他操作数] + [A] + [B]
-        """
-        op_A = genes[op_pos]
-        operands = self._find_operands_ranges(genes, op_pos)
-        
-        if not operands or genes[operands[0]['end']].degree == 0:
-            return None, ''
-        
-        # 提取左操作数 B(...)
-        left_operand_range = operands[0]
-        op_B_pos = left_operand_range['end']
-        op_B = genes[op_B_pos]
-        
-        # 找到 B 的操作数
-        B_operands = self._find_operands_ranges(genes, op_B_pos)
-        
-        if not B_operands:
-            return None, ''
-        
-        # 提取各部分
-        # B 的左子树：从 B 的第一个操作数开始到倒数第二个操作数结束
-        B_left_part_start = B_operands[0]['start']
-        B_left_part_end = B_operands[-2]['end'] if len(B_operands) > 1 else B_operands[0]['start'] - 1
-        
-        # B 的最后一个操作数
-        B_last_operand_start = B_operands[-1]['start']
-        B_last_operand_end = B_operands[-1]['end']
-        
-        # A 的其他操作数（除了左操作数）
-        A_other_operands_start = operands[1]['start'] if len(operands) > 1 else op_pos
-        A_other_operands_end = operands[-1]['end'] if len(operands) > 1 else op_pos - 1
-        
-        # 重组基因序列
-        new_genes = []
-        
-        # 1. 前缀部分（op_A 之前的所有基因）
-        if B_left_part_start > 0:
-            new_genes.extend(genes[:B_left_part_start])
-        
-        # 2. B 的左子树部分（除了最后一个操作数）
-        if B_left_part_end >= B_left_part_start:
-            new_genes.extend(genes[B_left_part_start:B_left_part_end + 1])
-        
-        # 3. B 的最后一个操作数
-        new_genes.extend(genes[B_last_operand_start:B_last_operand_end + 1])
-        
-        # 4. A 的其他操作数
-        if len(operands) > 1:
-            new_genes.extend(genes[A_other_operands_start:A_other_operands_end + 1])
-        
-        # 5. 操作符 A
-        new_genes.append(op_A)
-        
-        # 6. 操作符 B
-        new_genes.append(op_B)
-        
-        # 7. 后缀部分（op_A 之后的所有基因）
-        if op_pos + 1 < len(genes):
-            new_genes.extend(genes[op_pos + 1:])
-        
-        return new_genes, 'rotate_tree_left'
-
-
-    def _standard_right_rotation(self, genes, op_pos: int) -> Tuple[Optional[List], str]:
-        """
-        标准右旋：A(C, B(...)) -> B(A(C, ...), ...)
-        
-        RPN 示例：
-        原: [C, D, E, +, *]  表示 mul(C, add(D,E))
-        后: [C, D, *, E, +]  表示 add(mul(C,D), E)
-        """
-        op_A = genes[op_pos]
-        
-        if op_A.degree != 2:
-            return None, ''
-        
-        operands = self._find_operands_ranges(genes, op_pos)
-        
-        if len(operands) < 2 or genes[operands[1]['end']].degree == 0:
-            return None, ''
-        
-        # 提取右操作数 B(...)
-        right_operand_range = operands[1]
-        op_B_pos = right_operand_range['end']
-        op_B = genes[op_B_pos]
-        
-        # 找到 B 的操作数
-        B_operands = self._find_operands_ranges(genes, op_B_pos)
-        
-        if not B_operands:
-            return None, ''
-        
-        # 提取各部分
-        # A 的左操作数
-        A_left_start = operands[0]['start']
-        A_left_end = operands[0]['end']
-        
-        # B 的第一个操作数
-        B_first_start = B_operands[0]['start']
-        B_first_end = B_operands[0]['end']
-        
-        # B 的其他操作数
-        B_other_start = B_operands[1]['start'] if len(B_operands) > 1 else op_B_pos
-        B_other_end = B_operands[-1]['end'] if len(B_operands) > 1 else op_B_pos - 1
-        
-        # 重组基因序列
-        new_genes = []
-        
-        # 1. 前缀部分
-        if A_left_start > 0:
-            new_genes.extend(genes[:A_left_start])
-        
-        # 2. A 的左操作数
-        new_genes.extend(genes[A_left_start:A_left_end + 1])
-        
-        # 3. B 的第一个操作数
-        new_genes.extend(genes[B_first_start:B_first_end + 1])
-        
-        # 4. 操作符 A
-        new_genes.append(op_A)
-        
-        # 5. B 的其他操作数
-        if len(B_operands) > 1:
-            new_genes.extend(genes[B_other_start:B_other_end + 1])
-        
-        # 6. 操作符 B
-        new_genes.append(op_B)
-        
-        # 7. 后缀部分
-        if op_pos + 1 < len(genes):
-            new_genes.extend(genes[op_pos + 1:])
-        
-        return new_genes, 'rotate_tree_right'
-
-
-    def _deep_left_rotation(self, genes, op_pos: int) -> Tuple[Optional[List], str]:
-        """
-        深度左旋：A(B(D, E), C) -> B(D, A(E, C))
-        
-        RPN 示例：
-        原: [D, E, +, C, *]  表示 mul(add(D,E), C)
-        后: [D, E, C, *, +]  表示 add(D, mul(E,C))
-        
-        这是标准左旋的变体，同时提升 B 的左子节点
-        """
-        op_A = genes[op_pos]
-        operands = self._find_operands_ranges(genes, op_pos)
-        
-        if not operands:
-            return None, ''
-        
-        left_operand_range = operands[0]
-        op_B_pos = left_operand_range['end']
-        op_B = genes[op_B_pos]
-        
-        if op_B.degree < 2:
-            return None, ''
-        
-        B_operands = self._find_operands_ranges(genes, op_B_pos)
-        
-        if len(B_operands) < 2:
-            return None, ''
-        
-        # 提取各部分
-        # B 的左子节点 D
-        D_start = B_operands[0]['start']
-        D_end = B_operands[0]['end']
-        
-        # B 的其他操作数 E
-        E_start = B_operands[1]['start']
-        E_end = B_operands[-1]['end']
-        
-        # A 的其他操作数 C
-        C_start = operands[1]['start'] if len(operands) > 1 else op_pos
-        C_end = operands[-1]['end'] if len(operands) > 1 else op_pos - 1
-        
-        # 重组: [prefix] + [D] + [E] + [C] + [A] + [B] + [suffix]
-        new_genes = []
-        
-        if D_start > 0:
-            new_genes.extend(genes[:D_start])
-        
-        new_genes.extend(genes[D_start:D_end + 1])
-        new_genes.extend(genes[E_start:E_end + 1])
-        
-        if len(operands) > 1:
-            new_genes.extend(genes[C_start:C_end + 1])
-        
-        new_genes.append(op_A)
-        new_genes.append(op_B)
-        
-        if op_pos + 1 < len(genes):
-            new_genes.extend(genes[op_pos + 1:])
-        
-        return new_genes, 'rotate_tree_deep_left'
-
-
-    def _deep_right_rotation(self, genes, op_pos: int) -> Tuple[Optional[List], str]:
-        """
-        深度右旋：A(C, B(D, E)) -> B(A(C, D), E)
-        
-        RPN 示例：
-        原: [C, D, E, +, *]  表示 mul(C, add(D,E))
-        后: [C, D, *, E, +]  表示 add(mul(C,D), E)
-        """
-        op_A = genes[op_pos]
-        
-        if op_A.degree != 2:
-            return None, ''
-        
-        operands = self._find_operands_ranges(genes, op_pos)
-        
-        if len(operands) < 2:
-            return None, ''
-        
-        right_operand_range = operands[1]
-        op_B_pos = right_operand_range['end']
-        op_B = genes[op_B_pos]
-        
-        if op_B.degree < 2:
-            return None, ''
-        
-        B_operands = self._find_operands_ranges(genes, op_B_pos)
-        
-        if len(B_operands) < 2:
-            return None, ''
-        
-        # 提取各部分
-        # A 的左操作数 C
-        C_start = operands[0]['start']
-        C_end = operands[0]['end']
-        
-        # B 的第一个操作数 D
-        D_start = B_operands[0]['start']
-        D_end = B_operands[0]['end']
-        
-        # B 的最后一个操作数 E
-        E_start = B_operands[-1]['start']
-        E_end = B_operands[-1]['end']
-        
-        # 重组: [prefix] + [C] + [D] + [A] + [E] + [B] + [suffix]
-        new_genes = []
-        
-        if C_start > 0:
-            new_genes.extend(genes[:C_start])
-        
-        new_genes.extend(genes[C_start:C_end + 1])
-        new_genes.extend(genes[D_start:D_end + 1])
-        new_genes.append(op_A)
-        new_genes.extend(genes[E_start:E_end + 1])
-        new_genes.append(op_B)
-        
-        if op_pos + 1 < len(genes):
-            new_genes.extend(genes[op_pos + 1:])
-        
-        return new_genes, 'rotate_tree_deep_right'
-
-
-    def _swap_subtrees(self, genes, op_pos: int) -> Tuple[Optional[List], str]:
-        """
-        交换子树：A(left, right) -> A(right, left)
-        
-        RPN 示例：
-        原: [B, C, +, D, *]  表示 mul(add(B,C), D)
-        后: [D, B, C, +, *]  表示 mul(D, add(B,C))
-        
-        这对于非交换操作符（如减法、除法）特别有用
-        """
-        op = genes[op_pos]
-        
-        if op.degree != 2:
-            return None, ''
-        
-        operands = self._find_operands_ranges(genes, op_pos)
-        
-        if len(operands) < 2:
-            return None, ''
-        
-        # 提取左右操作数
-        left_start = operands[0]['start']
-        left_end = operands[0]['end']
-        
-        right_start = operands[1]['start']
-        right_end = operands[1]['end']
-        
-        # 重组: [prefix] + [right] + [left] + [op] + [suffix]
-        new_genes = []
-        
-        if left_start > 0:
-            new_genes.extend(genes[:left_start])
-        
-        new_genes.extend(genes[right_start:right_end + 1])
-        new_genes.extend(genes[left_start:left_end + 1])
-        new_genes.append(op)
-        
-        if op_pos + 1 < len(genes):
-            new_genes.extend(genes[op_pos + 1:])
-        
-        return new_genes, 'swap_subtrees'
-
-    def randomize_tree(self, parent: Expression) -> Tuple[Optional['Expression'], bool]:
-        """随机替换子树 (RPN version)"""
-        # 1. 随机选择一个 '节点' (即 genes 列表中的一个索引)
-        target_idx = self.random_state.randint(parent.size)
-        target_gene = parent.genes[target_idx]
-        
-        # 2. 找到这个节点所代表的整个子表达式的边界
-        if target_gene.degree == 0:
-            # 它是一个叶子节点
-            start_idx = target_idx
-            end_idx = target_idx
+            self.random_state.shuffle(children)
+            new_root.children = children
+            new_expr.tree = new_root
         else:
-            # 它是一个操作符, 找到它所代表的子表达式的开头
-            end_idx = target_idx
-            start_idx = self._find_subexpr_start(parent.genes, end_idx)
-        
-        target_size = end_idx - start_idx + 1
-        
-        # 3. 计算替换后的最大尺寸 (复制自您的逻辑)
-        size_of_rest = parent.size - target_size
-        max_target_size = self.maxsize - size_of_rest
-        
-        valid_sizes = np.array(list(self.generator.size_prob.keys()))
-        size_probs = np.array(list(self.generator.size_prob.values()))
-        mask = valid_sizes <= max_target_size
-        
-        if not np.any(mask):
-            return None, False
-        
-        new_size = self.random_state.choice(
-            valid_sizes[mask], 
-            p=size_probs[mask] / size_probs[mask].sum()
-        )
-        
-        # 4. 生成新的子表达式 (基因列表)
-        new_subtree_genes = self.generator.build_tree(size=new_size)
-        
-        # 5. 构建最终的基因列表
-        new_genes = (
-            parent.genes[:start_idx] + 
-            new_subtree_genes + 
-            parent.genes[end_idx + 1:]
-        )
-        
-        # 6. 复制和验证
-        new_expr = self.reproduce(genes=new_genes)
-        return new_expr, True
-
-    def hoist_tree(self, parent: Expression) -> Tuple[Optional['Expression'], bool]:
-        """提升子树 (RPN version)"""
-        # 1. 找到所有非叶子 '节点' (操作符)
-        operator_indices = [i for i, gene in enumerate(parent.genes) if gene.degree > 0]
-        if not operator_indices:
-            return None, False
-        
-        # 2. 随机选择一个操作符 (作为 'subtree' 的根)
-        op_idx = self.random_state.choice(operator_indices)
-        op_gene = parent.genes[op_idx]
-        
-        # 3. 确定该操作符的 'degree' 个操作数子表达式的边界
-        # RPN 结构: [ ..., OP_N, ..., OP_2, OP_1, CURRENT_OP_AT_op_idx ]
-        # 我们需要从 CURRENT_OP_AT_op_idx 往前倒推，找到 op_gene.degree 个操作数子表达式。
-        
-        child_boundaries = []
-        current_pos_end = op_idx - 1 # 从操作符的前一个位置开始
-        
-        for _ in range(op_gene.degree):
-            if current_pos_end < 0:
-                # 栈不足，RPN 结构无效
+            # 替换叶子节点
+            new_target = self._find_corresponding_node(new_expr.tree, target_node)
+            if new_target is None:
                 return None, False
             
-            # 找到当前操作数子表达式的起始位置
-            child_start = self._find_subexpr_start(parent.genes, current_pos_end)
+            parent_node = new_target.parent
+            cloned_leaf = SymbolicNode(node_content=new_target.node_content)
             
-            # 添加到列表中，由于是倒序查找，所以插入到列表的头部以保持正序
-            child_boundaries.insert(0, (child_start, current_pos_end))
+            new_node = SymbolicNode(node_content=new_operator)
+            children = [cloned_leaf]
+            for _ in range(new_operator.degree - 1):
+                other_child = SymbolicNode(node_content=self._get_random_leaf())
+                children.append(other_child)
             
-            # 移动到下一个操作数子表达式的结束位置
-            current_pos_end = child_start - 1
+            self.random_state.shuffle(children)
+            new_node.children = children
             
-        if len(child_boundaries) != op_gene.degree:
-            # 理论上，如果上述循环没有返回 None，这里应该匹配
-            # 这是一个额外的安全检查
-            return None, False
+            children_list = list(parent_node.children)
+            replacement_idx = children_list.index(new_target)
+            children_list[replacement_idx] = new_node
+            parent_node.children = children_list
         
-        # 4. 随机选择一个 '子节点' (subsubtree) 来提升
-        # 这个 'subsubtree' 将替换整个操作符及其所有操作数。
-        selected_idx = self.random_state.choice(len(child_boundaries))
-        hoist_start, hoist_end = child_boundaries[selected_idx]
-        hoisted_genes = parent.genes[hoist_start : hoist_end + 1]
-        
-        # 5. 构建新基因 (用 'subsubtree' 替换 'subtree')
-        # 整个被提升的子树是从第一个操作数子表达式的起始位置到操作符自身。
-        # 也就是 parent.genes[child_boundaries[0][0] : op_idx + 1] 这段将被替换。
-        
-        full_subtree_start = child_boundaries[0][0] # 整个子树的起始位置
-        
-        new_genes_list = (
-            parent.genes[:full_subtree_start] + # 前缀部分
-            hoisted_genes +                     # 被提升的子表达式
-            parent.genes[op_idx + 1:]           # 操作符之后的部分 (如果存在)
-        )
-        
-        # 6. 复制和验证
-        # 假设 Expression 构造函数会调用 _is_valid 进行验证
-        new_expr = Expression(genes=new_genes_list, metric=parent.metric)
-        if not new_expr._is_valid():
-            # 如果新表达式无效，则返回 None
-            return None, False 
-            
         return new_expr, True
 
-    # def hoist_tree(self, parent: Expression) -> Tuple[Optional['Expression'], bool]:
-    #     """提升子树 (RPN version)"""
-    #     # 1. 找到所有非叶子 '节点' (操作符)
-    #     operator_indices = [i for i, gene in enumerate(parent.genes) if gene.degree > 0]
-    #     if not operator_indices:
-    #         return None, False
-        
-    #     # 2. 随机选择一个操作符 (作为 'subtree' 的根)
-    #     op_idx = self.random_state.choice(operator_indices)
-    #     op_gene = parent.genes[op_idx]
-        
-    #     # 3. 找到这个 'subtree' 的起始位置
-    #     start_idx = self._find_subexpr_start(parent.genes, op_idx)
-        
-    #     # 4. 找到其所有 '子节点' (操作数) 的边界
-    #     child_boundaries = []
-    #     current_start = start_idx
-    #     # 迭代直到我们到达操作符之前
-    #     while current_start < op_idx:
-    #         # 找到当前子表达式的结束位置
-    #         current_end = self._find_first_subexpr_end(parent.genes, current_start)
-    #         child_boundaries.append((current_start, current_end))
-    #         current_start = current_end + 1
-        
-    #     if len(child_boundaries) != op_gene.degree:
-    #         # RPN 表达式无效 (理论上不应发生)
-    #         return None, False
-        
-    #     # 5. 随机选择一个 '子节点' (subsubtree) 来提升
-    #     selected_idx = self.random_state.choice(len(child_boundaries))
-    #     hoist_start, hoist_end = child_boundaries[selected_idx]
-    #     hoisted_genes = parent.genes[hoist_start : hoist_end + 1]
-        
-    #     # 6. 构建新基因 (用 'subsubtree' 替换 'subtree')
-    #     new_genes = (
-    #         parent.genes[:start_idx] + 
-    #         hoisted_genes + 
-    #         parent.genes[op_idx + 1:]
-    #     )
-        
-    #     # 7. 复制和验证
-    #     new_expr = self.reproduce(genes=new_genes)
-    #     return new_expr, True
-
-    def do_nothing_tree(self, parent: Expression) -> Tuple[Optional['Expression'], bool]:
-        """返回一个新的、相同的表达式，表示没有变化。"""
-        new_expr = self.reproduce(genes=parent.genes)
-        return new_expr, True
-
-    def mutate_constant(self, parent: Expression) -> Tuple[Optional['Expression'], bool]:
-        """突变常量 (RPN version)"""
-        # 1. 收集候选索引
-        constant_indices = [i for i, gene in enumerate(parent.genes) 
-                            if isinstance(gene, Constant)]
-        if not constant_indices:
+    def insert_node(self, parent: Expression):
+        """
+        插入节点突变（优化版）
+        """
+        # 1. 提前检查大小限制
+        if parent.tree.size >= self.maxsize - 1:
             return None, False
         
-        # 2. 随机选择一个
-        target_idx = self.random_state.choice(constant_indices)
-        target_gene = parent.genes[target_idx]
+        # 2. 选择目标节点
+        target_node = self.get_subtree(parent.tree, not_leaf=True, not_root=True)
+        if target_node is None:
+            return None, False
+        
+        # 3. 选择算子并检查大小
+        new_operator = self._get_random_operator()
+        new_size = parent.tree.size + 1 + (new_operator.degree - 1)
+        if new_size > self.maxsize:
+            return None, False
+        
+        # 4. 通过检查后再复制
+        new_expr = self.reproduce(parent)
+        
+        # 5. 在新树上找到对应节点
+        new_target = self._find_corresponding_node(new_expr.tree, target_node)
+        if new_target is None:
+            return None, False
+        
+        parent_node = new_target.parent
+        cloned_target = clone_tree(new_target)
+        
+        new_node = SymbolicNode(node_content=new_operator)
+        children = [cloned_target]
+        for _ in range(new_operator.degree - 1):
+            other_child = SymbolicNode(node_content=self._get_random_leaf())
+            children.append(other_child)
+        
+        self.random_state.shuffle(children)
+        new_node.children = children
+        
+        children_list = list(parent_node.children)
+        replacement_idx = children_list.index(new_target)
+        children_list[replacement_idx] = new_node
+        parent_node.children = children_list
+        
+        return new_expr, True
+
+    def delete_node(self, parent: Expression):
+        """删除节点突变（修复版）"""
+        # 1. 提前检查
+        if parent.tree.size <= 1:
+            return None, False
+        
+        # 2. 选择目标节点
+        target_node = self.get_subtree(parent.tree)
+        if target_node is None:
+            return None, False
+        
+        # 3. 如果是叶子节点，准备替换的叶子
+        new_leaf_content = None
+        if target_node.is_leaf:
+            new_leaf_content = self._get_random_leaf(exclude=target_node.node_content)
+            if new_leaf_content is None:
+                return None, False
+        
+        # 4. 通过检查后再复制
+        new_expr = self.reproduce(parent)
+        
+        # 5. 在新树上找到对应节点
+        new_target = self._find_corresponding_node(new_expr.tree, target_node)
+        if new_target is None:
+            return None, False
+        
+        # 6. 执行删除操作
+        if new_target.is_leaf:
+            # 叶子节点：替换为新的随机叶子
+            new_target.node_content = new_leaf_content
+        else:
+            # 非叶子节点：提升一个子节点
+            promoted_child = clone_tree(self.random_state.choice(new_target.children))
+            parent_node = new_target.parent
+            if parent_node is None:
+                new_expr.tree = promoted_child
+            else:
+                children_list = list(parent_node.children)
+                idx = children_list.index(new_target)
+                children_list[idx] = promoted_child
+                parent_node.children = children_list
+        
+        return new_expr, True
+
+    def do_nothing_tree(self, parent: Expression):
+        """返回一个新的、相同的表达式"""
+        new_expr = self.reproduce(parent)
+        return new_expr, True
+
+    def mutate_constant(self, parent: Expression):
+        """突变常量（优化版）"""
+        # 1. 收集候选节点
+        candidates = [node for node in PreOrderIter(parent.tree) 
+                     if isinstance(node.node_content, Constant)]
+        if not candidates:
+            return None, False
+        
+        # 2. 随机选择一个常量节点
+        target_node = self.random_state.choice(candidates)
         
         # 3. 计算新值
         perturbation = 1 + self.perturbation_factor * self.random_state.random() + 0.1
         perturbation = perturbation if self.random_state.uniform() > 0.5 else 1/perturbation
         if self.random_state.uniform() < self.probability_negate_constant:
             perturbation = -perturbation
-        new_value = target_gene.value * perturbation
-        new_constant = Constant(value=new_value)
+        new_value = target_node.node_content.value * perturbation
         
-        # 4. 创建新基因列表
-        new_genes = parent.genes[:target_idx] + [new_constant] + parent.genes[target_idx + 1:]
+        # 4. 复制树
+        new_expr = self.reproduce(parent)
         
-        # 5. 复制和验证
-        new_expr = self.reproduce(genes=new_genes)
+        # 5. 在新树上找到对应节点并修改
+        new_target = self._find_corresponding_node(new_expr.tree, target_node)
+        if new_target is None:
+            return None, False
+        
+        new_target.node_content = Constant(value=new_value)
+        
         return new_expr, True
 
-    def mutate_variable(self, parent: Expression) -> Tuple[Optional['Expression'], bool]:
-        """突变变量 (RPN version)"""
-        # 1. 收集候选索引
-        variable_indices = [i for i, gene in enumerate(parent.genes) 
-                            if isinstance(gene, Variable)]
-        if not variable_indices:
+    def mutate_variable(self, parent: Expression):
+        """突变变量（优化版）"""
+        # 1. 收集候选节点
+        candidates = [node for node in PreOrderIter(parent.tree) 
+                     if isinstance(node.node_content, Variable)]
+        if not self.generator.use_variables or not candidates:
             return None, False
 
-        # 2. 随机选择一个
-        target_idx = self.random_state.choice(variable_indices)
-        target_gene = parent.genes[target_idx]
+        # 2. 选择目标节点
+        target_node = self.random_state.choice(candidates)
         
         # 3. 选择新变量
-        new_variable = self.random_state.choice(self.generator.variables)
-        if new_variable == target_gene:
+        old_variable = target_node.node_content
+        variable_idx = self.generator.variables.index(old_variable)
+        variable_indices = np.delete(np.arange(len(self.generator.variables)), variable_idx)
+        distances = np.abs(variable_indices - variable_idx)
+        weights = np.exp(-0.5 * distances ** 2)
+        new_idx = np.random.choice(variable_indices, p=weights/weights.sum())
+        new_variable = self.generator.variables[new_idx]
+        
+        if new_variable == old_variable:
             return None, False
         
-        # 4. 创建新基因列表
-        new_genes = parent.genes[:target_idx] + [new_variable] + parent.genes[target_idx + 1:]
+        # 4. 复制树并修改
+        new_expr = self.reproduce(parent)
+        new_target = self._find_corresponding_node(new_expr.tree, target_node)
+        if new_target is None:
+            return None, False
         
-        # 5. 复制和验证
-        new_expr = self.reproduce(genes=new_genes)
+        new_target.node_content = new_variable
+        
         return new_expr, True
 
-    def mutate_operator(self, parent: Expression) -> Tuple[Optional['Expression'], bool]:
-        """突变操作符 (RPN version)"""
-        # 1. 收集候选索引 (非叶子)
-        operator_indices = [i for i, gene in enumerate(parent.genes) 
-                            if gene.degree > 0]
-        if not operator_indices:
+    def mutate_operator(self, parent: Expression):
+        """突变操作符（优化版）"""
+        # 1. 选择目标节点
+        target_node = self.get_subtree(parent.tree, not_leaf=True)
+        if target_node is None:
             return None, False
         
-        # 2. 随机选择一个
-        target_idx = self.random_state.choice(operator_indices)
-        target_gene = parent.genes[target_idx]
-        degree = target_gene.degree
+        # 2. 选择新算子
+        target_degree = target_node.degree
+        target_operator = target_node.node_content
+        new_operator = self._get_random_operator(target_degree, exclude=target_operator)
         
-        # 3. 寻找相同度数的替代品
-        alternatives = [op for op in self.generator._degree_operators.get(degree, []) 
-                        if op != target_gene]
-        
-        if not alternatives:
+        if not new_operator:
             return None, False
         
-        new_operator = self.random_state.choice(alternatives)
+        # 3. 复制树并修改
+        new_expr = self.reproduce(parent)
+        new_target = self._find_corresponding_node(new_expr.tree, target_node)
+        if new_target is None:
+            return None, False
         
-        # 4. 创建新基因列表
-        new_genes = parent.genes[:target_idx] + [new_operator] + parent.genes[target_idx + 1:]
+        new_target.node_content = new_operator
         
-        # 5. 复制和验证
-        new_expr = self.reproduce(genes=new_genes)
         return new_expr, True
 
-    def mutate_aggregation(self, parent: Expression) -> Tuple[Optional['Expression'], bool]:
-        """突变聚合节点 (RPN version)"""
-        # 1. 收集候选索引
-        agg_indices = [i for i, gene in enumerate(parent.genes) 
-                       if isinstance(gene, DynamicAggregation)]
-        if not agg_indices:
+    def mutate_aggregation(self, parent: Expression):
+        """突变聚合节点（优化版）"""
+        # 1. 收集候选节点
+        candidates = [node for node in PreOrderIter(parent.tree) 
+                     if isinstance(node.node_content, DynamicAggregation)]
+        if not candidates:
             return None, False
         
-        # 2. 随机选择一个
-        target_idx = self.random_state.choice(agg_indices)
-        aggregation = parent.genes[target_idx]
+        # 2. 选择目标节点
+        target_node = self.random_state.choice(candidates)
+        aggregation = target_node.node_content
         
-        # 3. 计算新的聚合参数 (复制您的逻辑)
-        valid_op_num = len(aggregation.valid_op)
-        prob_mutate_operator = 0.0001*valid_op_num if valid_op_num>1 else 0.0
-        if self.random_state.random() < prob_mutate_operator:
+        # 3. 计算新的聚合参数（保持原有逻辑）
+        valid_op_num = len(aggregation.valid_op) if aggregation.valid_op else 1
+        prob_mutate_operator = 0.0001 * valid_op_num if valid_op_num > 1 else 0.0
+        
+        if self.random_state.random() < prob_mutate_operator and aggregation.valid_op:
             new_op_name = self.random_state.choice(aggregation.valid_op)
             new_aggregation = DynamicAggregation(
                 v_start=aggregation.v_start,
@@ -1181,6 +660,7 @@ class ExpressionGP:
                 valid_op=aggregation.valid_op
             )
         else:
+            # 执行窗口突变（保持原有逻辑）
             v_start, v_end = aggregation.v_start, aggregation.v_end
             n_variables = aggregation.n_variables
             current_window_size = v_end - v_start + 1
@@ -1191,7 +671,7 @@ class ExpressionGP:
                 ['shift_both', 'shift_start', 'shift_end', 'expand', 'shrink']
             )
             
-            # 执行突变逻辑
+            # [保持原有的突变逻辑不变]
             if mutation_type == 'shift_both':
                 shift = self.random_state.randint(-max_shift, max_shift + 1)
                 new_start = v_start + shift
@@ -1258,85 +738,595 @@ class ExpressionGP:
                 valid_op=aggregation.valid_op
             )
         
-        # 4. 创建新基因列表
-        new_genes = parent.genes[:target_idx] + [new_aggregation] + parent.genes[target_idx + 1:]
+        # 4. 复制树并修改
+        new_expr = self.reproduce(parent)
+        new_target = self._find_corresponding_node(new_expr.tree, target_node)
+        if new_target is None:
+            return None, False
         
-        # 5. 复制和验证
-        new_expr = self.reproduce(genes=new_genes)
+        new_target.node_content = new_aggregation
+        
         return new_expr, True
 
-    def swap_operands(self, parent: Expression) -> Tuple[Optional['Expression'], bool]:
-        """交换二元操作符的两个操作数 (RPN version)"""
-        # 1. 找到所有二元操作符的索引
-        binary_op_indices = [i for i, gene in enumerate(parent.genes) 
-                             if gene.degree == 2]
-        if not binary_op_indices:
+    def swap_operands(self, parent: Expression):
+        """交换操作数（优化版）"""
+        # 1. 收集候选节点
+        candidates = [node for node in PreOrderIter(parent.tree) if node.degree == 2]
+        if not candidates:
             return None, False
         
-        # 2. 随机选择一个二元操作符的位置
-        op_pos = self.random_state.choice(binary_op_indices)
+        # 2. 选择目标节点
+        target_node = self.random_state.choice(candidates)
         
-        # 3. 确定两个操作数子表达式的边界
-        # RPN 结构: [... (左操作数子树 L_SUBTREE) ... (右操作数子树 R_SUBTREE) ... BINARY_OP]
-        # BINARY_OP 在 op_pos
-        
-        # 首先找到右操作数子树 (R_SUBTREE)
-        # R_SUBTREE 结束于 op_pos - 1
-        end_R_subtree = op_pos - 1
-        # 找到 R_SUBTREE 的起始位置
-        start_R_subtree = self._find_subexpr_start(parent.genes, end_R_subtree)
-        
-        # 然后找到左操作数子树 (L_SUBTREE)
-        # L_SUBTREE 结束于 start_R_subtree - 1
-        end_L_subtree = start_R_subtree - 1
-        # 找到 L_SUBTREE 的起始位置
-        start_L_subtree = self._find_subexpr_start(parent.genes, end_L_subtree)
-        
-        # 边界有效性检查
-        if start_L_subtree < 0 or start_R_subtree <= end_L_subtree or op_pos <= end_R_subtree:
-            # 这表示 RPN 结构不符合预期，或者操作数不存在
+        # 3. 复制树并交换
+        new_expr = self.reproduce(parent)
+        new_target = self._find_corresponding_node(new_expr.tree, target_node)
+        if new_target is None:
             return None, False
+        
+        swapped_children = list(new_target.children)[::-1]
+        new_target.children = swapped_children
+        
+        return new_expr, True
+
+    def rotate_tree(self, parent: Expression):
+        """旋转树（修复版）"""
+        # 1. 收集可旋转的候选节点
+        def is_valid_rotation_node(node: SymbolicNode) -> bool:
+            if node.is_leaf:
+                return False
+            # 检查子节点是否满足旋转条件
+            if node.degree >= 1 and len(node.children) >= 1 and not node.children[0].is_leaf:
+                return True
+            if node.degree == 2 and len(node.children) >= 2 and not node.children[1].is_leaf:
+                return True
+            return False
+
+        # 安全遍历树
+        def safe_preorder_iter(node):
+            stack = [node]
+            while stack:
+                current = stack.pop()
+                yield current
+                stack.extend(reversed(current.children))
+        
+        candidates = [node for node in safe_preorder_iter(parent.tree) 
+                    if is_valid_rotation_node(node)]
+        
+        if not candidates:
+            return None, False
+
+        # 2. 选择目标节点
+        subtree_root = self.random_state.choice(candidates)
+        
+        # 旋转条件检查
+        can_rotate_right = (len(subtree_root.children) >= 1 and 
+                        not subtree_root.children[0].is_leaf and
+                        len(subtree_root.children[0].children) >= 1)
+        
+        can_rotate_left = (len(subtree_root.children) >= 2 and 
+                        not subtree_root.children[1].is_leaf and
+                        len(subtree_root.children[1].children) >= 1)
+        
+        if not can_rotate_left and not can_rotate_right:
+            return None, False
+
+        # 3. 确定旋转方向
+        if can_rotate_left and can_rotate_right:
+            direction = self.random_state.choice(['left', 'right'])
+        elif can_rotate_left:
+            direction = 'left'
+        else:
+            direction = 'right'
+
+        # 4. 复制树
+        new_expr = self.reproduce(parent)
+        
+        # 5. 在新树上找到对应节点
+        new_subtree_root = self._find_corresponding_node(new_expr.tree, subtree_root)
+        if new_subtree_root is None:
+            return None, False
+        
+        # 验证找到的节点
+        if (new_subtree_root.name != subtree_root.name or 
+            new_subtree_root.degree != subtree_root.degree or
+            len(new_subtree_root.children) != len(subtree_root.children)):
+            return None, False
+        
+        original_parent = new_subtree_root.parent
+        
+        # 6. 执行旋转
+        if direction == 'right':
+            A = new_subtree_root
+            if len(A.children) < 1:
+                return None, False
             
-        # 4. 提取两个子表达式 (基因列表)
-        L_SUBTREE_genes = parent.genes[start_L_subtree : end_L_subtree + 1]
-        R_SUBTREE_genes = parent.genes[start_R_subtree : end_R_subtree + 1]
+            B = A.children[0]
+            if len(B.children) < 1:
+                return None, False        
+            C = A.children[1] if len(A.children) > 1 else None
+            D = B.children[0]
+            E = B.children[1] if len(B.children) > 1 else None
+
+            new_A = SymbolicNode(node_content=A.node_content)
+            new_B = SymbolicNode(node_content=B.node_content)
+            new_D = clone_tree(D) if D is not None else None
+            new_E = clone_tree(E) if E is not None else None
+            new_C = clone_tree(C) if C is not None else None
+            
+            if B.degree == 1:
+                if A.degree == 1:
+                    return None, False
+                elif A.degree == 2:
+                    if new_D is None or new_C is None:
+                        return None, False
+                    new_A.children = [new_D, new_C]
+                    new_B.children = [new_A]
+                else:
+                    return None, False
+            elif B.degree == 2:
+                if new_D is None:
+                    return None, False
+                    
+                children_A = []
+                if new_E is not None: 
+                    children_A.append(new_E)
+                if new_C is not None: 
+                    children_A.append(new_C)
+                
+                if A.degree == 1:
+                    if len(children_A) == 0:
+                        return None, False
+                    new_A.children = children_A[:1]
+                elif A.degree == 2:
+                    if len(children_A) != 2:
+                        return None, False
+                    new_A.children = children_A
+                else:
+                    return None, False
+                    
+                new_B.children = [new_D, new_A]
+            else:
+                return None, False
+        else:  # left rotation
+            A = new_subtree_root
+            if len(A.children) < 2:
+                return None, False
+                
+            C = A.children[0]
+            B = A.children[1]
+            
+            if len(B.children) < 1:
+                return None, False
+                
+            D = B.children[0]
+            E = B.children[1] if len(B.children) > 1 else None
+
+            new_A = SymbolicNode(node_content=A.node_content)
+            new_B = SymbolicNode(node_content=B.node_content)
+            new_C = clone_tree(C) if C is not None else None
+            new_D = clone_tree(D) if D is not None else None
+            new_E = clone_tree(E) if E is not None else None
+            
+            if B.degree == 1:
+                if A.degree == 1:
+                    return None, False
+                elif A.degree == 2:
+                    if new_C is None or new_D is None:
+                        return None, False
+                    new_A.children = [new_C, new_D]
+                    new_B.children = [new_A]
+                else:
+                    return None, False
+            elif B.degree == 2:
+                if new_C is None or new_D is None:
+                    return None, False
+                    
+                if A.degree == 1:
+                    new_A.children = [new_C]
+                elif A.degree == 2:
+                    new_A.children = [new_C, new_D]
+                else:
+                    return None, False
+                    
+                children_B = [new_A]
+                if new_E is not None: 
+                    children_B.append(new_E)
+                if len(children_B) != 2:
+                    return None, False
+                new_B.children = children_B
+            else:
+                return None, False
         
-        # 5. 构建交换后的新基因列表
-        # 结构变为: [... (右操作数子树 R_SUBTREE) ... (左操作数子树 L_SUBTREE) ... BINARY_OP]
-        new_genes_list = (
-            parent.genes[:start_L_subtree] +  # 前缀部分
-            R_SUBTREE_genes +                 # 交换后的右操作数子树
-            L_SUBTREE_genes +                 # 交换后的左操作数子树
-            parent.genes[op_pos:]             # 操作符及之后的部分
+        # 替换节点
+        if original_parent is None:
+            new_expr.tree = new_B
+        else:
+            children_list = list(original_parent.children)
+            idx = children_list.index(new_subtree_root)
+            children_list[idx] = new_B
+            original_parent.children = children_list
+        
+        return new_expr, True
+
+    def randomize_tree(self, parent: Expression):
+        """随机替换子树（优化版）"""
+        # 1. 选择目标节点
+        target_node = self.get_subtree(parent.tree)
+        if target_node is None:
+            return None, False
+        
+        # 2. 计算可用大小
+        max_target_size = self.maxsize - (parent.tree.size - target_node.size)
+        valid_sizes = np.array(list(self.generator.size_prob.keys()))
+        size_probs = np.array(list(self.generator.size_prob.values()))
+        mask = valid_sizes <= max_target_size
+        if not np.any(mask):
+            return None, False
+        
+        target_size = self.random_state.choice(
+            valid_sizes[mask], 
+            p=size_probs[mask]/size_probs[mask].sum()
         )
         
-        # 6. 复制和验证
-        # 假设 Expression 构造函数会调用 _is_valid 进行验证
-        new_expr = Expression(genes=new_genes_list, metric=parent.metric) 
+        # 3. 生成新子树
+        new_subtree = self.generator.build_tree(target_size)
+        
+        # 4. 复制树
+        new_expr = self.reproduce(parent)
+        
+        # 5. 在新树上找到对应节点并替换
+        new_target = self._find_corresponding_node(new_expr.tree, target_node)
+        if new_target is None:
+            return None, False
+
+        if new_target.is_root:
+            new_expr.tree = new_subtree
+        else:
+            self._crossover(new_target, new_subtree)
         
         return new_expr, True
 
+    def hoist_tree(self, parent: Expression):
+        """提升子树（优化版）"""
+        # 1. 选择目标节点
+        subtree = self.get_subtree(parent.tree, not_leaf=True)
+        if subtree is None:
+            return None, False
+        
+        # 2. 在原树上选择子子树
+        subsubtree = self.get_subtree(tree=subtree, not_root=True)
+        if subsubtree is None:
+            return None, False
+        
+        # 3. 复制树
+        new_expr = self.reproduce(parent)
+        
+        # 4. 在新树上找到对应节点
+        new_subtree = self._find_corresponding_node(new_expr.tree, subtree)
+        if new_subtree is None:
+            return None, False
+        
+        # 5. 在新子树中找到对应的子子树节点
+        new_subsubtree = self._find_corresponding_node(new_subtree, subsubtree)
+        if new_subsubtree is None:
+            return None, False
+        
+        # 6. 克隆子子树并替换
+        cloned_subsubtree = clone_tree(new_subsubtree)
+        
+        if new_subtree.is_root:
+            new_expr.tree = cloned_subsubtree
+        else:
+            self._crossover(new_subtree, cloned_subsubtree)
+        
+        return new_expr, True
+
+    def simplify(self, parent: Expression):
+        """
+        简化树，返回一个新的Expression对象
+        使用小的容差将接近0或1的常量对齐
+        """
+        new_expr = self.reproduce(parent)
+        
+        # 多次迭代简化，直到不再有变化
+        max_iterations = 10
+        for iteration in range(max_iterations):
+            original_tree = clone_tree(new_expr.tree)
+            new_expr.tree = self._recursive_simplify(new_expr.tree, self.constants_tolerance)
+            
+            # 如果树没有变化，说明已经简化完成
+            if Expression._trees_are_equal(original_tree, new_expr.tree):
+                break
+        
+        simplified = not Expression._trees_are_equal(parent.tree, new_expr.tree)
+        return new_expr, simplified
+
+    def _recursive_simplify(self, node: SymbolicNode, tolerance: float) -> SymbolicNode:
+        """
+        增强版递归简化函数，支持更多简化规则
+        """
+        # --- Base Case: 叶子节点 ---
+        if node.is_leaf:
+            if isinstance(node.node_content, Constant):
+                value = node.node_content.value
+                # 接近0的值归零
+                if abs(value) < tolerance:
+                    return SymbolicNode(node_content=Constant(0.0))
+                # 接近1的值归一
+                if abs(value - 1.0) < tolerance:
+                    return SymbolicNode(node_content=Constant(1.0))
+            return node
+
+        # --- Recursive Step: 先简化所有子节点 ---
+        node.children = [self._recursive_simplify(child, tolerance) for child in node.children]
+
+        op_name = node.node_content.name
+        children = node.children
+
+        # --- 常量折叠 ---
+        if all(isinstance(child.node_content, Constant) for child in children):
+            try:
+                child_values = [child.node_content.value for child in children]
+                new_value = node.node_content(*child_values)
+                result_node = SymbolicNode(node_content=Constant(new_value))
+                return self._recursive_simplify(result_node, tolerance)
+            except Exception:
+                pass
+
+        # --- 处理无常量场景的特殊规则 ---
+        if not self.generator.use_constants:
+            if node.degree == 1 and isinstance(children[0].node_content, Constant):
+                random_var_node = SymbolicNode(node_content=self._get_random_leaf())
+                node.children = [random_var_node]
+                return node
+            if node.degree >= 2:
+                if all(isinstance(child.node_content, Constant) for child in node.children):
+                    return SymbolicNode(node_content=self._get_random_leaf())
+                elif any(isinstance(child.node_content, Constant) for child in node.children):
+                    children_list = list(node.children)
+                    children_constant_index = [i for i, child in enumerate(children_list) 
+                                            if isinstance(child.node_content, Constant)]
+                    if any(isinstance(child.node_content, Operator) for child in node.children):
+                        children_op = [child for child in children_list 
+                                    if isinstance(child.node_content, Operator)]
+                        return self.random_state.choice(children_op)
+                    if self.random_state.uniform() < 0.5:
+                        for i in children_constant_index:
+                            random_var_node = SymbolicNode(node_content=self._get_random_leaf())
+                            children_list[i] = random_var_node
+                        node.children = children_list
+                    else:
+                        valid_variables = [child for child in children_list 
+                                        if isinstance(child.node_content, Variable)]
+                        if valid_variables:
+                            random_var_node = self.random_state.choice(valid_variables)
+                            return random_var_node
+
+        # --- 二元运算符简化规则 ---
+        if node.degree == 2:
+            left, right = children[0], children[1]
+            left_op, right_op = left.node_content, right.node_content
+
+            # 加法规则
+            if op_name == 'add' or op_name == '+':
+                # x + 0 = x, 0 + x = x
+                if isinstance(right_op, Constant) and right_op.value == 0:
+                    return left
+                if isinstance(left_op, Constant) and left_op.value == 0:
+                    return right
+                # x + (-y) = x - y
+                if isinstance(right_op, Operator) and right_op.name in ('neg', '-'):
+                    if right_op.degree == 1:
+                        new_node = SymbolicNode(node_content=self._get_operator_by_name('sub'))
+                        new_node.children = [left, right.children[0]]
+                        return new_node
+
+            # 减法规则
+            elif op_name == 'sub' or op_name == '-':
+                # x - 0 = x
+                if isinstance(right_op, Constant) and right_op.value == 0:
+                    return left
+                # 0 - x = -x
+                if isinstance(left_op, Constant) and left_op.value == 0:
+                    neg_op = self._get_operator_by_name('neg')
+                    if neg_op:
+                        new_node = SymbolicNode(node_content=neg_op)
+                        new_node.children = [right]
+                        return new_node
+                # x - x = 0
+                if Expression._trees_are_equal(left, right):
+                    return SymbolicNode(node_content=Constant(0.0))
+                # x - (-y) = x + y
+                if isinstance(right_op, Operator) and right_op.name in ('neg', '-'):
+                    if right_op.degree == 1:
+                        new_node = SymbolicNode(node_content=self._get_operator_by_name('add'))
+                        new_node.children = [left, right.children[0]]
+                        return new_node
+
+            # 乘法规则
+            elif op_name == 'mul' or op_name == '*':
+                # x * 1 = x, 1 * x = x
+                if isinstance(right_op, Constant) and right_op.value == 1:
+                    return left
+                if isinstance(left_op, Constant) and left_op.value == 1:
+                    return right
+                # x * 0 = 0, 0 * x = 0
+                if isinstance(right_op, Constant) and right_op.value == 0:
+                    return SymbolicNode(node_content=Constant(0.0))
+                if isinstance(left_op, Constant) and left_op.value == 0:
+                    return SymbolicNode(node_content=Constant(0.0))
+                # x * (-1) = -x, (-1) * x = -x
+                if isinstance(right_op, Constant) and right_op.value == -1:
+                    neg_op = self._get_operator_by_name('neg')
+                    if neg_op:
+                        new_node = SymbolicNode(node_content=neg_op)
+                        new_node.children = [left]
+                        return new_node
+                if isinstance(left_op, Constant) and left_op.value == -1:
+                    neg_op = self._get_operator_by_name('neg')
+                    if neg_op:
+                        new_node = SymbolicNode(node_content=neg_op)
+                        new_node.children = [right]
+                        return new_node
+                # x * (y / x) = y
+                if isinstance(right_op, Operator) and right_op.name in ('div', '/'):
+                    if Expression._trees_are_equal(left, right.children[1]):
+                        return right.children[0]
+                # (y / x) * x = y
+                if isinstance(left_op, Operator) and left_op.name in ('div', '/'):
+                    if Expression._trees_are_equal(right, left.children[1]):
+                        return left.children[0]
+
+            # 除法规则
+            elif op_name == 'div' or op_name == '/':
+                # x / 1 = x
+                if isinstance(right_op, Constant) and right_op.value == 1:
+                    return left
+                # 0 / x = 0 (x != 0)
+                if isinstance(left_op, Constant) and left_op.value == 0:
+                    return SymbolicNode(node_content=Constant(0.0))
+                # x / 0 = 1 (保护性处理)
+                if isinstance(right_op, Constant) and right_op.value == 0:
+                    return SymbolicNode(node_content=Constant(1.0))
+                # x / x = 1
+                if Expression._trees_are_equal(left, right):
+                    return SymbolicNode(node_content=Constant(1.0))
+                # (x * y) / x = y, (x * y) / y = x
+                if isinstance(left_op, Operator) and left_op.name in ('mul', '*'):
+                    if Expression._trees_are_equal(right, left.children[0]):
+                        return left.children[1]
+                    if Expression._trees_are_equal(right, left.children[1]):
+                        return left.children[0]
+                # x / (x * y) = 1 / y, x / (y * x) = 1 / y
+                if isinstance(right_op, Operator) and right_op.name in ('mul', '*'):
+                    one_node = SymbolicNode(node_content=Constant(1.0))
+                    div_op = self._get_operator_by_name('div')
+                    if Expression._trees_are_equal(left, right.children[0]):
+                        new_node = SymbolicNode(node_content=div_op)
+                        new_node.children = [one_node, right.children[1]]
+                        return new_node
+                    if Expression._trees_are_equal(left, right.children[1]):
+                        new_node = SymbolicNode(node_content=div_op)
+                        new_node.children = [one_node, right.children[0]]
+                        return new_node
+
+            # 加法的代数简化
+            if op_name in ('add', '+'):
+                # x + (y - x) = y
+                if isinstance(right_op, Operator) and right_op.name in ('sub', '-'):
+                    if Expression._trees_are_equal(left, right.children[1]):
+                        return right.children[0]
+                # (y - x) + x = y
+                if isinstance(left_op, Operator) and left_op.name in ('sub', '-'):
+                    if Expression._trees_are_equal(right, left.children[1]):
+                        return left.children[0]
+
+        # --- 一元运算符简化规则 ---
+        if node.degree == 1:
+            child = children[0]
+            child_op = child.node_content
+            
+            # -(-x) = x
+            if op_name in ('neg', '-'):
+                if isinstance(child_op, Operator) and child_op.name in ('neg', '-'):
+                    if child_op.degree == 1:
+                        return child.children[0]
+                # -(c) = -c (常量折叠)
+                if isinstance(child_op, Constant):
+                    return SymbolicNode(node_content=Constant(-child_op.value))
+
+        return node
+
+    def _get_operator_by_name(self, name: str) -> Optional[Operator]:
+        """根据名称获取运算符"""
+        for op in self.generator.operators:
+            if op.name == name:
+                return op
+        return None
+
     def optimize_constants(
-        self,
-        parent: Expression, 
-        X: np.ndarray, 
-        y: np.ndarray,
-        optimizer_algorithm='L-BFGS-B',
-        optimizer_nrestarts=3,
-        optimizer_iterations=10
+        self, parent: Expression, X: np.ndarray, y: np.ndarray,
+        optimizer_algorithm='L-BFGS-B', optimizer_nrestarts=3, optimizer_iterations=10
     ):
-        """
-        混合策略的常量优化
-        - 梯度计算：JAX（快速自动微分）
-        - 适应度评估：NumPy（避免重复编译）
-        """
         # 检查是否有常量
         if not (len(parent.constant_indices) > 0):
-            return parent, False, np.nan
-        
+            return None, False, np.nan
+
+        if parent.metric.name in _fitness_jax_map:
+            return self._optimize_constants_jax(
+                parent, X, y, optimizer_algorithm, 
+                optimizer_nrestarts, optimizer_iterations
+            )
+        else:
+            return self._optimize_constants_numpy(
+                parent, X, y, optimizer_algorithm, 
+                optimizer_nrestarts, optimizer_iterations
+            )
+
+    def _optimize_constants_numpy(
+        self, parent: Expression, X: np.ndarray, y: np.ndarray,
+        optimizer_algorithm='L-BFGS-B', optimizer_nrestarts=3, optimizer_iterations=10
+    ):
         # 获取初始常量
         initial_constants = np.array([
-            parent.genes[idx].value for idx in parent._constant_indices
+            node.node_content.value for node in PostOrderIter(parent.tree) 
+                if isinstance(node.node_content, Constant)
+        ])
+
+        # 定义优化目标（使用预编译的梯度）
+        def objective(constants_np: np.ndarray):
+            # 计算损失（使用快速的NumPy执行）
+            fitness = parent.fitness(X, y, constants_np)
+            loss = -fitness if parent.metric.greater_is_better else fitness
+            
+            return loss
+
+        # 多次重启优化
+        best_loss = float('inf')
+        best_constants = initial_constants.copy()
+        
+        for restart in range(optimizer_nrestarts):
+            # 初始点
+            if restart == 0:
+                x0 = initial_constants.copy()
+            else:
+                noise_scale = 0.05 / np.sqrt(restart)
+                noise = self.random_state.normal(0, noise_scale, size=len(initial_constants))
+                constants_scale = np.abs(initial_constants) + 1e-6
+                x0 = initial_constants + noise * constants_scale
+            
+            # 执行优化
+            if optimizer_algorithm in METHODS_WITH_EPS:
+                result = minimize(
+                    objective, x0, method=optimizer_algorithm, 
+                    options={'maxiter': optimizer_iterations, 'eps': self.constants_tolerance}
+                )
+            else:
+                result = minimize(
+                    objective, x0,
+                    method=optimizer_algorithm, 
+                    options={'maxiter': optimizer_iterations}
+                )
+            # 更新最佳结果
+            if result.fun < best_loss:
+                best_loss = result.fun
+                best_constants = result.x
+
+        # 创建优化后的表达式
+        optimized_expr = parent.update_constants(best_constants)
+        final_fitness = -best_loss if parent.metric.greater_is_better else best_loss
+        
+        return optimized_expr, True, final_fitness
+
+    def _optimize_constants_jax(
+        self, parent: Expression, X: np.ndarray, y: np.ndarray,
+        optimizer_algorithm='L-BFGS-B', optimizer_nrestarts=3, optimizer_iterations=10
+    ):
+        # 获取初始常量
+        initial_constants = jnp.array([
+            node.node_content.value for node in PostOrderIter(parent.tree) 
+                if isinstance(node.node_content, Constant)
         ])
         
         # 预编译JAX梯度函数（只编译一次）
@@ -1352,8 +1342,7 @@ class ExpressionGP:
             grad = grad_fn(constants_jax, X_jax, y_jax)
             
             # 计算损失（使用快速的NumPy执行）
-            temp_expr = parent.update_constants(constants_np)
-            fitness = temp_expr.fitness(X, y)
+            fitness = parent.fitness(X, y, constants_np)
             loss = -fitness if parent.metric.greater_is_better else fitness
             
             return float(loss), np.array(grad)
@@ -1363,15 +1352,13 @@ class ExpressionGP:
         best_constants = initial_constants.copy()
         
         for restart in range(optimizer_nrestarts):
-            # 第一次使用原始值，后续添加噪声
+            # 初始点
             if restart == 0:
                 x0 = initial_constants.copy()
             else:
-                # 噪声强度递减（避免后期扰动过大）
                 noise_scale = 0.05 / np.sqrt(restart)
-                # restart=1: 5%, restart=2: 3.5%, restart=3: 2.9%
                 noise = self.random_state.normal(0, noise_scale, size=len(initial_constants))
-                constants_scale = np.abs(initial_constants) + 1e-6  # 处理零值
+                constants_scale = np.abs(initial_constants) + 1e-6
                 x0 = initial_constants + noise * constants_scale
             
             # 执行优化
@@ -1379,9 +1366,7 @@ class ExpressionGP:
                 result = minimize(
                     objective_and_grad, x0,
                     method=optimizer_algorithm, jac=True,
-                    options={'maxiter': optimizer_iterations, 
-                             'eps': self.constants_tolerance
-                    }
+                    options={'maxiter': optimizer_iterations, 'eps': 0.00001}
                 )
             else:
                 result = minimize(
@@ -1389,7 +1374,6 @@ class ExpressionGP:
                     method=optimizer_algorithm, jac=True,
                     options={'maxiter': optimizer_iterations}
                 )
-            
             # 更新最佳结果
             if result.fun < best_loss:
                 best_loss = result.fun
@@ -1397,8 +1381,6 @@ class ExpressionGP:
         
         # 创建优化后的表达式
         optimized_expr = parent.update_constants(best_constants)
-        
-        # 最终适应度
         final_fitness = -best_loss if parent.metric.greater_is_better else best_loss
         
         return optimized_expr, True, final_fitness
@@ -1447,12 +1429,12 @@ class ExpressionGP:
         时间复杂度：O(iterations * neighbors * n_samples)
         其中 neighbors ≈ O(n_aggregations * shift_amount * 操作类型)
         """
-        # 1. 收集所有聚合节点的索引（一次遍历）
-        agg_indices = [(i, gene) for i, gene in enumerate(self.genes)
-                      if isinstance(gene, DynamicAggregation)]
-        
-        if not agg_indices:
+        if parent._count_scalar_aggregations() == 0:
             return None, False, np.nan
+        
+        # 1. 收集所有聚合节点的索引（一次遍历）
+        agg_nodes = [node for node in PreOrderIter(parent.tree) 
+                    if isinstance(node.node_content, DynamicAggregation)]
         
         # 2. 创建副本并记录初始状态
         new_expr = parent.copy()
@@ -1460,40 +1442,41 @@ class ExpressionGP:
         early_exaggeration_iter = min(early_exaggeration_iter, optimizer_iterations)
         
         # 初始状态：[(index, v_start, v_end, op_name, valid_op), ...]
-        initial_states = [
-            {
-                'idx': agg_idx,
+        initial_states = []
+        for node in agg_nodes:
+            agg = node.node_content
+            initial_states.append({
+                'node': node,
                 'v_start': agg.v_start,
                 'v_end': agg.v_end,
                 'op_name': agg.op_name,
                 'valid_op': agg.valid_op
-            }
-            for agg_idx, agg in agg_indices
-        ]
+            })
         
         # 3. 计算初始适应度
         best_fitness = new_expr.fitness(X, y)
         best_states = [s.copy() for s in initial_states]
         
         # 4. 定义快速应用状态的函数
-        def apply_states_fast(states):
-            """快速应用聚合参数（原地修改）"""
+        def apply_states(states):
+            """将参数状态应用到节点"""
             for state in states:
-                idx = state['idx']
-                new_expr.genes[idx] = DynamicAggregation(
+                node = state['node']
+                node.node_content = DynamicAggregation(
                     v_start=state['v_start'],
                     v_end=state['v_end'],
                     op_name=state['op_name'],
                     n_variables=n_variables,
                     valid_op=state['valid_op']
                 )
+            return True
         
         # 6. 贪心爬山算法
         current_states = initial_states
         current_fitness = best_fitness
         
         iterations = 0
-        no_improvement_count = 0
+        no_improvement_count = 0  # 记录连续无改进的迭代次数
         
         while iterations < optimizer_iterations and no_improvement_count < early_stopping_patience:
             iterations += 1
@@ -1512,7 +1495,7 @@ class ExpressionGP:
             
             # 评估邻居（首次改进即停止）
             for neighbor_states in neighbors:
-                apply_states_fast(neighbor_states)
+                apply_states(neighbor_states)
                 
                 neighbor_fitness = new_expr.fitness(X, y)
                 
@@ -1538,7 +1521,7 @@ class ExpressionGP:
                 no_improvement_count += 1
         
         # 7. 应用最佳状态
-        apply_states_fast(best_states)
+        apply_states(best_states)
         raw_fitness = best_fitness
         
         return new_expr, True, raw_fitness
@@ -1665,372 +1648,6 @@ class ExpressionGP:
         
         return neighbors
 
-    def simplify(self, parent: Expression) -> Tuple[Optional['Expression'], bool]:
-        """
-        简化表达式（基于模式匹配）
-        
-        使用 RPN 栈进行迭代简化，以正确处理嵌套表达式。
-        
-        支持的规则：
-        - 常量折叠 (e.g., 1 + 1 -> 2)
-        - 恒等操作 (e.g., x + 0 -> x, x * 1 -> x)
-        - 零/湮灭操作 (e.g., x * 0 -> 0, 0 / x -> 0)
-        - 保护性除零 (e.g., x / 0 -> 1)
-        - 幂等操作 (e.g., x - x -> 0, x / x -> 1)
-        - 逆运算 (e.g., -(-x) -> x, x - (-y) -> x + y)
-        - 分数简化 (e.g., (x * y) / x -> y, x / (x * y) -> inv(y))
-        """
-        # 'stack' 是一个“元堆栈”，它包含 *子表达式（基因列表）*
-        # e.g., for [x, 2, *], stack will be [[x], [Constant(2)]]
-        # then they are popped and pushed back as [[x, Constant(2), *]]
-        stack: List[List[NodeContent]] = []
-        
-        # 跟踪是否发生了任何变化
-        simplified_once = False
-
-        for gene in parent.genes:
-            if gene.degree == 0:
-                # 叶子节点，将其作为 [gene] 列表压栈
-                stack.append([gene])
-                continue
-
-            # 操作符，弹出所需的操作数（它们是列表）
-            if len(stack) < gene.degree:
-                # 这种情况不应该在合法的 RPN 中发生
-                # 停止简化，将原基因压栈
-                unsimplified_expr = []
-                for arg_genes in stack:
-                    unsimplified_expr.extend(arg_genes)
-                unsimplified_expr.append(gene)
-                stack = [unsimplified_expr]
-                break
-
-            args = [stack.pop() for _ in range(gene.degree)]
-            args.reverse() # 恢复 L-R 顺序
-            
-            # 尝试简化
-            simplified_genes = None
-            if gene.degree == 1:
-                simplified_genes = self._try_simplify_unary(args[0], gene)
-            elif gene.degree == 2:
-                simplified_genes = self._try_simplify_binary(args[0], args[1], gene)
-            
-            if simplified_genes is not None:
-                # 简化成功
-                stack.append(simplified_genes)
-                simplified_once = True
-            else:
-                # 无法简化，将原始 RPN 重新组合并压栈
-                # [op1_genes] + [op2_genes] + [op]
-                unsimplified_expr = []
-                for arg_genes in args:
-                    unsimplified_expr.extend(arg_genes)
-                unsimplified_expr.append(gene)
-                stack.append(unsimplified_expr)
-
-        # 最终，栈中应该只剩下一个元素：完整的（可能简化的）表达式
-        if len(stack) != 1:
-            # 简化过程出错或 RPN 本身无效
-            return None, False
-            
-        new_genes = stack[0]
-
-        # 检查是否有简化
-        if not simplified_once:
-             return None, False
-        
-        new_expr = self.reproduce(new_genes)
-        # 比较新旧表达式的字符串形式，因为 [x, 1, *] -> [x] 长度可能不变
-        if new_expr == parent:
-            return None, False
-        
-        return new_expr, True
-
-    def _is_constant_value(self, gene_list: List[NodeContent], value: float) -> bool:
-        """辅助函数：检查一个子表达式是否为特定值的常量"""
-        if len(gene_list) == 1 and isinstance(gene_list[0], Constant):
-            return abs(gene_list[0].value - value) < self.constants_tolerance
-        return False
-        
-    def _get_constant_value(self, gene_list: List[NodeContent]) -> Optional[float]:
-        """辅助函数：如果子表达式是常量，返回其值"""
-        if len(gene_list) == 1 and isinstance(gene_list[0], Constant):
-            return gene_list[0].value
-        return None
-        
-    def _find_subexpr_start_in_list(self, gene_list: List[NodeContent], end_idx: int) -> int:
-        """
-        在 RPN 基因列表切片中，找到在 end_idx 处结束的子表达式的起始索引。
-        """
-        gene = gene_list[end_idx]
-        if gene.degree == 0:
-            return end_idx
-        
-        needed = gene.degree
-        pos = end_idx - 1
-        
-        while needed > 0 and pos >= 0:
-            g = gene_list[pos]
-            needed = needed - 1 + g.degree
-            pos -= 1
-        
-        # pos 是最后一个被消耗的基因的索引
-        # 所以起始位置是 pos + 1
-        return pos + 1
-
-    def _try_simplify_binary(self, 
-                             left_genes: List[NodeContent], 
-                             right_genes: List[NodeContent], 
-                             op: Operator) -> Optional[List[NodeContent]]:
-        """
-        尝试简化二元操作（RPN 列表版）
-        
-        返回：简化后的基因列表，或 None（无法简化）
-        """
-        op_name = op.name
-        
-        # 1. 常量折叠
-        left_val = self._get_constant_value(left_genes)
-        right_val = self._get_constant_value(right_genes)
-        
-        if left_val is not None and right_val is not None:
-            try:
-                # 检查除零 (x / 0)
-                if op_name in ['div', '/'] and abs(right_val) < self.constants_tolerance:
-                    # 保护性除零：x / 0 = 1
-                    return [Constant(1.0)]
-                
-                result = op(left_val, right_val)
-                return [Constant(result)]
-            except:
-                return None # 计算失败（例如 log(-1)）
-
-        # 2. 恒等操作 (Identity)
-        
-        # x + 0 = x
-        if op_name in ['add', '+'] and self._is_constant_value(right_genes, 0):
-            return left_genes
-        # 0 + x = x
-        if op_name in ['add', '+'] and self._is_constant_value(left_genes, 0):
-            return right_genes
-            
-        # x - 0 = x
-        if op_name in ['sub', '-'] and self._is_constant_value(right_genes, 0):
-            return left_genes
-            
-        # x * 1 = x
-        if op_name in ['mul', '*'] and self._is_constant_value(right_genes, 1):
-            return left_genes
-        # 1 * x = x
-        if op_name in ['mul', '*'] and self._is_constant_value(left_genes, 1):
-            return right_genes
-            
-        # x / 1 = x
-        if op_name in ['div', '/'] and self._is_constant_value(right_genes, 1):
-            return left_genes
-            
-        # 3. 零/湮灭操作 (Annihilator)
-        
-        # x * 0 = 0
-        if op_name in ['mul', '*'] and self._is_constant_value(right_genes, 0):
-            return [Constant(0.0)]
-        # 0 * x = 0
-        if op_name in ['mul', '*'] and self._is_constant_value(left_genes, 0):
-            return [Constant(0.0)]
-            
-        # 0 / x = 0 (x != 0)
-        if op_name in ['div', '/'] and self._is_constant_value(left_genes, 0):
-            if right_val is not None and abs(right_val) < self.constants_tolerance:
-                # 0 / 0 -> 保护性处理
-                return [Constant(1.0)]
-            # 0 / x = 0
-            return [Constant(0.0)]
-            
-        # x / 0 = 1 (保护性处理, 在常量折叠中已处理, 这里再加一层)
-        if op_name in ['div', '/'] and self._is_constant_value(right_genes, 0):
-            return [Constant(1.0)]
-            
-        # 4. 幂等操作 (Idempotent)
-        
-        # x / x = 1
-        if op_name in ['div', '/'] and left_genes == right_genes:
-            return [Constant(1.0)]
-            
-        # x - x = 0
-        if op_name in ['sub', '-'] and left_genes == right_genes:
-            return [Constant(0.0)]
-            
-        # 5. 逆运算 (Inverse)
-        
-        # x + (-y) = x - y
-        # 检查 right_genes 是否为 neg(y) -> [y, neg]
-        if op_name in ['add', '+'] and \
-           len(right_genes) > 1 and \
-           right_genes[-1].name == 'neg':
-            y_genes = right_genes[:-1] # 提取 y
-            sub_op = _operator_map.get('sub') 
-            if sub_op:
-                return left_genes + y_genes + [sub_op]
-        
-        # x - (-y) = x + y
-        if op_name in ['sub', '-'] and \
-           len(right_genes) > 1 and \
-           right_genes[-1].name == 'neg':
-            y_genes = right_genes[:-1] # 提取 y
-            add_op = _operator_map.get('add') 
-            if add_op:
-                return left_genes + y_genes + [add_op]
-                
-        # (y - x) + x = y
-        # 检查 left_genes 是否为 (y - x) -> [y, x, sub]
-        if op_name in ['add', '+'] and \
-           len(left_genes) > 2 and \
-           left_genes[-1].name == 'sub':
-            
-            op_pos = len(left_genes) - 1
-            # 找到 x 和 y 的 RPN 切片
-            start_x = self._find_subexpr_start_in_list(left_genes, op_pos)
-            end_x = op_pos - 1
-            start_y = self._find_subexpr_start_in_list(left_genes, start_x - 1)
-            end_y = start_x - 1
-            
-            x_genes = left_genes[start_x : end_x + 1]
-            y_genes = left_genes[start_y : end_y + 1]
-            
-            if x_genes == right_genes:
-                return y_genes
-                
-        # x + (y - x) = y
-        # 检查 right_genes 是否为 (y - x) -> [y, x, sub]
-        if op_name in ['add', '+'] and \
-           len(right_genes) > 2 and \
-           right_genes[-1].name == 'sub':
-            
-            op_pos = len(right_genes) - 1
-            start_x = self._find_subexpr_start_in_list(right_genes, op_pos)
-            end_x = op_pos - 1
-            start_y = self._find_subexpr_start_in_list(right_genes, start_x - 1)
-            end_y = start_x - 1
-            
-            x_genes = right_genes[start_x : end_x + 1]
-            y_genes = right_genes[start_y : end_y + 1]
-            
-            if x_genes == left_genes:
-                return y_genes
-                
-        # 6. 分数简化
-        # 检查 left_genes 是否为 (A * B) -> [A, B, mul]
-        if op_name in ['div', '/'] and \
-           len(left_genes) > 2 and \
-           left_genes[-1].name == 'mul':
-            op_pos = len(left_genes) - 1
-            start_B = self._find_subexpr_start_in_list(left_genes, op_pos)
-            end_B = op_pos - 1
-            start_A = self._find_subexpr_start_in_list(left_genes, start_B - 1)
-            end_A = start_B - 1
-            
-            A_genes = left_genes[start_A : end_A + 1]
-            B_genes = left_genes[start_B : end_B + 1]
-            
-            # (A * B) / A = B
-            if A_genes == right_genes:
-                return B_genes
-            # (A * B) / B = A
-            if B_genes == right_genes:
-                return A_genes
-                
-        # 检查 right_genes 是否为 (A * B) -> [A, B, mul]
-        if op_name in ['div', '/'] and \
-           len(right_genes) > 2 and \
-           right_genes[-1].name == 'mul':
-            op_pos = len(right_genes) - 1
-            start_B = self._find_subexpr_start_in_list(right_genes, op_pos)
-            end_B = op_pos - 1
-            start_A = self._find_subexpr_start_in_list(right_genes, start_B - 1)
-            end_A = start_B - 1
-            
-            A_genes = right_genes[start_A : end_A + 1]
-            B_genes = right_genes[start_B : end_B + 1]
-            inv_op = _operator_map.get('inv') # 需要 'inv' (1/x) 在 self.operators 中
-            
-            # x / (x * B) = 1 / B
-            if A_genes == left_genes and inv_op:
-                return B_genes + [inv_op]
-            # x / (A * x) = 1 / A
-            if B_genes == left_genes and inv_op:
-                return A_genes + [inv_op]
-                
-        # 检查 right_genes 是否为 (A / B) -> [A, B, div]
-        if op_name in ['mul', '*'] and \
-           len(right_genes) > 2 and \
-           right_genes[-1].name == 'div':
-            op_pos = len(right_genes) - 1
-            start_B = self._find_subexpr_start_in_list(right_genes, op_pos)
-            end_B = op_pos - 1
-            start_A = self._find_subexpr_start_in_list(right_genes, start_B - 1)
-            end_A = start_B - 1
-            
-            A_genes = right_genes[start_A : end_A + 1]
-            B_genes = right_genes[start_B : end_B + 1]
-            
-            # B * (A / B) = A
-            if B_genes == left_genes:
-                return A_genes
-                
-        # 检查 left_genes 是否为 (A / B) -> [A, B, div]
-        if op_name in ['mul', '*'] and \
-           len(left_genes) > 2 and \
-           left_genes[-1].name == 'div':
-            op_pos = len(left_genes) - 1
-            start_B = self._find_subexpr_start_in_list(left_genes, op_pos)
-            end_B = op_pos - 1
-            start_A = self._find_subexpr_start_in_list(left_genes, start_B - 1)
-            end_A = start_B - 1
-            
-            A_genes = left_genes[start_A : end_A + 1]
-            B_genes = left_genes[start_B : end_B + 1]
-            
-            # (A / B) * B = A
-            if B_genes == right_genes:
-                return A_genes
-        
-        return None
-
-    def _try_simplify_unary(self, 
-                            arg_genes: List[NodeContent], 
-                            op: Operator) -> Optional[List[NodeContent]]:
-        """尝试简化一元操作（RPN 列表版）"""
-        op_name = op.name
-        
-        # 1. 常量折叠
-        arg_val = self._get_constant_value(arg_genes)
-        
-        if arg_val is not None:
-            try:
-                result = op(arg_val)
-                return [Constant(result)]
-            except:
-                return None
-        
-        # 2. 逆运算
-        # -(-x) = x
-        # 检查 arg_genes 是否为 neg(x) -> [x, neg]
-        if op_name == 'neg' and \
-           len(arg_genes) > 1 and \
-           arg_genes[-1].name == 'neg':
-            x_genes = arg_genes[:-1] # 提取 x
-            return x_genes
-            
-        # inv(inv(x)) = x
-        if op_name == 'inv' and \
-           len(arg_genes) > 1 and \
-           arg_genes[-1].name == 'inv':
-            x_genes = arg_genes[:-1] # 提取 x
-            return x_genes
-
-        return None
-
-
 
 
 class ExpressionSetGP:
@@ -2049,12 +1666,14 @@ class ExpressionSetGP:
         self.random_state = check_random_state(random_state)
         self.set_crossover_probability = set_crossover_probability
 
-    def reproduce(self, expressions) -> 'ExpressionSet':
+    def reproduce(self, expressions: List[Optional['Expression']] = None) -> 'ExpressionSet':
         """Returns a list of nodes in the tree in pre-order."""
+        if expressions is None:
+            expressions = [expr.copy() for expr in expressions]
         return ExpressionSet(
             expressions=expressions,
-            out_func=self.generator.out_func, 
-            metric=self.generator.metric
+            metric=self.generator.metric,
+            out_func=self.generator.out_func
         )
 
     def crossover(self, 
@@ -2174,14 +1793,10 @@ class ExpressionSetGP:
         mutation_point = self.random_state.choice(valid_points)
         parent_expr = parent.expressions[mutation_point]
         
-        mutated_expr, mutation_succeeded, mutation_name = self.gpoperator.mutation(parent_expr)
+        mutated_expr, mutation_succeeded, _ = self.gpoperator.mutation(parent_expr)
         
         # 1. 提早失败
         if not mutation_succeeded:
-            return None, False
-        
-        if not mutated_expr._is_valid():
-            print(f"Invalid mutation: {mutated_expr}")
             return None, False
         
         # 2. 构建一个全新的列表
@@ -2270,7 +1885,6 @@ class ExpressionSetGP:
             parent.expressions[idx2+1:]
         )
         new_expr_set = self.reproduce(new_exprs)
-        new_expr_set.mutation_name = 'swap_exprs'
         
         return new_expr_set, True
 
@@ -2321,7 +1935,9 @@ class ExpressionSetGP:
 
     def do_nothing_set(self, parent: ExpressionSet):
         """Return a new, identical expression set."""
-        new_expr_set = self.reproduce(parent.expressions)
+        new_expr_set = self.reproduce(
+            [expr.copy() for expr in parent.expressions]
+        )
         return new_expr_set, True
 
     def add_expr(self, parent: ExpressionSet):
@@ -2348,12 +1964,13 @@ class ExpressionSetGP:
         
         return new_expr_set, True
 
-    def optimize_constants(self, parent: ExpressionSet, X, y, 
+    def optimize_constants(self, parent: ExpressionSet, X: np.ndarray, y: np.ndarray, 
                            optimizer_algorithm='L-BFGS-B', optimizer_nrestarts=3, 
                            optimizer_iterations=10) -> Tuple[Optional['ExpressionSet'], bool]:
-        """优化表达式集合的所有常量"""
-        
-        # 1. 获取常量信息（只构建一次）
+        """
+        优化ExpressionSet的所有常量
+        """
+        # 1. 检查是否有常量
         const_info = parent._build_constant_info()
         if const_info['total_constants'] == 0:
             return None, False, np.nan
@@ -2362,27 +1979,26 @@ class ExpressionSetGP:
         X_jax = jnp.array(X)
         y_jax = jnp.array(y)
         
-        # 3. 预编译梯度函数（只编译一次）
+        # 3. 预编译梯度函数
         grad_fn = parent._get_gradient_function()
         
         # 4. 定义优化目标
         def objective_and_grad(constants):
             constants_jax = jnp.array(constants)
             
-            # 计算梯度（复用编译）
+            # 计算梯度（使用预编译的函数）
             grad = grad_fn(constants_jax, X_jax, y_jax)
             
-            # 计算损失（使用快速的NumPy执行）
-            temp_expr_set = parent.update_constants(constants)
-            fitness = temp_expr_set.fitness(X, y)
+            # 计算损失（使用NumPy快速执行）
+            fitness = parent.fitness(X, y, constants=constants)
             loss = -fitness if parent.metric.greater_is_better else fitness
             
             return float(loss), np.array(grad)
         
         # 5. 提取初始常量
         initial_constants = np.array([
-            parent.expressions[expr_idx].genes[gene_idx].value
-            for expr_idx, gene_idx in const_info['flat_indices']
+            node.node_content.value 
+            for expr_idx, node in const_info['flat_nodes']
         ])
         
         # 6. 执行优化
@@ -2428,95 +2044,6 @@ class ExpressionSetGP:
         final_fitness = -best_loss if parent.metric.greater_is_better else best_loss
         
         return optimized_expr_set, True, final_fitness
-
-    # def optimize_constants(self, parent: ExpressionSet, X, y, 
-    #                        optimizer_algorithm='L-BFGS-B', optimizer_nrestarts=3, 
-    #                        optimizer_iterations=10) -> Tuple[Optional['ExpressionSet'], bool]:
-    #     # 收集所有常量节点，提取初始常量值
-    #     constant_indices = []
-    #     for expr_idx, expr in enumerate(parent.expressions):
-    #         if expr is not None:
-    #             constant_indices.extend([
-    #                 (expr_idx, gene_idx) for gene_idx, gene in enumerate(expr.genes) 
-    #                     if isinstance(gene, Constant)
-    #             ])
-        
-    #     if not constant_indices:
-    #         return None, False, np.nan
-        
-    #     # 转换为JAX数组
-    #     X_jax = jnp.array(X)
-    #     y_jax = jnp.array(y)
-        
-    #     # 提取初始常量值（NumPy 数组以便向量化操作）
-    #     initial_constants = jnp.array([
-    #         parent[expr_idx][gene_idx].value for (expr_idx, gene_idx) in constant_indices
-    #     ])
-        
-    #     # 预编译JAX梯度函数（只编译一次）
-    #     grad_fn = parent._get_gradient_function()
-    #     X_jax = jnp.array(X)
-    #     y_jax = jnp.array(y)
-
-    #     # 定义优化目标（使用预编译的梯度）
-    #     def objective_and_grad(constants_np):
-    #         constants_jax = jnp.array(constants_np)
-            
-    #         # 计算梯度（使用预编译的函数）
-    #         grad = grad_fn(constants_jax, X_jax, y_jax)
-            
-    #         # 计算损失（使用快速的NumPy执行）
-    #         temp_expr = parent.update_constants(constants_np)
-    #         fitness = temp_expr.fitness(X, y)
-    #         loss = -fitness if parent.metric.greater_is_better else fitness
-            
-    #         return float(loss), np.array(grad)
-        
-    #     # 多次重启优化
-    #     best_loss = float('inf')
-    #     best_constants = initial_constants.copy()
-        
-    #     for restart in range(optimizer_nrestarts):
-    #         # 第一次使用原始值，后续添加噪声
-    #         if restart == 0:
-    #             x0 = initial_constants.copy()
-    #         else:
-    #             # 噪声强度递减（避免后期扰动过大）
-    #             noise_scale = 0.05 / np.sqrt(restart)
-    #             # restart=1: 5%, restart=2: 3.5%, restart=3: 2.9%
-    #             noise = self.random_state.normal(0, noise_scale, size=len(initial_constants))
-    #             constants_scale = np.abs(initial_constants) + 1e-6  # 处理零值
-    #             x0 = initial_constants + noise * constants_scale
-            
-    #         # 执行优化
-    #         if optimizer_algorithm in METHODS_WITH_EPS:
-    #             result = minimize(
-    #                 objective_and_grad, x0,
-    #                 method=optimizer_algorithm, jac=True,
-    #                 options={
-    #                     'maxiter': optimizer_iterations,
-    #                     'eps': self.gpoperator.constants_tolerance
-    #                 }
-    #             )
-    #         else:
-    #             result = minimize(
-    #                 objective_and_grad, x0,
-    #                 method=optimizer_algorithm, jac=True,
-    #                 options={'maxiter': optimizer_iterations}
-    #             )
-            
-    #         # 更新最佳结果
-    #         if result.fun < best_loss:
-    #             best_loss = result.fun
-    #             best_constants = result.x
-        
-    #     # 创建优化后的表达式
-    #     optimized_expr_set = parent.update_constants(best_constants)
-        
-    #     # 最终适应度
-    #     final_fitness = -best_loss if parent.metric.greater_is_better else best_loss
-        
-    #     return optimized_expr_set, True, final_fitness
 
     def optimize_aggregations(
         self, parent: ExpressionSet, X, y, 

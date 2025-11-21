@@ -132,18 +132,14 @@ class Operator(NodeContent):
         The number of arguments that the ``function`` takes.
 
     """
-    __slots__ = ['function', 'name', 'degree', 'elementwise']
-    def __init__(self, function, name, degree, elementwise):
+    __slots__ = ['function', 'name', 'degree']
+    def __init__(self, function, name, degree):
         self.function = function
         self.name = name
         self.degree = degree
-        self.elementwise = elementwise
 
     def __call__(self, *args):
-        try:
-            return self.function(*args) if self.elementwise else float(self.function(args))
-        except Exception:  # pragma: no cover
-            return args[0]
+        return self.function(*args)
 
     def __eq__(self, other):
         if isinstance(other, Operator):
@@ -191,10 +187,13 @@ def _protected_multiplication(x1, x2):
         return result
 
 def _protected_division(x1, x2):
-    """除法闭包，处理零除数情况"""
+    """高效的保护除法函数，适用于频繁调用场景"""
+    # 直接使用numpy操作，避免不必要的类型检查和条件判断
     with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
-        safe_mask = (np.abs(x2) > 0.0001) & (np.abs(x1 / x2) < 1e10)
-        return np.where(safe_mask, np.divide(x1, x2), 1.)
+        result = np.divide(x1, x2)
+        # 使用位运算&代替逻辑运算and，提高效率
+        safe_mask = (np.abs(x2) > 1e-10) & np.isfinite(result) & (np.abs(result) < 1e10)
+        return np.where(safe_mask, result, 1.0)
 
 
 def _protected_sqrt(x1):
@@ -344,31 +343,29 @@ def _softmax(x: np.ndarray, axis: int = 1) -> np.ndarray:
 
 
 
-add2 = Operator(function=_protected_addition, name='add', degree=2, elementwise=True)
-sub2 = Operator(function=_protected_subtraction, name='sub', degree=2, elementwise=True)
-mul2 = Operator(function=_protected_multiplication, name='mul', degree=2, elementwise=True)
-div2 = Operator(function=_protected_division, name='div', degree=2, elementwise=True)
-sqrt1 = Operator(function=_protected_sqrt, name='sqrt', degree=1, elementwise=True)
-log1 = Operator(function=_protected_log, name='log', degree=1, elementwise=True)
-neg1 = Operator(function=np.negative, name='neg', degree=1, elementwise=True)
-inv1 = Operator(function=_protected_inverse, name='inv', degree=1, elementwise=True)
-max2 = Operator(function=np.max, name='max', degree=1, elementwise=False)
-abs1 = Operator(function=np.abs, name='abs', degree=1, elementwise=True)
-maximum2 = Operator(function=np.maximum, name='maximum', degree=2, elementwise=True)
-min2 = Operator(function=np.min, name='min', degree=1, elementwise=False)
-minimum2 = Operator(function=np.minimum, name='minimum', degree=2, elementwise=True)
-sin1 = Operator(function=np.sin, name='sin', degree=1, elementwise=True)
-cos1 = Operator(function=np.cos, name='cos', degree=1, elementwise=True)
-tan1 = Operator(function=np.tan, name='tan', degree=1, elementwise=True)
-sinh1 = Operator(function=np.sinh, name='sinh', degree=1, elementwise=True)
-cosh1 = Operator(function=np.cosh, name='cosh', degree=1, elementwise=True)
-tanh1 = Operator(function=np.tanh, name='tanh', degree=1, elementwise=True)
-exp1 = Operator(function=_protected_exp, name='exp', degree=1, elementwise=True)
-expsq1 = Operator(function=_protected_expsq, name='expsq', degree=1, elementwise=True)
+add2 = Operator(function=_protected_addition, name='add', degree=2)
+sub2 = Operator(function=_protected_subtraction, name='sub', degree=2)
+mul2 = Operator(function=_protected_multiplication, name='mul', degree=2)
+div2 = Operator(function=_protected_division, name='div', degree=2)
+sqrt1 = Operator(function=_protected_sqrt, name='sqrt', degree=1)
+log1 = Operator(function=_protected_log, name='log', degree=1)
+neg1 = Operator(function=np.negative, name='neg', degree=1)
+inv1 = Operator(function=_protected_inverse, name='inv', degree=1)
+abs1 = Operator(function=np.abs, name='abs', degree=1)
+maximum2 = Operator(function=np.maximum, name='maximum', degree=2)
+minimum2 = Operator(function=np.minimum, name='minimum', degree=2)
+sin1 = Operator(function=np.sin, name='sin', degree=1)
+cos1 = Operator(function=np.cos, name='cos', degree=1)
+tan1 = Operator(function=np.tan, name='tan', degree=1)
+sinh1 = Operator(function=np.sinh, name='sinh', degree=1)
+cosh1 = Operator(function=np.cosh, name='cosh', degree=1)
+tanh1 = Operator(function=np.tanh, name='tanh', degree=1)
+exp1 = Operator(function=_protected_exp, name='exp', degree=1)
+expsq1 = Operator(function=_protected_expsq, name='expsq', degree=1)
 
-sigmoid = Operator(function=_sigmoid, name='sigmoid', degree=1, elementwise=True)
-softplus = Operator(function=_softplus, name='softplus', degree=1, elementwise=True)
-softmax = Operator(function=_softmax, name='softmax', degree=2, elementwise=True)
+sigmoid = Operator(function=_sigmoid, name='sigmoid', degree=1)
+softplus = Operator(function=_softplus, name='softplus', degree=1)
+softmax = Operator(function=_softmax, name='softmax', degree=2)
 
 _operator_map = {
     '+': add2, 

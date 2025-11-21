@@ -335,7 +335,7 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
                  constants_tolerance: float = 1e-5,
                  allow_duplicate_expressions: bool = True,
                  should_optimize_constants: bool = True,
-                 should_optimize_aggregations: bool = False,
+                 should_optimize_aggregations: bool = True,
                  optimizer_algorithm: Literal['Nelder-Mead', 'CG', 'BFGS', 'Newton-CG', 'L-BFGS-B', 
                                               'COBYLA', 'COBYQA', 'SLSQP', 'trust-constr', ] = 'L-BFGS-B',
                  optimizer_nrestarts: int = 2,
