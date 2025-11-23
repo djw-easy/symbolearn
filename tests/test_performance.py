@@ -1,10 +1,13 @@
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
 import jax
 import time
 import numpy as np
 import jax.numpy as jnp
 from scipy.optimize import minimize
 from typing import List, Dict, Union
-
 
 
 from src.fitness import _fitness_map
@@ -190,7 +193,67 @@ def build_symbolic_tree(genes: List[Union[Constant, Variable, Operator]]) -> Sym
 
 # 2. 定义优化函数
 METHODS_WITH_EPS = ['CG', 'BFGS', 'Newton-CG', 'L-BFGS-B', 'SLSQP']
-def optimize_constants_hybrid(
+
+def optimize_constants_numpy(
+    parent: Expression, X: np.ndarray, y: np.ndarray,
+    optimizer_algorithm='L-BFGS-B', optimizer_nrestarts=3, 
+    optimizer_iterations=10, random_state: np.random.RandomState = None
+):
+    random_state = check_random_state(random_state)
+    # 获取初始常量
+    initial_constants = np.array([
+        node.node_content.value for node in PostOrderIter(parent.tree) 
+            if isinstance(node.node_content, Constant)
+    ])
+
+    # 定义优化目标（使用预编译的梯度）
+    def objective(constants_np: np.ndarray):
+        # 计算损失（使用快速的NumPy执行）
+        fitness = parent.fitness(X, y, constants_np)
+        loss = -fitness if parent.metric.greater_is_better else fitness
+        
+        return loss
+
+    # 多次重启优化
+    best_loss = float('inf')
+    best_constants = initial_constants.copy()
+    
+    for restart in range(optimizer_nrestarts):
+        # 初始点
+        if restart == 0:
+            x0 = initial_constants.copy()
+        else:
+            noise_scale = 0.05 / np.sqrt(restart)
+            noise = random_state.normal(0, noise_scale, size=len(initial_constants))
+            constants_scale = np.abs(initial_constants) + 1e-6
+            x0 = initial_constants + noise * constants_scale
+        
+        # 执行优化
+        if optimizer_algorithm in METHODS_WITH_EPS:
+            result = minimize(
+                objective, x0, method=optimizer_algorithm, 
+                options={'maxiter': optimizer_iterations, 'eps': 0.00001}
+            )
+        else:
+            result = minimize(
+                objective, x0,
+                method=optimizer_algorithm, 
+                options={'maxiter': optimizer_iterations}
+            )
+        # 更新最佳结果
+        if result.fun < best_loss:
+            best_loss = result.fun
+            best_constants = result.x
+
+    # 创建优化后的表达式
+    optimized_expr = parent.update_constants(best_constants)
+    final_fitness = -best_loss if parent.metric.greater_is_better else best_loss
+    
+    return optimized_expr, True, final_fitness
+
+
+
+def optimize_constants_jax(
     expr: Expression, 
     X: np.ndarray, 
     y: np.ndarray,
@@ -276,6 +339,8 @@ def optimize_constants_hybrid(
 
 
 
+n_samples = 3000
+
 
 # 3. 测试表达式的执行速度
 print("=" * 60)
@@ -283,7 +348,7 @@ print("测试表达式的执行速度")
 # 预热
 expr_name = list(raw_expressions.keys())[0]
 X, y, y_true, true_params = generate_data_for_expression(
-    expr_name, n_samples=1000, noise_std=0.05
+    expr_name, n_samples=n_samples, noise_std=0.05
 )
 tree = build_symbolic_tree(raw_expressions[expr_name]["genes"])
 expression = Expression(tree=tree, metric=_fitness_map['mse'])
@@ -292,7 +357,7 @@ raw_fitness = expression.fitness(X, y)
 for expr_name in raw_expressions.keys():
     print(f"测试表达式类型: {expr_name}")
     X, y, y_true, true_params = generate_data_for_expression(
-        expr_name, n_samples=1000, noise_std=0.05
+        expr_name, n_samples=n_samples, noise_std=0.05
     )
     start_time = time.time()
     n_iterations = 1000
@@ -311,16 +376,39 @@ print("=" * 60)
 
 # 4. 测试能否进行优化
 print("\n" + "=" * 60)
-print("测试能否进行优化")
+print("测试能否进行优化 ----- JAX 优化器")
 start_time = time.time()
 for expr_name in raw_expressions.keys():
     tree = build_symbolic_tree(raw_expressions[expr_name]["genes"])
     expression = Expression(tree=tree, metric=_fitness_map['mse'])
     X, y, y_true, true_params = generate_data_for_expression(
-        expr_name, n_samples=1000, noise_std=0.05
+        expr_name, n_samples=n_samples, noise_std=0.05
     )
     print(f'模板表达式: {expression.update_constants(true_params)}')
-    new_expr, _, _ = optimize_constants_hybrid(expression, X, y, optimizer_iterations=100, optimizer_nrestarts=1)
+    new_expr, _, _ = optimize_constants_jax(
+        expression, X, y, optimizer_iterations=100, optimizer_nrestarts=1
+    )
+    print(f'优化表达式: {new_expr}')
+    print(f'原始适应度: {expression.fitness(X, y)}')
+    print(f'优化适应度: {new_expr.fitness(X, y)}')
+end_time = time.time()
+print(f"全部评估耗时: {end_time - start_time:.3f} 秒")
+print("=" * 60)
+
+
+print("\n" + "=" * 60)
+print("测试能否进行优化 ----- Numpy 优化器")
+start_time = time.time()
+for expr_name in raw_expressions.keys():
+    tree = build_symbolic_tree(raw_expressions[expr_name]["genes"])
+    expression = Expression(tree=tree, metric=_fitness_map['mse'])
+    X, y, y_true, true_params = generate_data_for_expression(
+        expr_name, n_samples=n_samples, noise_std=0.05
+    )
+    print(f'模板表达式: {expression.update_constants(true_params)}')
+    new_expr, _, _ = optimize_constants_numpy(
+        expression, X, y, optimizer_iterations=100, optimizer_nrestarts=1
+    )
     print(f'优化表达式: {new_expr}')
     print(f'原始适应度: {expression.fitness(X, y)}')
     print(f'优化适应度: {new_expr.fitness(X, y)}')
@@ -331,18 +419,20 @@ print("=" * 60)
 
 # 5. 测试性能
 print("\n" + "=" * 60)
-print("测试性能")
+print("测试性能 ----- JAX 优化器")
 for expr_name in raw_expressions.keys():
     print(f"测试表达式类型: {expr_name}")
     X, y, y_true, true_params = generate_data_for_expression(
-        expr_name, n_samples=1000, noise_std=0.05
+        expr_name, n_samples=n_samples, noise_std=0.05
     )
     start_time = time.time()
     n_iterations = 100
     for i in range(n_iterations):
         tree = build_symbolic_tree(raw_expressions[expr_name]["genes"])
         expression = Expression(tree=tree, metric=_fitness_map['mse'])
-        new_expr, _, _ = optimize_constants_hybrid(expression, X, y)
+        new_expr, _, _ = optimize_constants_jax(
+            expression, X, y, optimizer_iterations=1000, optimizer_nrestarts=1
+        )
     end_time = time.time()
     avg_time = (end_time - start_time) / n_iterations * 1000
     throughput = n_iterations / (end_time - start_time)
@@ -352,5 +442,26 @@ for expr_name in raw_expressions.keys():
 print("=" * 60)
 
 
-
+print("\n" + "=" * 60)
+print("测试性能 ----- Numpy 优化器")
+for expr_name in raw_expressions.keys():
+    print(f"测试表达式类型: {expr_name}")
+    X, y, y_true, true_params = generate_data_for_expression(
+        expr_name, n_samples=n_samples, noise_std=0.05
+    )
+    start_time = time.time()
+    n_iterations = 100
+    for i in range(n_iterations):
+        tree = build_symbolic_tree(raw_expressions[expr_name]["genes"])
+        expression = Expression(tree=tree, metric=_fitness_map['mse'])
+        new_expr, _, _ = optimize_constants_numpy(
+            expression, X, y, optimizer_iterations=1000, optimizer_nrestarts=1
+        )
+    end_time = time.time()
+    avg_time = (end_time - start_time) / n_iterations * 1000
+    throughput = n_iterations / (end_time - start_time)
+    print(f"    评估 {n_iterations} 次耗时: {end_time - start_time:.3f} 秒")
+    print(f"    平均每次: {avg_time:.3f} 毫秒")
+    print(f"    吞吐量: {throughput:.0f} 次/秒")
+print("=" * 60)
 

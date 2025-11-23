@@ -125,7 +125,7 @@ def nll_loss(y_true, y_pred, w=None):
         w: 样本权重 (n,), 可选 None。
     """
     y_true = jnp.asarray(y_true, dtype=jnp.int32)
-    y_pred_log = jnp.asarray(y_pred, dtype=jnp.float64)
+    y_pred_log = jnp.asarray(y_pred, dtype=jnp.float32)
     n_samples = y_pred_log.shape[0]
 
     if n_samples == 0:
@@ -133,9 +133,9 @@ def nll_loss(y_true, y_pred, w=None):
 
     # 1. JIT-safe 权重处理 (None -> ones)
     if w is None:
-        w_safe = jnp.ones(n_samples, dtype=jnp.float64)
+        w_safe = jnp.ones(n_samples, dtype=jnp.float32)
     else:
-        w_safe = jnp.asarray(w, dtype=jnp.float64)
+        w_safe = jnp.asarray(w, dtype=jnp.float32)
 
     # 2. 核心修复: 将 1D (二分类) 转换为 2D 格式 (N, 2)
     if y_pred_log.ndim == 1:
@@ -165,8 +165,8 @@ def focal_loss(y_true, y_pred, w=None, alpha=None, gamma=2.0):
         gamma: float, 聚焦参数。
     """
     y_true = jnp.asarray(y_true, dtype=jnp.int32)
-    y_pred = jnp.asarray(y_pred, dtype=jnp.float64)
-    gamma_val = jnp.asarray(gamma, dtype=jnp.float64)
+    y_pred = jnp.asarray(y_pred, dtype=jnp.float32)
+    gamma_val = jnp.asarray(gamma, dtype=jnp.float32)
     n_samples = y_pred.shape[0]
 
     if n_samples == 0:
@@ -174,9 +174,9 @@ def focal_loss(y_true, y_pred, w=None, alpha=None, gamma=2.0):
 
     # 1. JIT-safe 权重处理
     if w is None:
-        w_safe = jnp.ones(n_samples, dtype=jnp.float64)
+        w_safe = jnp.ones(n_samples, dtype=jnp.float32)
     else:
-        w_safe = jnp.asarray(w, dtype=jnp.float64)
+        w_safe = jnp.asarray(w, dtype=jnp.float32)
 
     # 2. 核心修复: 将 1D (二分类) 转换为 2D 格式 (N, 2)
     if y_pred.ndim == 1:
@@ -191,7 +191,7 @@ def focal_loss(y_true, y_pred, w=None, alpha=None, gamma=2.0):
              raise ValueError("对于二分类，alpha 必须在 [0, 1] 范围内。")
              
         # alpha_0 (负类) = 1 - alpha_val, alpha_1 (正类) = alpha_val
-        alpha_vals = jnp.asarray([1.0 - alpha_val, alpha_val], dtype=jnp.float64)
+        alpha_vals = jnp.asarray([1.0 - alpha_val, alpha_val], dtype=jnp.float32)
         
         return _focal_loss_core_jit_2d(y_true, y_pred_2d, w_safe, alpha_vals, gamma_val)
     
@@ -201,9 +201,9 @@ def focal_loss(y_true, y_pred, w=None, alpha=None, gamma=2.0):
         # alpha 转换为 shape (n_classes,) 数组
         if alpha is None:
             # 默认均匀权重
-            alpha_vals = jnp.ones(n_classes, dtype=jnp.float64)
+            alpha_vals = jnp.ones(n_classes, dtype=jnp.float32)
         else:
-            alpha_vals = jnp.asarray(alpha, dtype=jnp.float64)
+            alpha_vals = jnp.asarray(alpha, dtype=jnp.float32)
             if alpha_vals.ndim == 0:
                  alpha_vals = jnp.full((n_classes,), alpha_vals.item())
             elif alpha_vals.shape[0] != n_classes:

@@ -16,6 +16,7 @@ import pandas as pd
 import jax.numpy as jnp
 from joblib import cpu_count
 from sklearn import set_config
+from numpy.typing import ArrayLike
 from sklearn.base import BaseEstimator
 from sklearn.exceptions import NotFittedError
 from sklearn.utils.validation import check_is_fitted
@@ -26,6 +27,7 @@ from src.halloffame import HallOfFame
 from src.population import Population
 from src.fitness import _fitness_map, Fitness
 from src.expression import Expression, ExpressionSet
+from src.tree_parser import load_expressions_from_csv
 from src.gpoperator import ExpressionGP, ExpressionSetGP
 from src.generator import ExprGenerator, ExprSetGenerator
 from src.distributed_backend import DistributedBackend, JoblibBackend
@@ -298,8 +300,9 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
                  use_aggregation: bool = False,
                  metric: Union[str, Fitness] = None,
                  out_func: Optional[Union[str, Operator, callable]] = None,
+                 initial_constants: Optional[Union[int, List[float]]] = None,
                  migration: bool = True,
-                 fraction_replaced: float = 0.00036,
+                 fraction_replaced: float = 0.0136,
                  hof_migration: bool = True,
                  fraction_replaced_hof: float = 0.0614,
                  topn: int = 12,
@@ -309,16 +312,16 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
                  alpha: float = 3.17,
                  crossover_probability: float = 0.0259,
                  add_node = 2.47,
-                 insert_node = 0.0312,
+                 insert_node = 0.312,
                  delete_node = 0.870,
                  do_nothing_tree = 0.273,
-                 mutate_constant = 0.346,
-                 mutate_variable = 0.142,
-                 mutate_operator = 0.036,
-                 mutate_aggregation = 0.293,
+                 mutate_constant = 0.046,
+                 mutate_variable = 0.042,
+                 mutate_operator = 0.026,
+                 mutate_aggregation = 0.093,
                  swap_operands = 0.198,
                  rotate_tree = 4.26,
-                 hoist_tree=0.411,
+                 hoist_tree=0.111,
                  randomize_tree = 0.502,
                  simplify_tree = 0.00209,
                  set_crossover_method: Literal['single_point', 'two_point', 'multi_point'] = 'multi_point',
@@ -338,15 +341,13 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
                  should_optimize_aggregations: bool = True,
                  optimizer_algorithm: Literal['Nelder-Mead', 'CG', 'BFGS', 'Newton-CG', 'L-BFGS-B', 
                                               'COBYLA', 'COBYQA', 'SLSQP', 'trust-constr', ] = 'L-BFGS-B',
-                 optimizer_nrestarts: int = 2,
+                 optimizer_nrestarts: int = 1,
                  optimizer_probability: float = 0.14,
-                 optimizer_iterations: int = 10,
+                 optimizer_iterations: int = 30,
                  perturbation_factor: float = 0.129,
                  probability_negate_constant: float = 0.00743,
                  batching: bool = False,
                  batch_size: int = 256,
-                 batching_strategy: str = 'fixed',
-                 batching_params: dict = None,
                  n_jobs: float = 1,
                  verbose: int = 0,
                  warm_start: bool = False,
@@ -372,6 +373,7 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
         self.use_aggregation = use_aggregation
         self.metric = metric
         self.out_func = out_func
+        self.initial_constants = initial_constants
         self.ncycles_per_iteration = ncycles_per_iteration
         self.annealing = annealing
         self.use_frequency = use_frequency
@@ -413,8 +415,6 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
         self.probability_negate_constant = probability_negate_constant
         self.batching = batching
         self.batch_size = batch_size
-        self.batching_strategy = batching_strategy
-        self.batching_params = batching_params
         self.n_jobs = min(_get_n_jobs(n_jobs), self.populations)
         self.verbose = verbose
         self.warm_start = warm_start
@@ -556,7 +556,7 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
         pop = population.evolve(X, y, seed, ncycles_per_iteration, crossover_probability, 
                                 tournament_selection_n, tournament_selection_p)
         return pop
-    
+
     def _perform_migration(self, gen, random_state):
         """
         执行迁移操作，结合了来自名人堂的精英和来自其他种群的个体。
@@ -570,54 +570,94 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
         - gen: 当前的进化代数。
         - random_state: 随机状态对象，用于可复现的随机操作。
         """
-        def migration(pop: Population, candidates, candidates_fitness, frac: float):
-            mean_number_replaced = int(len(pop) * frac)
-            num_replace = poisson_sample(mean_number_replaced, random_state)
-            num_replace = min(num_replace, len(candidates))
-            num_replace = min(num_replace, len(pop))
-            if num_replace > 0:
-                # 从候选个体中随机选择个体
-                immigrant_indices = random_state.choice(
-                    len(candidates), size=num_replace, replace=True
-                )
-                immigrants = [candidates[i] for i in immigrant_indices]
-                immigrants_fitness = [candidates_fitness[i] for i in immigrant_indices]
+        def select_immigrants(candidates, candidates_fitness, n_needed):
+            """从候选池中选择移民 (可以使用锦标赛或随机选择)"""
+            if not candidates:
+                return [], []
+            # 这里简单起见使用随机无放回选择，也可以改为基于适应度的轮盘赌
+            indices = random_state.choice(len(candidates), size=min(len(candidates), n_needed), replace=False)
+            return [candidates[i] for i in indices], [candidates_fitness[i] for i in indices]
+
+        def perform_replacement(pop, immigrants, immigrants_fitness):
+            """将移民放入种群，替换掉最差的个体"""
+            if not immigrants:
+                return
+            
+            num_to_replace = len(immigrants)
+            
+            # 策略 A: 替换最差的 (推荐，收敛快)
+            # 获取当前种群最差的 n 个个体的索引
+            # 假设 pop.fitnesses 越小越好 (error metric)。如果是 maximize metric，需反转逻辑。
+            # argsort 返回从小到大的索引，最后的是 error 最大的（最差的）
+            sorted_indices = np.argsort(pop.fitnesses)
+            worst_indices = sorted_indices[-num_to_replace:] 
+            
+            # 策略 B: 随机替换 (维持多样性，但可能杀掉精英)
+            # worst_indices = random_state.choice(len(pop), size=num_to_replace, replace=False)
+
+            for i, idx_to_replace in enumerate(worst_indices):
+                # 执行替换操作
+                # 只有当外来个体的适应度优于被替换者时才替换 (可选，精英保留策略)
+                # 这里我们强制替换以引入新基因
+                pop._replace_individual(idx_to_replace, immigrants[i], immigrants_fitness[i])
+
+        # --- 1. 种群间的迁移 (Inter-population) ---
+        if self.migration:
+            # 预先收集所有种群的精英，避免双重循环带来的高复杂度
+            # 结构: list of (list of individuals)
+            all_elites = []
+            all_elites_fitness = []
+            
+            for p in self._populations:
+                top_n_indices = p.find_top_n(self.topn, find_best=True) # 找出前 topn 个
+                all_elites.append([p[idx] for idx in top_n_indices])
+                all_elites_fitness.append([p.fitnesses[idx] for idx in top_n_indices])
+
+            for i, pop in enumerate(self._populations):
+                # 收集候选人 (Candidates)
+                candidates = []
+                candidates_fitness = []
                 
-                # 在当前种群中随机选择被替换的位置
-                replace_indices = random_state.choice(
-                    len(pop), size=num_replace, replace=False
-                )
+                # 拓扑策略: 环形拓扑 (Ring Topology) i 接收 i-1 的移民
+                # 这样可以保留不同岛屿的独特性，防止过早收敛
+                source_idx = (i - 1) % len(self._populations)
+                
+                # 将源种群的精英加入候选池 (注意：这里直接 extend，避免 list 嵌套 list)
+                candidates.extend(all_elites[source_idx])
+                candidates_fitness.extend(all_elites_fitness[source_idx])
+                
+                # 确定迁移数量
+                mean_number_replaced = len(pop) * self.fraction_replaced
+                n_migrants = poisson_sample(mean_number_replaced, random_state)
+                n_migrants = min(n_migrants, len(candidates))
+                n_migrants = min(n_migrants, len(pop))
+                
+                if n_migrants > 0:
+                    continue
+                
+                # 选择具体的移民
+                chosen_ind, chosen_fit = select_immigrants(candidates, candidates_fitness, n_migrants)
                 
                 # 执行替换
-                for i, idx in enumerate(replace_indices):
-                    new_individual = immigrants[i].copy()
-                    pop._replace_individual(idx, new_individual, immigrants_fitness[i])
+                perform_replacement(pop, chosen_ind, chosen_fit)
 
-        # 1. 种群间的迁移
-        if self.migration:
-            for i, pop in enumerate(self._populations):
-                # 收集各种群的本地精英
-                local_elites_by_pop = []
-                local_fitnesses_by_pop = []
-                for j, other_pop in enumerate(self._populations):
-                    if i==j:
-                        continue
-                    top_n_indices = other_pop.find_top_n(self.topn, find_best=True)
-                    local_elites_by_pop.append([other_pop[j] for j in top_n_indices])
-                    local_fitnesses_by_pop.append([other_pop.fitnesses[j] for j in top_n_indices])
-                
-                migration(pop, local_elites_by_pop, local_fitnesses_by_pop, self.fraction_replaced)
-        
-        # 2. 从名人堂进行迁移
-        if self.hof_migration:
+        # --- 2. 名人堂迁移 (HOF Migration) ---
+        if self.hof_migration and self.hall_of_fame_ is not None:
             pareto_front = self.hall_of_fame_.get_pareto_front()
-            pareto_front_individuals = list(pareto_front.expression)
-            pareto_front_fitnesses = list(pareto_front.error)
-            for pop in self._populations:
-                migration(
-                    pop, pareto_front_individuals, 
-                    pareto_front_fitnesses, self.fraction_replaced_hof
-                )
+            if pareto_front.shape[0] > 0: # 确保 HOF 不为空
+                # 注意：HOF 里的数据结构可能和 population 不一样，这里假设是 list
+                hof_individuals = list(pareto_front.expression)
+                hof_fitnesses = list(pareto_front.error)
+                mean_number_replaced = len(pop) * self.fraction_replaced
+                n_migrants_hof = poisson_sample(mean_number_replaced, random_state)
+                n_migrants_hof = min(n_migrants_hof, len(hof_individuals))
+                n_migrants_hof = min(n_migrants_hof, len(pop))
+                
+                for pop in self._populations:
+                    chosen_ind, chosen_fit = select_immigrants(
+                        hof_individuals, hof_fitnesses, n_migrants_hof
+                    )
+                    perform_replacement(pop, chosen_ind, chosen_fit)
 
     def _init_generator_gpoperator(self, n_variables, variable_names, seed):
         random_state = check_random_state(seed)
@@ -629,6 +669,7 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
             use_variables=self.use_variable,
             use_constants=self.use_constant,
             use_aggregations=self.use_aggregation,
+            initial_constants=self.initial_constants,
             aggregation_operators=self.aggregation_operators,
             metric=self.metric, out_func=self.out_func, random_state=random_state
         )
@@ -643,6 +684,7 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
         if not self.is_multi_output_:
             return expr_generator, expr_gpoperator
 
+        expr_generator.out_func = None
         expr_set_generator = ExprSetGenerator(
             order=self.order,
             maxsize=self.maxsize,
@@ -652,6 +694,7 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
             use_variables=self.use_variable,
             use_constants=self.use_constant,
             use_aggregations=self.use_aggregation,
+            initial_constants=self.initial_constants,
             aggregation_operators=self.aggregation_operators,
             metric=self.metric, out_func=self.out_func, random_state=random_state
         )
@@ -1068,5 +1111,96 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
         
         return best_individual
 
+    @classmethod
+    def from_file(
+        cls,
+        file_path: str,
+        n_variables: int = None,
+        classes: ArrayLike = None,
+        operators: List[str] = None,
+        maxsize: Optional[int] = None,
+        aggregation_operators: List[str] = None,
+        metric: Optional[Callable | str | Operator] = None,
+        out_func: Optional[Callable | str | Operator] = None,
+        variable_names: Optional[List[str]] = None,
+        expression_col: str = 'expression',
+        **base_kwargs: dict
+    ):
+        """
+        从CSV文件加载表达式，并将字符串转换为Expression或ExpressionSet对象
+        
+        Parameters
+        ----------
+        file_path : str
+            存储模型的文件路径
+        n_variables : int
+            特征/变量的总数。
+            这对于创建 DynamicAggregation (例如 min(v1-v90)) 
+            和变量 (例如 x99) 都至关重要。
+        variable_names : Optional[List[str]], default=None
+            可用的变量名称列表。
+        operators : List[Operator]
+            可用的运算符列表 (例如 +, *, tanh, softplus)
+        maxsize : Optional[int], default=None
+            表达式允许的最大节点数。如果为 None，则不限制。
+        aggregation_operators : List[str]
+            可用的动态聚合函数列表 (e.g., 'mean', 'max')
+        aggregation_operators : List[str]
+            可用的动态聚合函数列表 (e.g., 'mean', 'max')
+        metric : Optional[Callable | str | Operator], default=None
+            可用的度量函数，可以是函数或字符串。
+        expression_col : str
+            包含表达式字符串的列名，默认为'expression'
+        
+        Returns
+        -------
+        self : BaseSymbolic
+            The model with fitted equations.
+        """
+        if file_path.endswith('.csv'):
+            if n_variables is None and variable_names is not None:
+                n_variables = len(variable_names)
+            df = load_expressions_from_csv(
+                maxsize=maxsize,
+                csv_path=file_path,
+                operators=operators,
+                n_variables=n_variables,
+                variable_names=variable_names,
+                expression_col=expression_col,
+                out_func=out_func, metric=metric,
+                aggregation_operators=aggregation_operators
+            )
+            model = cls(
+                maxsize=maxsize,
+                operators=operators,
+                aggregation_operators=aggregation_operators,
+                **({'out_func': out_func} if out_func is not None else {}),
+                **({'metric': metric} if metric is not None else {}),
+                **base_kwargs
+            )
+            model.equations_ = df['expression']
+            model.n_features_in_ = n_variables
+            model.feature_names_in_ = variable_names or [f'x{i}' for i in range(n_variables)]
+            if isinstance(model.equations_[0], ExpressionSet):
+                model.is_multi_output_ = True
+                model.order = model.equations_[0].order
+            if classes is not None:
+                model.classes_ = np.unique(classes)
 
+            model.hall_of_fame_ = HallOfFame(model._metric.greater_is_better)
+            for expression, raw_fitness in zip(df['expression'], df['error']):
+                model.hall_of_fame_.add(expression, raw_fitness)
+
+            return model
+        elif file_path.endswith('.joblib'):
+            with open(file_path, 'rb') as f:
+                model = joblib.load(f)
+            
+            if 'warm_start' in base_kwargs and base_kwargs['warm_start']:
+                model.warm_start = True
+            model.n_jobs = min(cpu_count(), model.n_jobs)
+            
+            return model
+        else:
+            raise ValueError('Invalid file format. Only .csv and .pkl are supported.')
 

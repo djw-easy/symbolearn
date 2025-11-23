@@ -2,7 +2,7 @@ import numpy as np
 import numpy.ma as ma
 from typing import Union, Optional, List
 from joblib import wrap_non_picklable_objects
-import random
+from numba import vectorize, njit, float32, float64
 
 
 class NodeContent(object):
@@ -149,12 +149,6 @@ class Operator(NodeContent):
 
 
 
-"""
-NumPy 保护函数 - 普通版本
-提供数值稳定的数学运算函数，不处理 MaskedArray
-"""
-import numpy as np
-from typing import Union
 
 
 def _protected_addition(x1, x2):
@@ -248,9 +242,6 @@ def _sigmoid(x: np.ndarray) -> np.ndarray:
         >>> _sigmoid(x)
         array([0.26894142, 0.5, 0.73105858])
     """
-    if not isinstance(x, np.ndarray):
-        raise TypeError("输入必须是 np.ndarray")
-    
     EXP_LOWER_BOUND = -88.0
     EXP_UPPER_BOUND = 88.0
     
@@ -259,7 +250,7 @@ def _sigmoid(x: np.ndarray) -> np.ndarray:
         pos_mask = (x_clipped >= 0)
         neg_mask = ~pos_mask
         
-        result = np.empty_like(x, dtype=np.float64)
+        result = np.empty_like(x, dtype=np.float32)
         
         # 正值部分
         result[pos_mask] = 1.0 / (1.0 + np.exp(-x_clipped[pos_mask]))
@@ -272,8 +263,7 @@ def _sigmoid(x: np.ndarray) -> np.ndarray:
         result[x <= EXP_LOWER_BOUND] = 0.0
         result[x >= EXP_UPPER_BOUND] = 1.0
         
-        return result.astype(x.dtype)
-
+        return result.astype(np.float32)
 
 
 def _softplus(x: np.ndarray) -> np.ndarray:
@@ -299,47 +289,64 @@ def _softplus(x: np.ndarray) -> np.ndarray:
         return np.log(1.0 + np.exp(x_clipped))
 
 
-def _softmax(x: np.ndarray, axis: int = 1) -> np.ndarray:
-    """
-    计算数值稳定的 Softmax 函数
+# Softmax 的核心实现 (仅处理 2D 数组)
+# 专门针对 float32 优化，也兼容 float64
+@njit(fastmath=True)
+def _softmax_2d_impl(x):
+    rows, cols = x.shape
+    result = np.empty_like(x)
     
-    沿指定轴对输入数组计算 softmax 值：
-    softmax(x_i) = exp(x_i - max(x)) / sum(exp(x_j - max(x)))
-    通过减去最大值保证数值稳定性，避免指数运算溢出
+    for i in range(rows):
+        row_max = -np.inf
+        for j in range(cols):
+            if x[i, j] > row_max:
+                row_max = x[i, j]
+        
+        row_sum = 0.0
+        for j in range(cols):
+            val = x[i, j] - row_max
+            # 裁剪保护
+            if val < -700.0: val = -700.0
+            elif val > 700.0: val = 700.0
+            
+            e_val = np.exp(val)
+            result[i, j] = e_val
+            row_sum += e_val
+        
+        if row_sum == 0.0:
+            row_sum = 1.0
+            
+        factor = 1.0 / row_sum
+        for j in range(cols):
+            result[i, j] *= factor
+            
+    return result
+
+# Softmax 的 Python 包装器，处理标量和维度
+def _softmax(x, axis=1):
+    # 情况 1: 输入是标量 (Scalar)
+    if np.ndim(x) == 0:
+        # Softmax 对标量的结果数学上是 1.0
+        # 如果 x 是 float32，返回 float32(1.0)
+        return np.array(1.0, dtype=np.asarray(x).dtype)
+
+    x_arr = np.asarray(x)
     
-    参数:
-        x: 输入数组，通常为二维矩阵（样本数×类别数）
-        axis: 计算轴，默认为1（按行计算，每行和为1）
+    # 情况 2: 输入是 1D 数组 (视为单样本) -> 转 2D 处理
+    if x_arr.ndim == 1:
+        x_2d = x_arr.reshape(1, -1)
+        res = _softmax_2d_impl(x_2d)
+        return res.reshape(-1) # 还原回 1D
     
-    返回:
-        与输入同形状的 softmax 计算结果，每行（或列）的和为1
+    # 情况 3: 输入是 2D 数组 (标准情况)
+    if x_arr.ndim == 2:
+        return _softmax_2d_impl(x_arr)
     
-    示例:
-        >>> x = np.array([[1, 2, 3], [1, 2, 1]])
-        >>> _softmax(x, axis=1)
-        array([[0.09003057, 0.24472847, 0.66524096],
-               [0.21194156, 0.57611688, 0.21194156]])
-    """
-    if not isinstance(x, np.ndarray):
-        raise TypeError("输入必须是 np.ndarray")
-    if axis not in (0, 1):
-        raise ValueError("axis 必须是 0 或 1")
-    
+    # 情况 4: 更高维，回退到 Numpy (或抛出异常，视需求定)
+    # 这里为了安全回退到 numpy 实现
     with np.errstate(over='ignore', under='ignore', invalid='ignore'):
-        x_max = np.max(x, axis=axis, keepdims=True)
-        x_shifted = x - x_max
-        
-        # 对极端值进行保护
-        x_shifted = np.clip(x_shifted, -700, 700)
-        
-        exps = np.exp(x_shifted)
-        sum_exps = np.sum(exps, axis=axis, keepdims=True)
-        
-        # 处理 sum_exps 为 0 的情况
-        safe_sum = np.where(sum_exps == 0, 1.0, sum_exps)
-        result = exps / safe_sum
-        
-        return result
+        e_x = np.exp(x_arr - np.max(x_arr, axis=axis, keepdims=True))
+        return e_x / e_x.sum(axis=axis, keepdims=True)
 
 
 

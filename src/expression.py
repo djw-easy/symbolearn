@@ -9,8 +9,8 @@ from typing import Union, Optional, List, Tuple, Iterator
 
 
 from src.node import Operator, Constant, Variable, NodeContent, DynamicAggregation
+from src.tree import clone_tree, PreOrderIter, PostOrderIter, SymbolicNode
 from src.node_jax import DynamicAggregation as DynamicAggregation_jax
-from src.tree import clone_tree, PostOrderIter, SymbolicNode
 from src.fitness import Fitness, _fitness_jax_map
 from src.node_jax import _operator_jax_map
 
@@ -71,7 +71,7 @@ class Expression(object):
         """Recursively converts a node to a string formula."""
         if node.is_leaf:
             if isinstance(node.node_content, Constant):
-                return f"{node.node_content.value:.3f}"
+                return f"{node.node_content.value:.5f}"
             elif isinstance(node.node_content, Variable):
                 return node.node_content.name
             elif isinstance(node.node_content, DynamicAggregation):
@@ -89,7 +89,7 @@ class Expression(object):
                     elif node.children[0].node_content.value == 0:
                         return f"0"
                     else:
-                        return f"{-node.children[0].node_content.value:.3f}"
+                        return f"{-node.children[0].node_content.value:.5f}"
                 else:
                     return f"(-{children_strs[0]})"
             elif op_name == 'inv':
@@ -119,7 +119,7 @@ class Expression(object):
     def _count_scalar_constants(self) -> int:
         """Recursively counts the number of scalar constants in the tree."""
         count = 0
-        for node in PostOrderIter(self.tree):
+        for node in PreOrderIter(self.tree):
             if isinstance(node.node_content, Constant):
                 count += 1
         return count
@@ -127,7 +127,7 @@ class Expression(object):
     def _count_scalar_variables(self) -> int:
         """Recursively counts the number of scalar variables in the tree."""
         count = 0
-        for node in PostOrderIter(self.tree):
+        for node in PreOrderIter(self.tree):
             if isinstance(node.node_content, Variable):
                 count += 1
         return count
@@ -135,14 +135,35 @@ class Expression(object):
     def _count_scalar_aggregations(self) -> int:
         """Recursively counts the number of scalar aggregations in the tree."""
         count = 0
-        for node in PostOrderIter(self.tree):
+        for node in PreOrderIter(self.tree):
             if isinstance(node.node_content, DynamicAggregation):
                 count += 1
         return count
 
+    def _has_constants(self) -> bool:
+        """Check if the tree contains any constants."""
+        for node in PostOrderIter(self.tree):
+            if isinstance(node.node_content, Constant):
+                return True
+        return False
+
+    def _has_variables(self) -> bool:
+        """Check if the tree contains any variables."""
+        for node in PostOrderIter(self.tree):
+            if isinstance(node.node_content, Variable):
+                return True
+        return False
+
+    def _has_aggregations(self) -> bool:
+        """Check if the tree contains any aggregations."""
+        for node in PostOrderIter(self.tree):
+            if isinstance(node.node_content, DynamicAggregation):
+                return True
+        return False
+
     def _has_binary_operator(self) -> bool:
         """Checks if the tree contains any binary operators."""
-        for node in PostOrderIter(self.tree):
+        for node in PreOrderIter(self.tree):
             if node.degree == 2:
                 return True
         return False
@@ -258,7 +279,7 @@ class Expression(object):
                 constants: np.ndarray = None) -> np.float32:
         """Evaluate the raw fitness of the expression according to X, y."""
         if constants is None:
-            y_pred = self.execute(X)
+            y_pred = self._execute_postorder(X)
         else:
             y_pred = self._execute_postorder(X, constants)
         raw_fitness = self.metric(y, y_pred)
@@ -400,6 +421,237 @@ class Expression(object):
         
         return new_expr
 
+    def simplify(self, constants_tolerance: float = 1e-5) -> 'Expression':
+        """
+        简化表达式：应用代数规则简化表达式
+        
+        简化规则包括：
+        1. 常量折叠：计算常量表达式
+        2. 恒等式：x + 0 = x, x * 1 = x, x / 1 = x
+        3. 零元素：x * 0 = 0, 0 / x = 0
+        4. 代数化简：x - x = 0, x / x = 1, -(-x) = x
+        5. 分配律和结合律的应用
+        
+        Args:
+            constants_tolerance: 判断常量是否接近0或1的容差
+            
+        Returns:
+            Expression: 简化后的新表达式
+        """
+        new_expr = self.copy()
+        
+        # 多次迭代简化，直到不再有变化
+        max_iterations = 10
+        for iteration in range(max_iterations):
+            original_tree = clone_tree(new_expr.tree)
+            new_expr.tree = self._recursive_simplify(new_expr.tree, constants_tolerance)
+            
+            # 如果树没有变化，说明已经简化完成
+            if Expression._trees_are_equal(original_tree, new_expr.tree):
+                break
+        
+        return new_expr
+
+    def _recursive_simplify(self, node: SymbolicNode, tolerance: float) -> SymbolicNode:
+        """
+        递归简化函数，支持多种代数简化规则
+        
+        Args:
+            node: 要简化的节点
+            tolerance: 判断常量是否接近0或1的容差
+            
+        Returns:
+            SymbolicNode: 简化后的节点
+        """
+        # --- Base Case: 叶子节点 ---
+        if node.is_leaf:
+            if isinstance(node.node_content, Constant):
+                value = node.node_content.value
+                # 接近0的值归零
+                if abs(value) < tolerance:
+                    return SymbolicNode(node_content=Constant(0.0))
+                # 接近1的值归一
+                if abs(value - 1.0) < tolerance:
+                    return SymbolicNode(node_content=Constant(1.0))
+            return node
+
+        # --- Recursive Step: 先简化所有子节点 ---
+        node.children = [self._recursive_simplify(child, tolerance) for child in node.children]
+
+        op_name = node.node_content.name
+        children = node.children
+
+        # --- 常量折叠 ---
+        if all(isinstance(child.node_content, Constant) for child in children):
+            try:
+                child_values = [child.node_content.value for child in children]
+                new_value = node.node_content(*child_values)
+                return SymbolicNode(node_content=Constant(new_value))
+            except Exception:
+                # 如果计算失败（如除以0），保持原样
+                pass
+
+        # --- 二元运算符简化规则 ---
+        if node.degree == 2:
+            left, right = children[0], children[1]
+            left_op, right_op = left.node_content, right.node_content
+
+            # 加法规则
+            if op_name == 'add' or op_name == '+':
+                # x + 0 = x, 0 + x = x
+                if isinstance(right_op, Constant) and abs(right_op.value) < tolerance:
+                    return left
+                if isinstance(left_op, Constant) and abs(left_op.value) < tolerance:
+                    return right
+                # x + (-y) = x - y
+                if isinstance(right_op, Operator) and right_op.name in ('neg', '-'):
+                    if right_op.degree == 1:
+                        sub_op = self._get_operator_by_name('sub')
+                        if sub_op:
+                            new_node = SymbolicNode(node_content=sub_op)
+                            new_node.children = [left, right.children[0]]
+                            return new_node
+
+            # 减法规则
+            elif op_name == 'sub' or op_name == '-':
+                # x - 0 = x
+                if isinstance(right_op, Constant) and abs(right_op.value) < tolerance:
+                    return left
+                # 0 - x = -x
+                if isinstance(left_op, Constant) and abs(left_op.value) < tolerance:
+                    neg_op = self._get_operator_by_name('neg')
+                    if neg_op:
+                        new_node = SymbolicNode(node_content=neg_op)
+                        new_node.children = [right]
+                        return new_node
+                # x - x = 0
+                if Expression._trees_are_equal(left, right):
+                    return SymbolicNode(node_content=Constant(0.0))
+                # x - (-y) = x + y
+                if isinstance(right_op, Operator) and right_op.name in ('neg', '-'):
+                    if right_op.degree == 1:
+                        add_op = self._get_operator_by_name('add')
+                        if add_op:
+                            new_node = SymbolicNode(node_content=add_op)
+                            new_node.children = [left, right.children[0]]
+                            return new_node
+
+            # 乘法规则
+            elif op_name == 'mul' or op_name == '*':
+                # x * 1 = x, 1 * x = x
+                if isinstance(right_op, Constant) and abs(right_op.value - 1.0) < tolerance:
+                    return left
+                if isinstance(left_op, Constant) and abs(left_op.value - 1.0) < tolerance:
+                    return right
+                # x * 0 = 0, 0 * x = 0
+                if isinstance(right_op, Constant) and abs(right_op.value) < tolerance:
+                    return SymbolicNode(node_content=Constant(0.0))
+                if isinstance(left_op, Constant) and abs(left_op.value) < tolerance:
+                    return SymbolicNode(node_content=Constant(0.0))
+                # x * (-1) = -x, (-1) * x = -x
+                if isinstance(right_op, Constant) and abs(right_op.value + 1.0) < tolerance:
+                    neg_op = self._get_operator_by_name('neg')
+                    if neg_op:
+                        new_node = SymbolicNode(node_content=neg_op)
+                        new_node.children = [left]
+                        return new_node
+                if isinstance(left_op, Constant) and abs(left_op.value + 1.0) < tolerance:
+                    neg_op = self._get_operator_by_name('neg')
+                    if neg_op:
+                        new_node = SymbolicNode(node_content=neg_op)
+                        new_node.children = [right]
+                        return new_node
+                # x * (y / x) = y
+                if isinstance(right_op, Operator) and right_op.name in ('div', '/'):
+                    if Expression._trees_are_equal(left, right.children[1]):
+                        return right.children[0]
+                # (y / x) * x = y
+                if isinstance(left_op, Operator) and left_op.name in ('div', '/'):
+                    if Expression._trees_are_equal(right, left.children[1]):
+                        return left.children[0]
+
+            # 除法规则
+            elif op_name == 'div' or op_name == '/':
+                # x / 1 = x
+                if isinstance(right_op, Constant) and abs(right_op.value - 1.0) < tolerance:
+                    return left
+                # 0 / x = 0 (x != 0)
+                if isinstance(left_op, Constant) and abs(left_op.value) < tolerance:
+                    return SymbolicNode(node_content=Constant(0.0))
+                # x / 0 = 1 (保护性处理)
+                if isinstance(right_op, Constant) and abs(right_op.value) < tolerance:
+                    return SymbolicNode(node_content=Constant(1.0))
+                # x / x = 1
+                if Expression._trees_are_equal(left, right):
+                    return SymbolicNode(node_content=Constant(1.0))
+                # (x * y) / x = y, (x * y) / y = x
+                if isinstance(left_op, Operator) and left_op.name in ('mul', '*'):
+                    if Expression._trees_are_equal(right, left.children[0]):
+                        return left.children[1]
+                    if Expression._trees_are_equal(right, left.children[1]):
+                        return left.children[0]
+                # x / (x * y) = 1 / y, x / (y * x) = 1 / y
+                if isinstance(right_op, Operator) and right_op.name in ('mul', '*'):
+                    one_node = SymbolicNode(node_content=Constant(1.0))
+                    div_op = self._get_operator_by_name('div')
+                    if div_op:
+                        if Expression._trees_are_equal(left, right.children[0]):
+                            new_node = SymbolicNode(node_content=div_op)
+                            new_node.children = [one_node, right.children[1]]
+                            return new_node
+                        if Expression._trees_are_equal(left, right.children[1]):
+                            new_node = SymbolicNode(node_content=div_op)
+                            new_node.children = [one_node, right.children[0]]
+                            return new_node
+
+            # 加法的代数简化
+            if op_name in ('add', '+'):
+                # x + (y - x) = y
+                if isinstance(right_op, Operator) and right_op.name in ('sub', '-'):
+                    if Expression._trees_are_equal(left, right.children[1]):
+                        return right.children[0]
+                # (y - x) + x = y
+                if isinstance(left_op, Operator) and left_op.name in ('sub', '-'):
+                    if Expression._trees_are_equal(right, left.children[1]):
+                        return left.children[0]
+
+        # --- 一元运算符简化规则 ---
+        if node.degree == 1:
+            child = children[0]
+            child_op = child.node_content
+            
+            # -(-x) = x
+            if op_name in ('neg', '-'):
+                if isinstance(child_op, Operator) and child_op.name in ('neg', '-'):
+                    if child_op.degree == 1:
+                        return child.children[0]
+                # -(c) = -c (常量折叠)
+                if isinstance(child_op, Constant):
+                    return SymbolicNode(node_content=Constant(-child_op.value))
+
+        return node
+
+    def _get_operator_by_name(self, op_name: str) -> Optional[Operator]:
+        """
+        根据名称获取操作符
+        
+        Args:
+            op_name: 操作符名称
+            
+        Returns:
+            Operator: 找到的操作符，如果不存在则返回 None
+        """
+        # 需要从 Expression 对象中获取可用的操作符列表
+        # 这里假设有一个 operators 属性或类似的结构
+        # 如果没有，需要根据实际情况调整
+        if not hasattr(self, 'operators'):
+            # 如果没有 operators 属性，返回 None
+            return None
+        
+        for op in self.operators:
+            if op.name == op_name:
+                return op
+        return None
 
 
 
@@ -411,7 +663,7 @@ class ExpressionSet(object):
         self.out_func = out_func
         self.metric = metric
         
-        if not all(isinstance(expr, (type(None), type(expressions[0]))) for expr in expressions):
+        if not all(isinstance(expr, (type(None), Expression)) for expr in expressions):
             raise ValueError("All items in expressions must be Expression objects.")
         
         self.expressions = expressions
@@ -802,6 +1054,18 @@ class ExpressionSet(object):
         # 直接创建新对象（避免先copy再修改）
         return ExpressionSet(new_expressions, self.out_func, self.metric)
 
-
+    def simplify(self, constants_tolerance: float = 1e-5) -> 'Expression':
+        expressions = [None] * len(self.expressions)
+        for i, expr in enumerate(self.expressions):
+            if expr is not None:
+                simplified_expr = expr.simplify(expr, constants_tolerance)
+                expressions[i] = simplified_expr
+        
+        new_expr_set = ExpressionSet(
+            expressions,
+            out_func=self.out_func, metric=self.metric
+        )
+        
+        return new_expr_set
 
 

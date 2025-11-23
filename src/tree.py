@@ -83,7 +83,7 @@ class SymbolicNode:
             raise ValueError(f"Node with degree 0 cannot have children. Operator: {self.name}")
         
         if not isinstance(children, (list, tuple)):
-            children = [children]
+            children = list(children)
         
         if self.degree > 0 and len(children) != self.degree:
             raise ValueError(

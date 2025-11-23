@@ -10,7 +10,7 @@ class HallOfFame:
     A data structure to store and maintain the Pareto frontier of expressions
     found during symbolic regression evolution.
     """
-    def __init__(self, greater_is_better):
+    def __init__(self, greater_is_better, constants_tolerance=1e-5):
         """
         Initializes the HallOfFame.
 
@@ -19,6 +19,8 @@ class HallOfFame:
         greater_is_better : bool
             Whether a higher fitness score is better. This is needed to correctly
             determine dominance (we always want to minimize error).
+        constants_tolerance : float, optional
+            Tolerance for simplifying constants (default: 1e-5)
         """
         # self.entries[complexity] = (expression, error)
         self.entries = {}
@@ -26,18 +28,23 @@ class HallOfFame:
         # for dominance comparison, as Pareto fronts assume minimization of objectives.
         self.greater_is_better = greater_is_better
         self._multiplier = -1.0 if greater_is_better else 1.0
+        self.constants_tolerance = constants_tolerance
 
-    def add(self, candidate: Expression | ExpressionSet, raw_fitness: float):
+    def add(self, candidate: Expression | ExpressionSet, raw_fitness: float, _is_simplified: bool = False):
         """
         Tries to add a new candidate to the hall of fame, maintaining the
-        Pareto frontier. The candidate can have 2 or 3 objectives for dominance comparison.
-        Objectives are always minimized.
+        Pareto frontier. If the candidate can be added, it will be simplified first
+        and then the add process is executed again with the simplified version.
 
         Parameters
         ----------
         candidate : Expression or ExpressionSet
             An individual that has been evaluated and has .size, 
             and optionally .__len__() attributes.
+        raw_fitness : float
+            The raw fitness value of the candidate.
+        _is_simplified : bool, optional
+            Internal flag to prevent infinite recursion. Should not be set by users.
         """
         # Determine objectives (always minimize)
         # For ExpressionSet, we have 3 objectives: (num_expressions, complexity, error)
@@ -71,6 +78,30 @@ class HallOfFame:
 
         if is_dominated:
             return
+
+        # If we reach here, the candidate can be added
+        # Simplify it first (only if not already simplified)
+        if not _is_simplified:
+            if isinstance(candidate, Expression):
+                simplified = candidate.simplify(constants_tolerance=self.constants_tolerance)
+                # Recursively add the simplified version
+                self.add(simplified, raw_fitness, _is_simplified=True)
+                return
+            elif isinstance(candidate, ExpressionSet):
+                # For ExpressionSet, simplify each expression
+                simplified_expressions = [
+                    expr.simplify(constants_tolerance=self.constants_tolerance) 
+                    for expr in candidate.expressions
+                ]
+                # Create a new ExpressionSet with simplified expressions
+                simplified_set = ExpressionSet(
+                    expressions=simplified_expressions,
+                    out_func=candidate.out_func,
+                    metric=candidate.metric
+                )
+                # Recursively add the simplified version
+                self.add(simplified_set, raw_fitness, _is_simplified=True)
+                return
 
         # Remove dominated entries
         for key in dominated_keys:

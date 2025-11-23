@@ -128,12 +128,12 @@ _fitness_map = {
 _fitness_jax_map = {
     # Regression
     'mae': Fitness(function=mean_absolute_error_jax, greater_is_better=False, name='mae'), 
-    # 'mse': Fitness(function=mean_square_error_jax, greater_is_better=False, name='mse'), 
+    'mse': Fitness(function=mean_square_error_jax, greater_is_better=False, name='mse'), 
     'rmse': Fitness(function=root_mean_square_error_jax, greater_is_better=False, name='rmse'), 
     # Classification
-    'cross_entropy': Fitness(function=cross_entropy_loss_jax, greater_is_better=False, name='cross_entropy'), 
+    # 'cross_entropy': Fitness(function=cross_entropy_loss_jax, greater_is_better=False, name='cross_entropy'), 
     'nll_loss': Fitness(function=nll_loss_jax, greater_is_better=False, name='nll_loss'), 
-    'focal_loss': Fitness(function=focal_loss_jax, greater_is_better=False, name='focal_loss')
+    # 'focal_loss': Fitness(function=focal_loss_jax, greater_is_better=False, name='focal_loss')
 }
 
 

@@ -34,6 +34,7 @@ class ExprGenerator:
                  aggregation_operators: List[str] | None = None,
                  metric: Optional[Callable | str | Operator] = None,
                  out_func: Optional[Callable | str | Operator] = None,
+                 initial_constants: Optional[int | List[float]] = None,
                  random_state: Union[int, np.random.RandomState] = None):
         self.maxsize = maxsize
         self.n_variables = n_variables
@@ -47,7 +48,7 @@ class ExprGenerator:
         self.metric = self._init_metric(metric)
         self.out_func = self._init_out_func(out_func)
         self.operators = self._init_operators(operators)
-        self.constants = self._init_constants(n_variables)
+        self.constants = self._init_constants(n_variables, initial_constants)
         self.variables = self._init_variables(n_variables, variable_names)
         
         # 按度数分组操作符（快速查找）
@@ -135,11 +136,18 @@ class ExprGenerator:
         
         return variables
 
-    def _init_constants(self, n_variables):
-        if not self.use_constants: return []
-        constants = [Constant(self.random_state.normal(0, 3)) for _ in range(
-                max(1, math.ceil(n_variables/2))
+    def _init_constants(self, n_variables, initial_constants = None):
+        constants = []
+        if isinstance(initial_constants, (list, tuple)):
+            constants = [Constant(constant) for constant in initial_constants]
+        elif isinstance(initial_constants, int):
+            constants = [Constant(self.random_state.normal(0, 3)) for _ in range(initial_constants)]
+        elif isinstance(initial_constants, type(None)):
+            constants = [Constant(self.random_state.normal(0, 3)) for _ in range(
+                max(1, math.ceil(n_variables/3))
             )]
+        else:
+            raise ValueError('invalid type %s found in `initial_constants`.' % type(initial_constants))
 
         return constants
 
@@ -241,11 +249,53 @@ class ExprGenerator:
             if node.degree > 0:
                 node.node_content = self._get_random_operator(node.degree)
             elif node.degree == 0:
-                node.node_content = self._get_random_leaf()
+                node.node_content = self._get_leaf_with_rules(node)
             else:
                 raise ValueError("Invalid degree")
         
         return tree
+
+    def _get_leaf_with_rules(self, node: SymbolicNode) -> NodeContent:
+        """
+        根据规则获取叶子节点内容：
+        1. 如果父节点是degree=1的节点，使用非常量叶子
+        2. 同一父节点的叶子节点不能全部是常量
+        """
+        parent = node.parent
+        
+        # 规则1: 如果父节点是degree=1的节点，使用非常量叶子
+        if parent is not None and parent.degree == 1:
+            return self._get_random_nonconstant_leaf()
+        
+        # 规则2: 同一父节点的叶子节点不能全部是常量
+        if parent is not None and len(parent.children) > 1:
+            # 获取当前已经分配内容的兄弟叶子节点
+            sibling_leaves = []
+            all_siblings_filled = True
+            
+            for child in parent.children:
+                if child is node:
+                    continue  # 跳过当前节点
+                if hasattr(child, 'node_content') and child.node_content is not None:
+                    sibling_leaves.append(child)
+                else:
+                    # 如果有一个兄弟节点还没有被填充，我们不能应用规则2
+                    all_siblings_filled = False
+                    break
+            
+            # 只有当所有兄弟节点都已经被填充时，才检查规则2
+            if all_siblings_filled and sibling_leaves:
+                # 检查是否所有兄弟叶子节点都是常量
+                all_siblings_are_constants = all(
+                    isinstance(leaf.node_content, Constant) for leaf in sibling_leaves
+                )
+                
+                # 如果所有兄弟叶子节点都是常量，当前节点必须是非常量
+                if all_siblings_are_constants:
+                    return self._get_random_nonconstant_leaf()
+        
+        # 默认情况：随机选择叶子节点
+        return self._get_random_leaf()
 
     def _get_random_operator(self, degree: Optional[int] = None, exclude: Operator = None) -> Operator:
         """Helper to get a random operator (non-leaf)."""
@@ -258,23 +308,29 @@ class ExprGenerator:
         if not options: return None
         return self.random_state.choice(options)
 
-    def _get_random_leaf(self, exclude: Optional[Variable] = None) -> NodeContent:
-        """Gets a random leaf node (variable or constant)."""
-        if exclude is not None:
-            if isinstance(exclude, Variable):
-                options = [var for var in self.variables if var != exclude]
-                return self.random_state.choice(options)
-        
+    def _get_random_leaf(self) -> NodeContent:
+        """Gets a random leaf node (variable, constant or aggregation)."""
         probs = np.array([
-            2 if self.use_variables else 0,
-            1 if self.use_constants else 0,
-            1 if self.use_aggregations else 0
+            len(self.variables) if self.use_variables else 0,
+            len(self.constants) if self.use_constants else 0,
+            len(self.variables)/2.0 if self.use_aggregations else 0
         ])
         leaf_type = self.random_state.choice([0, 1, 2], p=probs/sum(probs))
         if leaf_type == 0:
             return self.random_state.choice(self.variables)
         elif leaf_type == 1:
             return self.random_state.choice(self.constants)
+        else:
+            return self._init_aggregation(self.n_variables, self.aggregation_operators)
+
+    def _get_random_nonconstant_leaf(self) -> NodeContent:
+        probs = np.array([
+            2 if self.use_variables else 0,
+            1 if self.use_aggregations else 0
+        ])
+        leaf_type = self.random_state.choice([0, 1], p=probs/sum(probs))
+        if leaf_type == 0:
+            return self.random_state.choice(self.variables)
         else:
             return self._init_aggregation(self.n_variables, self.aggregation_operators)
 
@@ -373,6 +429,7 @@ class ExprSetGenerator(ExprGenerator):
                  aggregation_operators: List[str] | None = None,
                  metric: Optional[Callable | str | Operator] = None,
                  out_func: Optional[Callable | str | Operator] = None,
+                 initial_constants: Optional[int | List[float]] = None,
                  random_state: Union[int, np.random.RandomState] = None):
         super().__init__(
             maxsize=maxsize,
@@ -382,6 +439,7 @@ class ExprSetGenerator(ExprGenerator):
             use_variables=use_variables,
             variable_names=variable_names,
             use_aggregations=use_aggregations,
+            initial_constants=initial_constants,
             aggregation_operators=aggregation_operators,
             metric=metric, out_func=out_func, random_state=random_state
         )
@@ -413,6 +471,13 @@ class ExprSetGenerator(ExprGenerator):
             maxcounts = max_tree_set_structures(size, self.maxorder, size_tree_counts)
             if maxcounts > 0:
                 self.size_maxcounts[size] = maxcounts
+
+    def generate_random_expr(self, size: Optional[int] = None):
+        tree = self.build_tree(size)
+        expression = Expression(
+            tree=tree, metric=self.metric, out_func=None
+        )
+        return expression
 
     def generate_random_exprset(self, size: Optional[int] = None):
         if self.fixed:

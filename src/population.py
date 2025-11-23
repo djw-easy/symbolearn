@@ -7,6 +7,7 @@ import math
 
 
 from src.node_jax import Constant
+from src.tree import PostOrderIter
 from src.halloffame import HallOfFame
 from src.utils import check_random_state
 from src.expression import Expression, ExpressionSet
@@ -395,7 +396,7 @@ class Population:
     # =========================================================================
 
     def _replace_individual(self, index: int, offspring: Union[Expression, ExpressionSet], 
-                            raw_fitness: float, update_birth: bool = True):
+                            raw_fitness: float, update_birth: bool = True, is_simplified: bool = False):
         """
         替换个体（带延迟更新优化）
         
@@ -403,7 +404,6 @@ class Population:
         1. 立即更新核心数组（fitnesses, birthes, sizes）
         2. 延迟更新频率缓存（攒够一批再更新）
         """
-        old_size = self.sizes[index]
         new_size = offspring.size
         
         # 更新核心数组（O(1)）
@@ -419,7 +419,7 @@ class Population:
             self.frequencies[new_size] = self.frequencies.get(new_size, 0) + 1
         
         # 添加到名人堂
-        self.hall_of_fame.add(offspring, raw_fitness)
+        self.hall_of_fame.add(offspring, raw_fitness, is_simplified)
 
     # =========================================================================
     # 优化的进化循环
@@ -436,7 +436,11 @@ class Population:
         random_state = check_random_state(seed)
         n_evol_cycles = math.ceil(len(self) / tournament_selection_n)
         
-        for temperature in all_temperatures:
+        # 每次循环都重新初始化批量池
+        if self.batching:
+            self.batch_pool = self._init_batch_pool(X, y, random_state)
+        
+        for cycle_num, temperature in enumerate(all_temperatures):
             # 记录需要更新缓存的标志
             cache_needs_update = False
             X_batch, y_batch = self._get_batch(X, y, random_state)
@@ -457,7 +461,7 @@ class Population:
                             replace_idx1, offspring1, offspring1.fitness(X_batch, y_batch)
                         )
                         self._replace_individual(
-                            replace_idx2, offspring2, offspring1.fitness(X_batch, y_batch)
+                            replace_idx2, offspring2, offspring2.fitness(X_batch, y_batch)
                         )
                         cache_needs_update = True
                 else:
@@ -486,7 +490,7 @@ class Population:
                 X, y, random_state, self.optimizer_algorithm, 
                 self.optimizer_probability, self.optimizer_nrestarts, self.optimizer_iterations
             )
-            # self._update_constants_in_population(self.optimizer_probability, self.topn, random_state)
+            self._update_constants_in_population(self.topn, random_state)
         
         if self.generator.use_aggregations and self.should_optimize_aggregations:
             self._optimize_aggregations_in_population(
@@ -499,7 +503,10 @@ class Population:
                 simplified_ind, simplify_accepted = self.gpoperator.simplify(ind)
                 if simplify_accepted:
                     raw_fitness = simplified_ind.fitness(X, y)
-                    self._replace_individual(i, simplified_ind, raw_fitness, update_birth=False)
+                    self._replace_individual(
+                        i, simplified_ind, raw_fitness, 
+                        update_birth=False, is_simplified=True
+                    )
         
         self.niteration += 1
         return self
@@ -602,19 +609,23 @@ class Population:
                 if optimize_accepted:
                     self._replace_individual(i, offspring, raw_fitness, update_birth=False)
     
-    def _update_constants_in_population(self, optimize_probability, topn, random_state):
+    def _update_constants_in_population(self, topn, random_state):
         optimize_constant_indexes = self.find_top_n(topn)
         individuals = [self.individuals[index] for index in optimize_constant_indexes]
         constant_values = []
         for individual in individuals:
             if isinstance(individual, Expression):
-                constant_values += [gene.value for gene in individual.genes
-                                    if isinstance(gene, Constant)]
+                constant_values += [
+                    node.node_content.value for node in PostOrderIter(individual.tree) 
+                        if isinstance(node.node_content, Constant)
+                ]
             else:
                 for expr in individual.expressions:
                     if expr is not None:
-                        constant_values += [gene.value for gene in individual.genes 
-                                            if isinstance(gene, Constant)]
+                        constant_values += [
+                            node.node_content.value for node in PostOrderIter(expr.tree) 
+                                if isinstance(node.node_content, Constant)
+                        ]
         
         old_constants = self.generator.constants
         representative_values = self._find_top_n_frequent_floats(constant_values, len(old_constants))
@@ -664,3 +675,4 @@ class Population:
                 )
                 if optimize_accepted:
                     self._replace_individual(i, offspring, raw_fitness, update_birth=False)
+
