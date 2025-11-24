@@ -61,11 +61,11 @@ def _binary_cross_entropy_loss(y_true, y_pred, w=None):
     
     # 转换为合适的类型
     y_true = np.asarray(y_true, dtype=np.int32)
-    y_pred = np.asarray(y_pred, dtype=np.float64)
+    y_pred = np.asarray(y_pred, dtype=np.float32)
     
     # 调用 numba 加速的核心函数
     if w is not None:
-        w = np.asarray(w, dtype=np.float64)
+        w = np.asarray(w, dtype=np.float32)
         return _binary_cross_entropy_weighted_core(y_true, y_pred, w)
     else:
         return _binary_cross_entropy_core(y_true, y_pred, None)

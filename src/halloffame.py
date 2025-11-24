@@ -46,70 +46,78 @@ class HallOfFame:
         _is_simplified : bool, optional
             Internal flag to prevent infinite recursion. Should not be set by users.
         """
+        # 如果未简化,先简化再递归调用
+        if not _is_simplified:
+            if isinstance(candidate, Expression):
+                simplified = candidate.simplify(constants_tolerance=self.constants_tolerance)
+                # 递归添加简化后的版本
+                self.add(simplified, raw_fitness, _is_simplified=True)
+                return
+            elif isinstance(candidate, ExpressionSet):
+                simplified = candidate.simplify(constants_tolerance=self.constants_tolerance)
+                # 递归添加简化后的版本
+                self.add(simplified, raw_fitness, _is_simplified=True)
+                return
+        
+        # 以下代码只处理已简化的候选者
         # Determine objectives (always minimize)
-        # For ExpressionSet, we have 3 objectives: (num_expressions, complexity, error)
-        # For Expression, we have 2 objectives: (complexity, error)
         error = raw_fitness * self._multiplier
         if isinstance(candidate, ExpressionSet):
             objectives = (candidate.order, candidate.size, error)
-            # Use a tuple of objectives as the key
             candidate_key = (candidate.order, candidate.size)
         else:
             objectives = (candidate.size, error)
             candidate_key = candidate.size
 
-        # Do not add if an identical or better solution for this key already exists
+        # 检查是否已存在相同或更好的解
         if candidate_key in self.entries:
             existing_objectives = self.entries[candidate_key][1]
-            if all(e <= o for e, o in zip(existing_objectives, objectives)):
+            # 注意: existing_objectives 最后一个元素是 raw_fitness, 需要转换为 error
+            existing_error = existing_objectives[-1] * self._multiplier
+            
+            # 重建完整的 objectives 用于比较(都使用 error)
+            if isinstance(candidate, ExpressionSet):
+                existing_obj_for_comparison = (existing_objectives[0], existing_objectives[1], existing_error)
+            else:
+                existing_obj_for_comparison = (existing_objectives[0], existing_error)
+            
+            # 如果现有解在所有目标上都不劣于新候选者,则不添加
+            if all(e <= o for e, o in zip(existing_obj_for_comparison, objectives)):
                 return
 
         # Check for dominance
         dominated_keys = []
         is_dominated = False
-        for key, (expr, existing_objectives) in self.entries.items():
-            # New candidate is dominated by an existing one
-            if all(e <= o for e, o in zip(existing_objectives, objectives)):
+        
+        for key, (expr, stored_objectives) in self.entries.items():
+            # 将存储的 raw_fitness 转换为 error 进行比较
+            stored_error = stored_objectives[-1] * self._multiplier
+            
+            if isinstance(candidate, ExpressionSet):
+                existing_obj_for_comparison = (stored_objectives[0], stored_objectives[1], stored_error)
+            else:
+                existing_obj_for_comparison = (stored_objectives[0], stored_error)
+            
+            # 新候选者被现有解支配
+            if all(e <= o for e, o in zip(existing_obj_for_comparison, objectives)):
                 is_dominated = True
                 break
-            # New candidate dominates an existing one
-            if all(o <= e for o, e in zip(objectives, existing_objectives)):
+            
+            # 新候选者支配现有解
+            if all(o <= e for o, e in zip(objectives, existing_obj_for_comparison)):
                 dominated_keys.append(key)
 
         if is_dominated:
             return
-
-        # If we reach here, the candidate can be added
-        # Simplify it first (only if not already simplified)
-        if not _is_simplified:
-            if isinstance(candidate, Expression):
-                simplified = candidate.simplify(constants_tolerance=self.constants_tolerance)
-                # Recursively add the simplified version
-                self.add(simplified, raw_fitness, _is_simplified=True)
-                return
-            elif isinstance(candidate, ExpressionSet):
-                # For ExpressionSet, simplify each expression
-                simplified_expressions = [
-                    expr.simplify(constants_tolerance=self.constants_tolerance) 
-                    for expr in candidate.expressions
-                ]
-                # Create a new ExpressionSet with simplified expressions
-                simplified_set = ExpressionSet(
-                    expressions=simplified_expressions,
-                    out_func=candidate.out_func,
-                    metric=candidate.metric
-                )
-                # Recursively add the simplified version
-                self.add(simplified_set, raw_fitness, _is_simplified=True)
-                return
 
         # Remove dominated entries
         for key in dominated_keys:
             del self.entries[key]
 
         # Add the new non-dominated solution
-        objectives = tuple(list(objectives)[:-1] + [raw_fitness])
-        self.entries[candidate_key] = (candidate.copy(), objectives)
+        # 存储时最后一个元素保持为 raw_fitness
+        objectives_to_store = tuple(list(objectives)[:-1] + [raw_fitness])
+        self.entries[candidate_key] = (candidate.copy(), objectives_to_store)
 
     def __len__(self) -> int:
         """

@@ -578,27 +578,18 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
             indices = random_state.choice(len(candidates), size=min(len(candidates), n_needed), replace=False)
             return [candidates[i] for i in indices], [candidates_fitness[i] for i in indices]
 
-        def perform_replacement(pop, immigrants, immigrants_fitness):
+        def perform_replacement(pop: Population, immigrants, immigrants_fitness):
             """将移民放入种群，替换掉最差的个体"""
             if not immigrants:
                 return
             
             num_to_replace = len(immigrants)
             
-            # 策略 A: 替换最差的 (推荐，收敛快)
-            # 获取当前种群最差的 n 个个体的索引
-            # 假设 pop.fitnesses 越小越好 (error metric)。如果是 maximize metric，需反转逻辑。
-            # argsort 返回从小到大的索引，最后的是 error 最大的（最差的）
-            sorted_indices = np.argsort(pop.fitnesses)
-            worst_indices = sorted_indices[-num_to_replace:] 
-            
-            # 策略 B: 随机替换 (维持多样性，但可能杀掉精英)
-            # worst_indices = random_state.choice(len(pop), size=num_to_replace, replace=False)
+            # 替换最老的num_to_replace个个体
+            oldest_indices = pop.find_oldest_n(num_to_replace)
 
-            for i, idx_to_replace in enumerate(worst_indices):
+            for i, idx_to_replace in enumerate(oldest_indices):
                 # 执行替换操作
-                # 只有当外来个体的适应度优于被替换者时才替换 (可选，精英保留策略)
-                # 这里我们强制替换以引入新基因
                 pop._replace_individual(idx_to_replace, immigrants[i], immigrants_fitness[i])
 
         # --- 1. 种群间的迁移 (Inter-population) ---
@@ -915,11 +906,14 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
         The string `>>>>` denotes which equation is selected.
         """
         # This part is good, it handles the unfitted case.
-        check_is_fitted(
-            self, 
-            attributes=['equations_', 'n_features_in_', 
-                        'feature_names_in_', 'hall_of_fame_']
-        )
+        try:
+            check_is_fitted(
+                self, 
+                attributes=['equations_', 'n_features_in_', 
+                            'feature_names_in_', 'hall_of_fame_']
+            )
+        except:
+            return super().__repr__()
 
         hof_df = self.get_hof()
         hof_df['expression'] = hof_df['expression'].apply(lambda x: str(x))
@@ -981,11 +975,14 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
         return output
 
     def _html_repr(self):
-        check_is_fitted(
-            self, 
-            attributes=['equations_', 'n_features_in_', 
-                        'feature_names_in_', 'hall_of_fame_']
-        )
+        try:
+            check_is_fitted(
+                self, 
+                attributes=['equations_', 'n_features_in_', 
+                            'feature_names_in_', 'hall_of_fame_']
+            )
+        except:
+            return super()._html_repr()
 
         try:
             from sklearn.utils._repr_html.estimator import estimator_html_repr

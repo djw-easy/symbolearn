@@ -322,7 +322,7 @@ class SymbolicTransformer(BaseSymbolic, TransformerMixin):
         )
         super().__init__(metric=metric, out_func=out_func, **kwargs)
 
-    def fit(self, X, y=None, sample_weight=None,
+    def fit(self, X: np.ndarray, y=None, 
             variable_names: Optional[List[str]] = None):
         """Fit the Genetic Program according to X, y.
 
@@ -349,11 +349,8 @@ class SymbolicTransformer(BaseSymbolic, TransformerMixin):
             Returns self.
         """
         X, y = check_X_y(X, y, y_numeric=True)
-        # Check arrays
-        if sample_weight is not None:
-            sample_weight = _check_sample_weight(sample_weight, X)
         
-        return self._run(X, y, sample_weight, variable_names)
+        return self._run(X, y, variable_names)
 
     def transform(self, X):
         """Transform X.

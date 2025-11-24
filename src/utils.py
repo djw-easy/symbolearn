@@ -213,6 +213,71 @@ def _partition_estimators(n_estimators, n_jobs):
 
 
 
-
+def otsu_threshold_float(data, bins=256):
+    """
+    通用大津法阈值分割 - 支持任意范围的浮点数数据
+    
+    参数:
+        data: 输入数据(numpy数组,任意维度,任意数值范围)
+        bins: 直方图分箱数量,默认256
+    
+    返回:
+        threshold: 最优阈值
+        binary_data: 二值化后的数据(布尔数组)
+    """
+    # 展平数据
+    data_flat = data.flatten()
+    
+    # 移除NaN和Inf
+    data_flat = data_flat[np.isfinite(data_flat)]
+    
+    if len(data_flat) == 0:
+        raise ValueError("数据中没有有效值")
+    
+    # 计算直方图
+    hist, bin_edges = np.histogram(data_flat, bins=bins)
+    hist = hist.astype(float)
+    
+    # 计算每个bin的中心值
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    
+    # 总像素数
+    total = np.sum(hist)
+    
+    # 归一化直方图
+    hist_norm = hist / total
+    
+    # 初始化变量
+    max_variance = 0
+    optimal_threshold = bin_centers[0]
+    
+    # 遍历所有可能的阈值
+    for i in range(1, bins):
+        # 前景(类别0: 0~i)
+        w0 = np.sum(hist_norm[:i])
+        if w0 == 0 or w0 == 1:
+            continue
+        
+        # 背景(类别1: i~end)
+        w1 = 1 - w0
+        
+        # 前景加权平均值
+        mu0 = np.sum(bin_centers[:i] * hist_norm[:i]) / w0
+        
+        # 背景加权平均值
+        mu1 = np.sum(bin_centers[i:] * hist_norm[i:]) / w1
+        
+        # 类间方差
+        variance = w0 * w1 * (mu0 - mu1) ** 2
+        
+        # 更新最大类间方差和对应阈值
+        if variance > max_variance:
+            max_variance = variance
+            optimal_threshold = bin_centers[i]
+    
+    # 根据阈值进行二值化
+    binary_data = data > optimal_threshold
+    
+    return optimal_threshold, binary_data
 
 

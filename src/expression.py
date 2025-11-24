@@ -1058,7 +1058,7 @@ class ExpressionSet(object):
         expressions = [None] * len(self.expressions)
         for i, expr in enumerate(self.expressions):
             if expr is not None:
-                simplified_expr = expr.simplify(expr, constants_tolerance)
+                simplified_expr = expr.simplify(constants_tolerance)
                 expressions[i] = simplified_expr
         
         new_expr_set = ExpressionSet(

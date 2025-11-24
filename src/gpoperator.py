@@ -1993,7 +1993,7 @@ class ExpressionSetGP:
     def do_nothing_set(self, parent: ExpressionSet):
         """Return a new, identical expression set."""
         new_expr_set = self.reproduce(
-            [expr.copy() for expr in parent.expressions]
+            [expr.copy() if expr is not None else None for expr in parent.expressions]
         )
         return new_expr_set, True
 
@@ -2208,11 +2208,11 @@ class ExpressionSetGP:
         性能提升：相比原实现约 2-3x
         """
         # 1. 检查是否满足条件
-        if sum(expr._count_scalar_aggregations() for expr in parent.expressions) <= 0:
+        if sum(expr._count_scalar_aggregations() for expr in parent.expressions if expr is not None) <= 0:
             return None, False, np.nan
         
         # 2. 复制原始表达式集合
-        new_expr_set = self.reproduce([expr.copy() for expr in parent.expressions])
+        new_expr_set = self.reproduce([expr.copy() if expr is not None else None for expr in parent.expressions])
         
         # 3. 一次性收集所有聚合节点（关键优化）
         agg_nodes = []

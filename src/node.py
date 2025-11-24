@@ -202,9 +202,11 @@ def _protected_log(x1):
 
 
 def _protected_inverse(x1):
-    """倒数闭包，处理零参数"""
+    """使用np.where处理标量和数组"""
+    x1 = np.asarray(x1)  # 转换为numpy数组
     with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
-        return np.where(np.abs(x1) > 0.001, 1. / x1, 0.)
+        result = np.where(np.abs(x1) > 1e-10, 1.0 / x1, 0.0)
+        return result.item() if result.ndim == 0 else result
 
 
 def _protected_exp(x1):

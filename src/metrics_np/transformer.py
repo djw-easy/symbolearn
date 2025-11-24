@@ -592,82 +592,82 @@ def directional_otsu_separability(prediction: np.ndarray, target: np.ndarray) ->
 
 scaler = MinMaxScaler()
 # Multi dimensional
-def davies_bouldin_loss(y_true, y_pred, w):
+def davies_bouldin_loss(y_true, y_pred):
     """计算Davies-Bouldin损失函数。"""
-    y_pred = scaler.fit_transform(y_pred, axis=None)
+    y_pred = scaler.fit_transform(y_pred)
     return davies_bouldin_score(y_pred, y_true.ravel())
 
-def calinski_harabasz_loss(y_true, y_pred, w):
+def calinski_harabasz_loss(y_true, y_pred):
     """计算Calinski and Harabasz损失函数。"""
-    y_pred = scaler.fit_transform(y_pred, axis=None)
+    y_pred = scaler.fit_transform(y_pred)
     return calinski_harabasz_score(y_pred, y_true.ravel())
 
-def silhouette_loss(y_true, y_pred, w):
+def silhouette_loss(y_true, y_pred):
     """计算轮廓系数损失函数。"""
-    y_pred = scaler.fit_transform(y_pred, axis=None)
+    y_pred = scaler.fit_transform(y_pred)
     return silhouette_score(y_pred, y_true.ravel())
 
 # Single dimension
-def bhattacharyya_loss(y_true, y_pred, w) -> float:
+def bhattacharyya_loss(y_true, y_pred) -> float:
     y_true = np.squeeze(y_true)
     y_pred = np.squeeze(y_pred)
     if np.all(y_pred == y_pred[0]):
         return -np.inf
-    y_pred = scaler.fit_transform(y_pred, axis=None)
+    y_pred = scaler.fit_transform(y_pred.reshape(-1, 1)).ravel()
     return _bhattacharyya_loss(y_pred, y_true.ravel())
 
-def hellinger_loss(y_true, y_pred, w) -> float:
+def hellinger_loss(y_true, y_pred) -> float:
     y_true = np.squeeze(y_true)
     y_pred = np.squeeze(y_pred)
     if np.all(y_pred == y_pred[0]):
         return -np.inf
-    y_pred = scaler.fit_transform(y_pred, axis=None)
+    y_pred = scaler.fit_transform(y_pred.reshape(-1, 1)).ravel()
     return _hellinger_loss(y_pred, y_true.ravel())
 
-def js_divergence_loss(y_true, y_pred, w) -> float:
+def js_divergence_loss(y_true, y_pred) -> float:
     y_true = np.squeeze(y_true)
     y_pred = np.squeeze(y_pred)
     if np.all(y_pred == y_pred[0]):
         return -np.inf
-    y_pred = scaler.fit_transform(y_pred, axis=None)
+    y_pred = scaler.fit_transform(y_pred.reshape(-1, 1)).ravel()
     return _js_divergence_loss(y_pred, y_true.ravel())
 
-def wasserstein_loss(y_true, y_pred, w) -> float:
+def wasserstein_loss(y_true, y_pred) -> float:
     y_true = np.squeeze(y_true)
     y_pred = np.squeeze(y_pred)
     if np.all(y_pred == y_pred[0]):
         return -np.inf
-    y_pred = scaler.fit_transform(y_pred, axis=None)
+    y_pred = scaler.fit_transform(y_pred.reshape(-1, 1)).ravel()
     return _earth_movers_distance_loss(y_pred, y_true.ravel())
 
-def compactness_loss(y_true, y_pred, w) -> float:
+def compactness_loss(y_true, y_pred) -> float:
     y_true = np.squeeze(y_true)
     y_pred = np.squeeze(y_pred)
     if np.all(y_pred == y_pred[0]):
         return -np.inf
-    y_pred = scaler.fit_transform(y_pred, axis=None)
+    y_pred = scaler.fit_transform(y_pred.reshape(-1, 1)).ravel()
     return _compactness_loss(y_pred, y_true.ravel())
 
-def separability_loss(y_true, y_pred, w) -> float:
+def separability_loss(y_true, y_pred) -> float:
     y_true = np.squeeze(y_true)
     y_pred = np.squeeze(y_pred)
     if np.all(y_pred == y_pred[0]):
         return -np.inf
-    y_pred = scaler.fit_transform(y_pred, axis=None)
+    y_pred = scaler.fit_transform(y_pred.reshape(-1, 1)).ravel()
     return directional_otsu_separability(y_pred, y_true.ravel())
 
-def fisher_loss(y_true, y_pred, w) -> float:
+def fisher_loss(y_true, y_pred) -> float:
     y_true = np.squeeze(y_true)
     y_pred = np.squeeze(y_pred)
     if np.all(y_pred == y_pred[0]):
         return -np.inf
-    y_pred = scaler.fit_transform(y_pred, axis=None)
+    y_pred = scaler.fit_transform(y_pred.reshape(-1, 1)).ravel()
     return fisher_linear_discriminant(y_pred, y_true.ravel())
 
-def f_statistic_loss(y_true, y_pred, w) -> float:
+def f_statistic_loss(y_true, y_pred) -> float:
     y_true = np.squeeze(y_true)
     y_pred = np.squeeze(y_pred)
     if np.all(y_pred == y_pred[0]):
         return -np.inf
-    y_pred = scaler.fit_transform(y_pred, axis=None)
+    y_pred = scaler.fit_transform(y_pred.reshape(-1, 1)).ravel()
     return f_statistic_anova(y_pred, y_true.ravel())

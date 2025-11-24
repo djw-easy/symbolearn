@@ -1,6 +1,7 @@
 from sklearn.model_selection import train_test_split
 from sklearn.utils.random import check_random_state
 from sklearn.preprocessing import StandardScaler
+from sklearn.datasets import load_diabetes
 from scipy.io import loadmat
 import jax.numpy as jnp
 from numba import njit
@@ -13,7 +14,7 @@ jax.config.update('jax_platform_name', 'cpu')
 
 
 from src.fitness import Fitness
-from src.symbolic_estimators import SymbolicRegressor, SymbolicClassifier
+from src.symbolic_estimators import SymbolicRegressor, SymbolicClassifier, SymbolicTransformer
 
 
 datasets_info = {
@@ -82,7 +83,7 @@ y_train_multi = np.stack(
 #     population_size=27, 
 #     metric=mse_fitness,
 #     use_constant=True,
-#     maxsize=11, order=4,
+#     maxsize=11, order=(2, 4),
 #     use_aggregation=True,
 #     # stopping_criteria=0.0001,
 #     ncycles_per_iteration=380,
@@ -95,62 +96,92 @@ y_train_multi = np.stack(
 
 
 
-if __name__ == '__main__':
-    print(f"{'-'*34} Testing ExpressionSet for Symbolic Classifier {'-'*34}")
+print(f"{'-'*27} Testing Expression for Symbolic Transformer {'-'*27}")
 
-    selected_dataset = 'Pavia University'
-    dataset_info = datasets_info[selected_dataset]
+rng = check_random_state(0)
+diabetes = load_diabetes()
+perm = rng.permutation(diabetes.target.size)
+diabetes.data = diabetes.data[perm]
+diabetes.target = diabetes.target[perm]
 
-    # Load data
-    root_dir = os.getcwd()
-    X = loadmat(os.path.join(root_dir, f'data/hyperspectral/{selected_dataset}/{dataset_info[0]}.mat'))
-    X = X[dataset_info[1]]
-    y = loadmat(os.path.join(root_dir, f'data/hyperspectral/{selected_dataset}/{dataset_info[2]}.mat'))
-    y = y[dataset_info[3]]
-    X = X[y != 0, :]
-    y = y[y != 0]
+from sklearn.linear_model import Ridge
+est = Ridge()
+est.fit(diabetes.data[:300, :], diabetes.target[:300])
+print(est.score(diabetes.data[300:, :], diabetes.target[300:]))
 
-    # Standardize data
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
+operator_set = ['add', 'sub', 'mul', 'div', 'sqrt', 'log',
+                'abs', 'neg', 'inv', 'maximum', 'minimum']
+st = SymbolicTransformer(
+    maxsize=21, 
+    niterations=10,
+    populations=10,
+    metric='pearson',
+    population_size=27,
+    use_constant=False,
+    operators=operator_set,
+    ncycles_per_iteration=90,
+    n_jobs=8, verbose=1, random_state=42
+)
+X_new = st.fit_transform(diabetes.data[:300, :], diabetes.target[:300])
 
-    # Split data
-    X_train, X_test, y_train, y_test = train_test_split(
-        X_scaled, y, train_size=200*dataset_info[-1], random_state=42, stratify=y
-    )
+
+
+# if __name__ == '__main__':
+#     print(f"{'-'*34} Testing ExpressionSet for Symbolic Classifier {'-'*34}")
+
+#     selected_dataset = 'Pavia University'
+#     dataset_info = datasets_info[selected_dataset]
+
+#     # Load data
+#     root_dir = os.getcwd()
+#     X = loadmat(os.path.join(root_dir, f'data/hyperspectral/{selected_dataset}/{dataset_info[0]}.mat'))
+#     X = X[dataset_info[1]]
+#     y = loadmat(os.path.join(root_dir, f'data/hyperspectral/{selected_dataset}/{dataset_info[2]}.mat'))
+#     y = y[dataset_info[3]]
+#     X = X[y != 0, :]
+#     y = y[y != 0]
+
+#     # Standardize data
+#     scaler = StandardScaler()
+#     X_scaled = scaler.fit_transform(X)
+
+#     # Split data
+#     X_train, X_test, y_train, y_test = train_test_split(
+#         X_scaled, y, train_size=200*dataset_info[-1], random_state=42, stratify=y
+#     )
     
-    sc_classifier = SymbolicClassifier(
-        maxsize=17,
-        niterations=10,
-        populations=31,
-        population_size=27,
-        use_constant=True,
-        use_variable=True,
-        use_aggregation=False,
-        ncycles_per_iteration=38,
-        batching=True, batch_size=512,
-        should_optimize_constants=True,
-        should_optimize_aggregations=True,
-        n_jobs=16, verbose=1, random_state=42,
-        metric='cross_entropy', out_func='softmax',
-        aggregation_operators=('mean', 'min', 'max'),
-        operators=('+', '-', '*', 'sigmoid', 'tanh', 'softplus')
-    )
-    sc_classifier.fit(X_train, y_train)
+#     sc_classifier = SymbolicClassifier(
+#         maxsize=17,
+#         niterations=10,
+#         populations=31,
+#         population_size=27,
+#         use_constant=True,
+#         use_variable=True,
+#         use_aggregation=False,
+#         ncycles_per_iteration=38,
+#         batching=True, batch_size=512,
+#         should_optimize_constants=True,
+#         should_optimize_aggregations=True,
+#         n_jobs=16, verbose=1, random_state=42,
+#         metric='cross_entropy', out_func='softmax',
+#         aggregation_operators=('mean', 'min', 'max'),
+#         operators=('+', '-', '*', 'sigmoid', 'tanh', 'softplus')
+#     )
+#     sc_classifier.fit(X_train, y_train)
     
-    # sc_classifier = SymbolicClassifier.from_file(
-    #     './data/Pavia University.csv',
-    #     maxsize=31, 
-    #     n_variables=103, 
-    #     classes=np.unique(y_train),
-    #     metric='focal_loss', out_func='softmax',
-    #     aggregation_operators=('mean', 'min', 'max'),
-    #     operators=('+', '*', 'sigmoid', 'tanh', 'softplus')
-    # )
-    # print(sc_classifier.get_best().expression.fitness(X_train, y_train-1))
-    print("TrainSet模型准确率:", sc_classifier.score(X_train, y_train))
-    print("TestSet模型准确率:", sc_classifier.score(X_test, y_test))
-    print("\nPareto Front:")
-    df = sc_classifier.get_hof()
-    print(df)
+#     # sc_classifier = SymbolicClassifier.from_file(
+#     #     './data/Pavia University.csv',
+#     #     maxsize=31, 
+#     #     n_variables=103, 
+#     #     classes=np.unique(y_train),
+#     #     metric='focal_loss', out_func='softmax',
+#     #     aggregation_operators=('mean', 'min', 'max'),
+#     #     operators=('+', '*', 'sigmoid', 'tanh', 'softplus')
+#     # )
+#     # print(sc_classifier.get_best().expression.fitness(X_train, y_train-1))
+#     print("TrainSet模型准确率:", sc_classifier.score(X_train, y_train))
+#     print("TestSet模型准确率:", sc_classifier.score(X_test, y_test))
+#     print("\nPareto Front:")
+#     df = sc_classifier.get_hof()
+#     print(df)
 
