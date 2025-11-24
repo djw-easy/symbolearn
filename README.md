@@ -71,7 +71,7 @@ Due to data size limitations, a preview of the Pavia University dataset is inclu
 
 ## **🚀 Usage**
 
-All experiments can be reproduced using the interactive notebook:
+Main experiments can be reproduced using the interactive notebook:
 
 ```
 example.ipynb
