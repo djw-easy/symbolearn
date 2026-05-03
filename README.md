@@ -6,7 +6,7 @@
 
 This repository provides the official implementation of the paper:
 
-**“Transparent class-specific spectral indices via data-driven symbolic learning: Toward interpretable land-cover mapping.”**
+**"Transparent class-specific spectral indices via data-driven symbolic learning: Toward interpretable land-cover mapping."**
 
 The code implements our data-driven symbolic learning framework for discovering transparent, class-specific spectral indices that support both single-index threshold segmentation and multiclass land-cover classification.
 
@@ -16,44 +16,71 @@ The code implements our data-driven symbolic learning framework for discovering 
 
 ---
 
-## **⭐ Features**
+## ⭐ Features
 
-* End-to-end symbolic discovery framework based on genetic programming
-* Class-specific spectral indices with full interpretability
-* Dynamic spectral aggregation terminals (DSATs)
-* Synergistic Softmax–Focal Loss optimization for multiclass expression sets
-* Support for both multispectral and hyperspectral datasets
-* Reproduction of all experiments reported in the paper
+- End-to-end symbolic discovery framework based on genetic programming
+- Class-specific spectral indices with full interpretability
+- **Dynamic Spectral Aggregation Terminals (DSATs)** — terminal nodes that aggregate adjacent spectral bands on demand
+- **Complexity-guided population initialization** — seeds the initial population with expressions spanning a wide range of structural complexity
+- Synergistic Softmax–Focal Loss optimization for multiclass expression sets
+- Support for both multispectral and hyperspectral datasets
+- Reproduction of all experiments reported in the paper
 
----
+### 🔧 Evolutionary Engine
 
-## **📦 Environment**
+The GP engine is inspired by [SymbolicRegression.jl](https://github.com/M厂暑暑暑暑暑/SymbolicRegression.jl) and shares many of its design characteristics (e.g., typed function sets, hall-of-fame archiving). The key novel contributions over that baseline are:
 
-The experiments were conducted with the following environment:
+- **DSATs**: terminals that adaptively aggregate neighboring spectral channels, enabling the discovery of indices that would be impractical to express with raw bands alone
+- **Complexity-guided initialization**: seeds the population across the full spectrum of expression complexity, improving exploration without sacrificing diversity
 
-```
-python = 3.13.5
-scikit-learn = 1.7.1
-scipy = 1.16.0
-jax = 0.8.0
-joblib = 1.5.1
-numba = 0.61.2
-numpy = 2.2.5
-pandas = 2.3.1
-```
-
-> We recommend using a virtual environment (conda or venv) to avoid version conflicts.
+Performance is lower than a compiled Julia implementation, but the NumPy/Numba backend provides reasonable speed for datasets of typical遥感 size.
 
 ---
 
-## **📁 Dataset**
+## 📦 Installation
+
+```bash
+pip install -r requirements.txt
+```
+
+The core library requires only NumPy, pandas, scipy, scikit-learn, joblib, and tqdm. Numba is optional — if installed, computationally intensive fitness functions are JIT-compiled for a significant speedup; if absent, the pure-NumPy fallback is used transparently.
+
+---
+
+## 🚀 Quick Start
+
+```python
+from src.symbolic_estimators import SymbolicClassifier, SymbolicRegressor
+from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+
+X, y = make_classification(n_samples=1000, n_features=20, random_state=42)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
+
+model = SymbolicClassifier(
+    n_classes=2,
+    feature_names=[f"B{i}" for i in range(X.shape[1])],
+    population_size=500,
+    n_generations=100,
+    random_state=42,
+)
+model.fit(X_train, y_train)
+print(f"Test Accuracy: {model.score(X_test, y_test):.4f}")
+print(f"Best expression: {model.best_expression_}")
+```
+
+For a full walkthrough, see [`example.ipynb`](./example.ipynb).
+
+---
+
+## 📁 Dataset
 
 ### Included datasets
 
 The repository includes example datasets under `./example_data`:
 
-* **Poyang Lake dataset**
-* **Multiclass-L8 dataset**
+- **Poyang Lake dataset**
+- **Multiclass-L8 dataset**
 
 ### External hyperspectral datasets
 
@@ -69,40 +96,56 @@ Due to data size limitations, a preview of the Pavia University dataset is inclu
 
 ---
 
-## **🚀 Usage**
-
-Main experiments can be reproduced using the interactive notebook:
-
-```
-example.ipynb
-```
-
-The notebook provides:
-
-* Step-by-step demonstrations
-* Visualization of symbolic expressions and classification maps
-* Examples of single-index discovery and multiclass index-set evolution
-* Clear documentation of parameter settings used in the paper
-
----
-
-## **📂 Repository Structure**
+## 📂 Repository Structure
 
 ```
 .
-├── example_data/        # Example multispectral & hyperspectral data
-├── figs/                # Figures and diagrams used in README/paper
-├── src/                 # Core symbolic learning and GP implementation
-├── example.ipynb        # Main demo notebook
-└── README.md            # Project documentation
+├── example_data/          # Example multispectral & hyperspectral data
+├── figs/                   # Figures and diagrams used in README/paper
+├── src/                    # Core implementation
+│   ├── base.py             # Base estimator class
+│   ├── expression.py        # Expression (chromosome) representation
+│   ├── fitness.py          # Fitness evaluation
+│   ├── generator.py        # Expression generator (complexity-guided)
+│   ├── gpoperator.py       # GP operators (crossover, mutation, selection)
+│   ├── halloffame.py       # Hall-of-fame archiving
+│   ├── log.py              # Logging utilities
+│   ├── metrics/            # Metric functions (classification, regression, transformer)
+│   ├── node.py             # Node representation
+│   ├── population.py       # Population management
+│   ├── symbolic_estimators.py  # High-level Estimator API
+│   ├── tree.py             # Tree representation
+│   ├── tree_parser.py      # String-to-tree parser
+│   └── utils.py            # Utility functions
+├── tests/                  # Unit tests
+├── example.ipynb           # Main demo notebook
+├── train_sc.py             # Training script for hyperspectral classification
+├── test.py                 # Lightweight smoke test
+├── requirements.txt        # Python dependencies
+└── README.md
 ```
 
 ---
 
-## **📧 Contact**
+## 📧 Contact
 
 If you have questions or encounter issues, feel free to contact:
 
 **Junwu Dong**
 Email: *[djw@lreis.ac.cn](mailto:djw@lreis.ac.cn)*
 
+---
+
+## 📚 Citation
+
+If you use this code in your research, please cite our paper:
+
+```
+TBD — bibtex entry will be added upon publication
+```
+
+---
+
+## 📄 License
+
+This project is for academic use. Please contact the authors for commercial licensing.
