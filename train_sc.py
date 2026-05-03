@@ -166,8 +166,8 @@ def parse_args():
     
     # Dataset Settings
     group_ds = parser.add_argument_group('Dataset')
-    group_ds.add_argument('--dataset', type=str, default='Houston', choices=DATASETS_INFO.keys())
-    group_ds.add_argument('--train_size', type=float, default=30, 
+    group_ds.add_argument('--dataset', type=str, default='Pavia University', choices=DATASETS_INFO.keys())
+    group_ds.add_argument('--train_size', type=float, default=100, 
                           help='Controls the number of training samples')
     group_ds.add_argument('--per_class', type=float, default=True, 
                           help='Determines how `train_size` is interpreted')

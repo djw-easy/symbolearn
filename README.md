@@ -58,15 +58,16 @@ X, y = make_classification(n_samples=1000, n_features=20, random_state=42)
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
 
 model = SymbolicClassifier(
-    n_classes=2,
-    feature_names=[f"B{i}" for i in range(X.shape[1])],
-    population_size=500,
-    n_generations=100,
-    random_state=42,
+    maxsize=15,
+    niterations=10,
+    populations=31,
+    population_size=27,
+    ncycles_per_iteration=38, 
+    n_jobs=8, verbose=1, random_state=42
 )
 model.fit(X_train, y_train)
 print(f"Test Accuracy: {model.score(X_test, y_test):.4f}")
-print(f"Best expression: {model.best_expression_}")
+print(f"Best expression: \n{model.get_best()}")
 ```
 
 For a full walkthrough, see [`example.ipynb`](./example.ipynb).
@@ -100,28 +101,28 @@ Due to data size limitations, a preview of the Pavia University dataset is inclu
 
 ```
 .
-├── example_data/          # Example multispectral & hyperspectral data
-├── figs/                   # Figures and diagrams used in README/paper
-├── src/                    # Core implementation
-│   ├── base.py             # Base estimator class
-│   ├── expression.py        # Expression (chromosome) representation
-│   ├── fitness.py          # Fitness evaluation
-│   ├── generator.py        # Expression generator (complexity-guided)
-│   ├── gpoperator.py       # GP operators (crossover, mutation, selection)
-│   ├── halloffame.py       # Hall-of-fame archiving
-│   ├── log.py              # Logging utilities
-│   ├── metrics/            # Metric functions (classification, regression, transformer)
-│   ├── node.py             # Node representation
-│   ├── population.py       # Population management
+├── example_data/               # Example multispectral & hyperspectral data
+├── figs/                       # Figures and diagrams used in README/paper
+├── src/                        # Core implementation
+│   ├── base.py                 # Base estimator class
+│   ├── expression.py           # Expression and ExpressionSet (chromosome) representation
+│   ├── fitness.py              # Fitness evaluation
+│   ├── generator.py            # Expression generator (complexity-guided)
+│   ├── gpoperator.py           # GP operators (crossover, mutation, selection)
+│   ├── halloffame.py           # Hall-of-fame archiving
+│   ├── log.py                  # Logging utilities
+│   ├── metrics/                # Metric functions (classification, regression, transformer)
+│   ├── node.py                 # Node representation
+│   ├── population.py           # Population management
 │   ├── symbolic_estimators.py  # High-level Estimator API
-│   ├── tree.py             # Tree representation
-│   ├── tree_parser.py      # String-to-tree parser
-│   └── utils.py            # Utility functions
-├── tests/                  # Unit tests
-├── example.ipynb           # Main demo notebook
-├── train_sc.py             # Training script for hyperspectral classification
-├── test.py                 # Lightweight smoke test
-├── requirements.txt        # Python dependencies
+│   ├── tree.py                 # Tree representation
+│   ├── tree_parser.py          # String-to-tree parser
+│   └── utils.py                # Utility functions
+├── tests/                      # Unit tests
+├── example.ipynb               # Main demo notebook
+├── train_sc.py                 # Training script for hyperspectral classification
+├── test.py                     # Lightweight smoke test
+├── requirements.txt            # Python dependencies
 └── README.md
 ```
 

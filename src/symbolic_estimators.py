@@ -129,20 +129,21 @@ class SymbolicClassifier(BaseSymbolic, ClassifierMixin):
 
     Parameters
     ----------
-    metric : str, default='cross_entropy'
+    metric : str, default='hinge_loss'
         The fitness metric to use for classification.
         Supported metrics: 'cross_entropy', 'nll_loss', 'focal_loss',
         'hinge_loss', 'nca_loss', 'prototype_loss', 'accuracy'
 
     out_func : str, Operator, or callable, default='softmax'
         The output function to apply to the result of the expression.
-        For 'hinge_loss' metric, must be 'identity' (no transformation).
+        For the 'hinge_loss' metric, it is recommended to use 'identity' 
+        (i.e., no transformation) to ensure correct calculation.
 
     **kwargs
         Additional keyword arguments passed to the BaseSymbolic constructor.
     """
 
-    def __init__(self, *, metric='cross_entropy', out_func='softmax', **kwargs):
+    def __init__(self, *, metric='hinge_loss', out_func='identity', **kwargs):
         self.typical_metrics = (
             'cross_entropy', 'nll_loss', 'focal_loss', 'hinge_loss', 'accuracy'
         )
