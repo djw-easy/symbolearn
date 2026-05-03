@@ -1,4 +1,4 @@
-from typing import Union, Optional, List, Dict
+from typing import Union, Optional, List, Dict, Tuple
 import numpy as np
 
 
@@ -6,13 +6,101 @@ from src.node import NodeContent
 from src.utils import check_random_state
 
 
-
 class SymbolicNode:
     """
-    自定义的符号节点实现，不依赖 anytree.LightNodeMixin
-    提供更好的性能和缓存控制
+    A tree node representing a component of a symbolic expression.
+
+    SymbolicNode is a lightweight, high-performance tree node implementation
+    that does not depend on external tree libraries. It provides explicit
+    parent-child relationships with optional size caching for efficiency.
+
+    Each SymbolicNode contains:
+    - node_content: The actual data (Operator, Variable, Constant, or DynamicAggregation)
+    - degree: Number of children (0 for leaves)
+    - name: Human-readable name derived from node_content
+    - parent: Reference to the parent node (None for root)
+    - children: Tuple of child SymbolicNodes
+
+    The node uses __slots__ for memory efficiency and caches the subtree size
+    to avoid repeated computation.
+
+    Parameters
+    ----------
+    node_content : NodeContent, optional
+        The content of this node (Operator, Variable, Constant, or DynamicAggregation).
+        If None, the node is created as a placeholder with the specified degree.
+    parent : SymbolicNode, optional
+        The parent node. If provided, this node is appended to parent's children.
+    children : SymbolicNode, list, or tuple, optional
+        The child nodes. Must match the degree of node_content.
+    degree : int, optional
+        Required when node_content is None. Specifies the number of children.
+
+    Attributes
+    ----------
+    node_content : NodeContent
+        The content stored in this node.
+    name : str
+        Human-readable name (e.g., 'add', 'x0', '2.5').
+    degree : int
+        Number of children (arity of the operator). 0 for leaf nodes.
+    parent : SymbolicNode or None
+        Reference to parent node.
+    children : tuple
+        Tuple of child SymbolicNodes (empty tuple for leaves).
+
+    Properties
+    ----------
+    is_leaf : bool
+        True if this node has no children.
+    is_root : bool
+        True if this node has no parent.
+    size : int
+        Number of nodes in the subtree rooted at this node (cached).
+    leaves : list
+        List of all leaf descendant nodes.
+    root : SymbolicNode
+        The root node of this tree.
+    depth : int
+        Depth of this node from the root (root has depth 0).
+
+    Methods
+    -------
+    __call__(X)
+        Execute the node (and its subtree) on input data X.
+        For operators: applies the operator to children's results.
+        For leaves: delegates to node_content(X).
+
+    Examples
+    --------
+    >>> from src.node import add2, Variable, Constant
+    >>> # Build: add(x0, 2.5)
+    >>> leaf1 = SymbolicNode(node_content=Variable(0))
+    >>> leaf2 = SymbolicNode(node_content=Constant(2.5))
+    >>> root = SymbolicNode(node_content=add2)
+    >>> root.children = [leaf1, leaf2]
+    >>> # Evaluate
+    >>> import numpy as np
+    >>> X = np.array([[1.0], [2.0], [3.0]])
+    >>> result = root(X)  # Returns array([3.5, 4.5, 5.5])
+
+    Notes
+    -----
+    The node enforces that children match the degree of the operator:
+    - degree=0 (leaf): no children allowed
+    - degree=1 (unary): exactly 1 child (e.g., sin, neg)
+    - degree=2 (binary): exactly 2 children (e.g., add, mul)
+
+    Size caching is invalidated automatically when children are modified.
+    The cache is also invalidated for all ancestors when any node's
+    children are changed.
+
+    See Also
+    --------
+    Expression : Wraps a SymbolicNode tree with additional functionality.
+    NodeContent : Base class for node content types.
     """
-    __slots__ = ('_node_content', 'name', 'degree', '_parent', '_children', '_cached_size')
+    __slots__ = ('_node_content', 'name', 'degree', '_parent', '_children', '_cached_size', '_temp_op_name')
     
     def __init__(self,
                  node_content: Optional[NodeContent] = None,
@@ -24,6 +112,7 @@ class SymbolicNode:
         self._parent = None
         self._children = []
         self._cached_size = None
+        self._temp_op_name = None  # For constraint-aware generation
         
         if node_content is not None:
             self.name = node_content.name
@@ -415,79 +504,9 @@ def generate_random_tree(
     return root
 
 
-def get_mth_tree(
-    size: int,
-    degrees: List[int],
-    m: int, # 0-based index
-    count_memo: Optional[Dict[int, int]] = None
-) -> Optional[SymbolicNode]:
-    """
-    给定确切的大小和索引 m, 返回第 m 个组合的树。
-    不提前生成所有树。
-    """
-    if count_memo is None:
-        count_memo = {}
 
-    # 检查索引是否有效
-    total_trees = count_trees(size, degrees, count_memo)
-    if m >= total_trees:
-        raise IndexError(f"索引 m={m} 超出范围，对于 size={size} 只有 {total_trees} 种可能的树。")
 
-    # 基本情况
-    if size == 1:
-        return SymbolicNode(degree=0)
-    
-    # 递归步骤
-    nodes_for_children = size - 1
-    
-    # 按照确定性顺序遍历所有选择
-    # 注意：这里的循环顺序必须与 count_trees 中的完全一致！
-    for degree in sorted(degrees): # 对 degrees 排序以保证确定性顺序
-        if degree == 0 or nodes_for_children < degree:
-            continue
-            
-        for partition in get_integer_partitions(nodes_for_children, degree):
-            # 计算这个 (degree, partition) 分支产生了多少组合
-            block_size = 1
-            child_counts = []
-            possible = True
-            for child_size in partition:
-                child_count = count_trees(child_size, degrees, count_memo)
-                if child_count == 0:
-                    possible = False
-                    break
-                block_size *= child_count
-                child_counts.append(child_count)
 
-            if not possible:
-                continue
 
-            # 如果索引 m 落在当前块中，则构建这棵树
-            if m < block_size:
-                root = SymbolicNode(degree=int(degree))
-                children = []
-                
-                # “解排名”：将 m 转换为每个子树的索引
-                remaining_m = m
-                for i in range(len(partition)):
-                    child_size = partition[i]
-                    # 计算后续子树组合的总数
-                    next_block_divider = block_size // child_counts[i]
-                    
-                    child_index = remaining_m // next_block_divider
-                    children.append(
-                        get_mth_tree(child_size, degrees, child_index, count_memo)
-                    )
-                    
-                    remaining_m %= next_block_divider
-                    block_size = next_block_divider
-
-                root.children = children
-                return root
-            
-            # 否则，跳过这个块，并更新索引
-            m -= block_size
-            
-    return None # 理论上不应到达这里
 
 

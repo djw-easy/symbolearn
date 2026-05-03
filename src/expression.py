@@ -1,48 +1,149 @@
-import jax
 import bisect
 import warnings
 import numpy as np
-import jax.numpy as jnp
-from functools import lru_cache
-from scipy.optimize import minimize
-from typing import Union, Optional, List, Tuple, Iterator
+from scipy import sparse
+from typing import Union, Optional, List
 
 
-from src.node import Operator, Constant, Variable, NodeContent, DynamicAggregation
+from src.fitness import Fitness
+from src.node import Operator, Constant, Variable, DynamicAggregation
 from src.tree import clone_tree, PreOrderIter, PostOrderIter, SymbolicNode
-from src.node_jax import DynamicAggregation as DynamicAggregation_jax
-from src.fitness import Fitness, _fitness_jax_map
-from src.node_jax import _operator_jax_map
-
 
 
 
 
 class Expression(object):
     """
-    符号树形式的表达式
+    A symbolic mathematical expression represented as a tree structure.
+
+    This class encapsulates a symbolic expression tree (SymbolicNode) along with
+    associated metadata such as the fitness metric, output transformation function,
+    and complexity configuration. Expressions are the fundamental individuals
+    evolved by the genetic programming algorithm.
+
+    The expression tree consists of:
+    - Internal nodes: Operators (mathematical functions like add, multiply, sin, etc.)
+    - Leaf nodes: Variables (input features), Constants (literal numeric values),
+                 or DynamicAggregations (spatial/spectral aggregations)
+
+    Expression trees can be:
+    - Evaluated on input data to produce predictions
+    - Simplified using algebraic rules
+    - Mutated or crossed over with other expressions
+    - Serialized to string representations for human interpretation
+
+    Parameters
+    ----------
+    tree : SymbolicNode
+        The root node of the symbolic expression tree.
+    out_func : Operator, optional
+        A unary operator applied to the output of the expression during evaluation.
+        For classification, this is typically softmax or sigmoid.
+    metric : Fitness, optional
+        The fitness function used to evaluate the expression quality.
+    ndigits : int, default=7
+        Number of digits for formatting floating-point constant values in string output.
+    complexity_of_operators : dict, optional
+        Custom complexity weights for each operator type. Keys are operator names,
+        values are the complexity cost. Default uses unit complexity.
+    complexity_of_constants : float, default=1.0
+        Complexity cost of constant leaf nodes.
+    complexity_of_variables : float or list, default=1.0
+        Complexity cost of variable leaf nodes. Can be a list to assign
+        different costs to different variables.
+    complexity_of_aggregations : float, default=1.0
+        Complexity cost of dynamic aggregation leaf nodes.
+    constraints : dict, optional
+        Operator argument complexity constraints. Format:
+        - Unary operators: {'op_name': max_complexity}
+        - Binary operators: {'op_name': (max_left, max_right)} or {'op_name': max_both}
+        Use -1 or None for unlimited complexity.
+    nested_constraints : dict, optional
+        Limits on consecutive nesting of operators. Format:
+        {'outer_op': {'inner_op': max_depth}}
+        depth=0 means forbidden, -1 means unlimited.
+
+    Attributes
+    ----------
+    tree : SymbolicNode
+        The root node of the expression tree.
+    metric : Fitness
+        The fitness function for evaluation.
+    out_func : Operator or None
+        Output transformation function.
+    complexity : float
+        The complexity score of the expression (sum of node complexities).
+
+    Examples
+    --------
+    >>> from src.tree import SymbolicNode
+    >>> from src.node import add2, Variable, Constant
+    >>> # Create: x0 + 2.5
+    >>> const_node = SymbolicNode(node_content=Constant(2.5), degree=0)
+    >>> var_node = SymbolicNode(node_content=Variable(0), degree=0)
+    >>> root = SymbolicNode(node_content=add2)
+    >>> root.children = [var_node, const_node]
+    >>> expr = Expression(tree=root, metric=Fitness(mse_func, False))
+    >>> result = expr.execute(X)  # Evaluate on data
+
+    Notes
+    -----
+    The complexity of an expression is computed as the weighted sum of its nodes,
+    where operators, variables, constants, and aggregations can each have
+    custom complexity weights. This enables the evolutionary process to
+    prefer simpler expressions through Pareto-based selection.
+
+    Expression simplification applies algebraic rules including:
+    - Constant folding: (2 + 3) -> 5
+    - Identity laws: x + 0 -> x, x * 1 -> x
+    - Zero laws: x * 0 -> 0, 0 / x -> 0
+    - Absorption laws: x - x -> 0, x / x -> 1
+    - Double negation: -(-x) -> x
     """
     def __init__(self,
                  tree: SymbolicNode,
-                 out_func: Operator | None = None, 
-                 metric: Fitness | None = None,
+                 out_func: Optional[Operator] = None, 
+                 metric: Optional[Fitness] = None, ndigits: int = 7,
                  complexity_of_operators: dict[str, int | float] | None = None,
                  complexity_of_constants: int | float | None = None,
-                 complexity_of_variables: int | float | None = None, 
-                 complexity_of_aggregations: int | float | None = None):
+                 complexity_of_variables: int | float | list[int | float] | None = None, 
+                 complexity_of_aggregations: int | float | None = None,
+                 constraints: dict[str, int | tuple[int, int]] | None = None,
+                 nested_constraints: dict[str, dict] | None = None):
         self.tree = tree
         self.metric = metric
+        self.ndigits = ndigits
         self.out_func = out_func
         self.complexity_of_operators = complexity_of_operators or {}
         self.complexity_of_constants = complexity_of_constants or 1
         self.complexity_of_variables = complexity_of_variables or 1
         self.complexity_of_aggregations = complexity_of_aggregations or 1
+        self.constraints = constraints or {}
+        self.nested_constraints = nested_constraints or {}
         
         # 预分析表达式结构
         self._constant_indices = None
         
-        # 懒编译梯度函数（只在需要时编译一次）
-        self._grad_fn_compiled = None
+        self._should_calc_complexity = False
+        # 检查操作符复杂度
+        if self.complexity_of_operators:
+            for op_complexity in self.complexity_of_operators.values():
+                if abs(op_complexity - 1.0) > 1e-6:  # 不等于1
+                    self._should_calc_complexity = True
+        # 检查常量复杂度
+        if abs(self.complexity_of_constants - 1.0) > 1e-6:
+            self._should_calc_complexity = True
+        # 检查变量复杂度
+        if isinstance(self.complexity_of_variables, (list, tuple)):
+            for var_complexity in self.complexity_of_variables:
+                if abs(var_complexity - 1.0) > 1e-6:
+                    self._should_calc_complexity = True
+        else:
+            if abs(self.complexity_of_variables - 1.0) > 1e-6:
+                self._should_calc_complexity = True
+        # 检查聚合复杂度
+        if abs(self.complexity_of_aggregations - 1.0) > 1e-6:
+            self._should_calc_complexity = True
 
     def _validate_tree(self, tree: SymbolicNode):
         """Recursively validates the genes in the provided tree."""
@@ -67,18 +168,18 @@ class Expression(object):
                     f"Node '{node.name}' has degree {node.degree} but found {len(node.children)} children."
                 )
 
-    def _tree_to_str(self, node: SymbolicNode) -> str:
+    def to_str(self, node: SymbolicNode) -> str:
         """Recursively converts a node to a string formula."""
         if node.is_leaf:
             if isinstance(node.node_content, Constant):
-                return f"{node.node_content.value:.5f}"
+                return str(round(float(node.node_content.value), self.ndigits))
             elif isinstance(node.node_content, Variable):
                 return node.node_content.name
             elif isinstance(node.node_content, DynamicAggregation):
                 return node.node_content.name
             return str(node.node_content.name)
 
-        children_strs = [self._tree_to_str(child) for child in node.children]
+        children_strs = [self.to_str(child) for child in node.children]
         
         op_name = node.node_content.name
         if node.degree == 1:
@@ -110,11 +211,11 @@ class Expression(object):
 
     def __str__(self):
         """Converts the symbolic tree to a string formula."""
-        return self._tree_to_str(self.tree)
+        return self.to_str(self.tree)
 
     def __repr__(self):
         """Provides a developer-friendly representation of the object."""
-        return f"Expression(formula='{self._tree_to_str(self.tree)}')"
+        return f"Expression(formula='{self.to_str(self.tree)}')"
 
     def _count_scalar_constants(self) -> int:
         """Recursively counts the number of scalar constants in the tree."""
@@ -177,33 +278,279 @@ class Expression(object):
         return self._constant_indices
 
     @property
+    def constants(self) -> np.ndarray:
+        current_constants = [node.node_content.value 
+                             for i, node in enumerate(PostOrderIter(self.tree)) 
+                             if isinstance(node.node_content, Constant)]
+        return np.array(current_constants)
+
+    @property
     def size(self) -> int:
         """The size of the expression tree."""
         return self.tree.size
 
-    def _calculate_complexity(self) -> float:
+    def _get_node_complexity(self, node: SymbolicNode) -> float:
         """
-        计算表达式的复杂度。
+        Get the complexity score for a single node.
+
+        Parameters
+        ----------
+        node : SymbolicNode
+            The node to evaluate.
+
+        Returns
+        -------
+        float
+            Complexity score based on node type and configured weights.
         """
-        total_complexity = 0.0
-        for node in PostOrderIter(self.tree):
-            if isinstance(node.node_content, Operator):
-                total_complexity += self.complexity_of_operators.get(node.name, 1)
-            elif isinstance(node.node_content, Constant):
-                total_complexity += self.complexity_of_constants
-            elif isinstance(node.node_content, Variable):
-                total_complexity += self.complexity_of_variables
-            elif isinstance(node.node_content, DynamicAggregation):
-                total_complexity += self.complexity_of_aggregations
+        if isinstance(node.node_content, Operator):
+            return self.complexity_of_operators.get(node.name, 1)
+        elif isinstance(node.node_content, Constant):
+            return self.complexity_of_constants
+        elif isinstance(node.node_content, Variable):
+            # Support per-variable complexity via list
+            if isinstance(self.complexity_of_variables, list):
+                var_idx = node.node_content.variable
+                return self.complexity_of_variables[var_idx] if var_idx < len(self.complexity_of_variables) else 1
             else:
-                # 对于未知类型，默认复杂度为1
-                total_complexity += 1
+                return self.complexity_of_variables
+        elif isinstance(node.node_content, DynamicAggregation):
+            return self.complexity_of_aggregations
+        else:
+            return 1
+
+    def _calculate_complexity(self, node: Optional[SymbolicNode] = None) -> float:
+        """
+        Calculate the complexity of an expression or subtree.
+
+        Complexity is computed as the weighted sum of all node complexities
+        in post-order traversal.
+
+        Parameters
+        ----------
+        node : SymbolicNode, optional
+            Root node of the subtree to evaluate. If None, evaluates entire tree.
+
+        Returns
+        -------
+        float
+            Total complexity score.
+        """
+        if node is None:
+            node = self.tree
+        
+        total_complexity = 0.0
+        for n in PostOrderIter(node):
+            total_complexity += self._get_node_complexity(n)
+        
         return total_complexity
 
     @property
     def complexity(self) -> float:
-        """表达式的复杂度。"""
-        return self._calculate_complexity()
+        """
+        The complexity score of the expression.
+
+        Returns the weighted complexity if custom weights are configured,
+        otherwise returns the tree size.
+        """
+        if self._should_calc_complexity:
+            return self._calculate_complexity()
+        return self.size
+
+    def _check_constraints(self, tree: Optional[SymbolicNode] = None) -> bool:
+        """
+        Check whether the expression satisfies all constraint conditions.
+
+        Parameters
+        ----------
+        tree : SymbolicNode, optional
+            Root node to check. If None, checks entire tree.
+
+        Returns
+        -------
+        bool
+            True if all constraints are satisfied.
+        """
+        if tree is None:
+            tree = self.tree
+        
+        # Check operator argument complexity constraints
+        if not self._check_operator_constraints(tree):
+            return False
+        
+        # Check nested operator depth constraints
+        if not self._check_nested_constraints(tree):
+            return False
+        
+        return True
+
+    def _check_operator_constraints(self, tree: SymbolicNode) -> bool:
+        """
+        Check operator argument complexity constraints.
+
+        Constraint format:
+        - Unary operators: {'sin': 3} means sin's argument complexity <= 3
+        - Binary operators: {'pow': (-1, 1)} means left arg unlimited, right arg <= 1
+
+        Parameters
+        ----------
+        tree : SymbolicNode
+            Root node to check.
+
+        Returns
+        -------
+        bool
+            True if all operator constraints are satisfied.
+        """
+        for node in PreOrderIter(tree):
+            if not isinstance(node.node_content, Operator):
+                continue
+            
+            op_name = node.node_content.name
+            if op_name not in self.constraints:
+                continue
+            
+            constraint = self.constraints[op_name]
+            
+            if node.degree == 1:
+                # Unary operator
+                if isinstance(constraint, int):
+                    max_complexity = constraint
+                    if max_complexity >= 0:  # -1 means unlimited
+                        child_complexity = self._calculate_complexity(node.children[0])
+                        if child_complexity > max_complexity:
+                            return False
+                elif isinstance(constraint, tuple):
+                    # Allow tuple format (max_complexity,) or (max_complexity, -1)
+                    max_complexity = constraint[0]
+                    if max_complexity >= 0:
+                        child_complexity = self._calculate_complexity(node.children[0])
+                        if child_complexity > max_complexity:
+                            return False
+            
+            elif node.degree == 2:
+                # Binary operator
+                if isinstance(constraint, tuple) and len(constraint) == 2:
+                    max_left, max_right = constraint
+                    
+                    # Check left argument
+                    if max_left >= 0:
+                        left_complexity = self._calculate_complexity(node.children[0])
+                        if left_complexity > max_left:
+                            return False
+                    
+                    # Check right argument
+                    if max_right >= 0:
+                        right_complexity = self._calculate_complexity(node.children[1])
+                        if right_complexity > max_right:
+                            return False
+                elif isinstance(constraint, int):
+                    # Allow single integer for both arguments
+                    max_complexity = constraint
+                    if max_complexity >= 0:
+                        for child in node.children:
+                            child_complexity = self._calculate_complexity(child)
+                            if child_complexity > max_complexity:
+                                return False
+        
+        return True
+
+    def _check_nested_constraints(self, tree: SymbolicNode) -> bool:
+        """
+        Validate nested operator depth constraints.
+
+        Constraint semantics:
+        nested_constraints[outer][inner] = k
+            - k == 0: inner cannot be a direct child of outer
+            - k >= 1: if inner is a direct child, continuous nesting depth <= k
+            - k == -1: allowed (skip check)
+
+        Parameters
+        ----------
+        tree : SymbolicNode
+            Root node to check.
+
+        Returns
+        -------
+        bool
+            True if all nested constraints are satisfied.
+        """
+        if not self.nested_constraints:
+            return True
+
+        # Compute continuous depth of same-name operator nesting on-demand
+        def get_continuous_depth(node: SymbolicNode) -> int:
+            if node.degree == 0:
+                return 0
+            op = node.name
+            max_child_depth = 0
+            for child in node.children:
+                if child.degree > 0 and child.name == op:
+                    child_depth = get_continuous_depth(child)
+                    if child_depth > max_child_depth:
+                        max_child_depth = child_depth
+            return 1 + max_child_depth
+
+        # Traverse all nodes and check direct child constraints
+        for node in PreOrderIter(tree):
+            if node.degree == 0:
+                continue
+
+            outer_op = node.name
+            if outer_op not in self.nested_constraints:
+                continue
+
+            child_constraints = self.nested_constraints[outer_op]
+
+            for child in node.children:
+                if child.degree == 0:
+                    continue  # Skip leaves (variables/constants)
+
+                child_op = child.name
+                if child_op not in child_constraints:
+                    continue
+
+                k = child_constraints[child_op]
+
+                if k == 0:
+                    return False
+                elif k > 0:
+                    # Only compute depth if k > 0
+                    if get_continuous_depth(child) > k:
+                        return False
+                # k == -1: allowed, skip check
+
+        return True
+
+    def is_valid(self, max_complexity: Optional[float] = None) -> bool:
+        """
+        Check whether the expression is valid.
+
+        An expression is valid if:
+        1. Its complexity does not exceed max_complexity (if specified)
+        2. All operator constraints are satisfied
+        3. All nested constraints are satisfied
+
+        Parameters
+        ----------
+        max_complexity : float, optional
+            Maximum allowed complexity. If None, complexity is not checked.
+
+        Returns
+        -------
+        bool
+            True if the expression is valid.
+        """
+        # Check complexity
+        if max_complexity is not None:
+            if self.complexity > max_complexity:
+                return False
+        
+        # Check constraints
+        if not self._check_constraints():
+            return False
+        
+        return True
 
     @staticmethod
     def _trees_are_equal(node1: SymbolicNode, node2: SymbolicNode) -> bool:
@@ -230,29 +577,78 @@ class Expression(object):
     def copy(self) -> 'Expression':
         """Returns a deep copy of the expression."""
         return Expression(
-            clone_tree(self.tree), out_func=self.out_func, metric=self.metric
+            clone_tree(self.tree), 
+            out_func=self.out_func, 
+            metric=self.metric, ndigits=self.ndigits,
+            complexity_of_operators=self.complexity_of_operators,
+            complexity_of_constants=self.complexity_of_constants,
+            complexity_of_variables=self.complexity_of_variables,
+            complexity_of_aggregations=self.complexity_of_aggregations,
+            constraints=self.constraints, nested_constraints=self.nested_constraints
         )
 
-    def execute(self, X: np.ndarray) -> np.ndarray:
-        """Execute the expression according to X."""
+    def _execute_tree(self, X: np.ndarray) -> np.ndarray:
+        """
+        Execute the expression on input data using direct tree evaluation.
+
+        Parameters
+        ----------
+        X : ndarray
+            Input features with shape (n_samples, n_features).
+
+        Returns
+        -------
+        ndarray
+            Expression output with shape dependent on expression structure.
+        """
         result = self.tree(X)
 
-        if not isinstance(result, np.ndarray) or result.ndim == 0:
-            result = np.full(X.shape[0], result)
+        # Handle scalar results
+        if np.isscalar(result) or result.ndim == 0:
+            result = np.full(X.shape[:-1], result)
 
-        result = result.ravel()
-        return result if self.out_func is None else self.out_func(result)
+        # Apply output function (e.g., softmax for classification)
+        if self.out_func is not None:
+            result = self.out_func(result)
+        
+        return result
 
-    def _execute_postorder(self, X: np.ndarray, constants: np.ndarray = None) -> np.ndarray:
+    def _execute_postorder(self, X: np.ndarray, valid_mask: Optional[np.ndarray] = None, 
+                           constants: Optional[np.ndarray] = None) -> np.ndarray:
+        """
+        Execute the expression using post-order traversal.
+
+        This method supports masked evaluation and optimized constant handling
+        for scenarios like batch processing with missing values.
+
+        Parameters
+        ----------
+        X : ndarray
+            Input features.
+        valid_mask : ndarray, optional
+            Boolean mask indicating valid samples.
+        constants : ndarray, optional
+            Pre-computed constant values for optimization.
+
+        Returns
+        -------
+        ndarray
+            Expression output for valid samples only.
+        """
         stack = []
         
         constant_counter = 0
         for node in PostOrderIter(self.tree):
             if node.degree == 0:
                 # Variable, Constant, DynamicAggregation
-                if (constants is not None) and isinstance(node.node_content, Constant):
-                    result = constants[constant_counter]
+                if isinstance(node.node_content, Constant):
+                    if constants is not None:
+                        result = constants[constant_counter]
+                    else:
+                        result = node.node_content.value
                     constant_counter += 1
+                elif isinstance(node.node_content, (Variable, DynamicAggregation)):
+                    result = node.node_content(X, valid_mask=valid_mask)
                 else:
                     result = node.node_content(X)
                 stack.append(result)
@@ -265,188 +661,130 @@ class Expression(object):
         
         result = stack[0]
         
-        # 处理标量
+        # Handle scalar results
         if np.isscalar(result) or result.ndim == 0:
-            result = np.full(X.shape[0], result)
+            result = np.full(X.shape[:-1], result)
+            result = result[valid_mask] if valid_mask is not None else result
         
-        # 应用输出函数
+        # Apply output function
         if self.out_func is not None:
             result = self.out_func(result)
         
         return result
 
-    def fitness(self, X: np.ndarray, y: np.ndarray, 
-                constants: np.ndarray = None) -> np.float32:
-        """Evaluate the raw fitness of the expression according to X, y."""
-        if constants is None:
-            y_pred = self._execute_postorder(X)
+    def execute(self, X: np.ndarray, valid_mask: Optional[np.ndarray] = None, 
+                constants: Optional[np.ndarray] = None) -> np.ndarray:
+        """
+        Execute the expression on input data.
+
+        Automatically selects the appropriate execution strategy based on
+        whether masking or optimized constants are needed.
+
+        Parameters
+        ----------
+        X : ndarray
+            Input features.
+        valid_mask : ndarray, optional
+            Boolean mask for valid samples.
+        constants : ndarray, optional
+            Pre-computed constant values.
+
+        Returns
+        -------
+        ndarray
+            Expression output.
+        """
+        if constants is None and valid_mask is None:
+            result = self._execute_tree(X)
         else:
-            y_pred = self._execute_postorder(X, constants)
-        raw_fitness = self.metric(y, y_pred)
+            result = self._execute_postorder(X, valid_mask, constants)
+        
+        return result
+
+    def fitness(self, X: np.ndarray, y: np.ndarray, 
+               sample_weight: Optional[np.ndarray] = None,
+               constants: Optional[np.ndarray] = None) -> np.float32:
+        """
+        Evaluate the fitness of the expression on given data.
+
+        Parameters
+        ----------
+        X : ndarray
+            Input features.
+        y : ndarray
+            Target values.
+        sample_weight : ndarray, optional
+            Sample weights for weighted evaluation.
+        constants : ndarray, optional
+            Pre-computed constant values.
+
+        Returns
+        -------
+        np.float32
+            Fitness value (higher is better if metric.greater_is_better).
+        """
+        raw_fitness = self.metric(self, X, y, constants=constants,
+                                  sample_weight=sample_weight)
+
         return np.float32(raw_fitness)
-
-    # ============ JAX梯度计算（仅用于常量优化） ============
-    def _tree_to_jax_executable(self):
-        """
-        将基因列表转换为JAX可执行版本（仅在需要梯度时调用）
-        关键优化：使用静态结构避免动态循环
-        """
-        genes = []
-        for node in PostOrderIter(self.tree):
-            if node.degree > 0:
-                genes.append(_operator_jax_map[node.name])
-            elif isinstance(node.node_content, DynamicAggregation):
-                genes.append(
-                    DynamicAggregation_jax(
-                        v_start=node.node_content.v_start, 
-                        v_end=node.node_content.v_end, 
-                        op_name=node.node_content.op_name, 
-                        n_variables=node.node_content.n_variables,
-                        valid_op=node.node_content.valid_op
-                    )
-                )
-            else:
-                genes.append(node.node_content)
-        return genes
-
-    def _build_jax_executable(self):
-        """
-        构建JAX可执行版本（仅在需要梯度时调用）
-        关键优化：使用静态结构避免动态循环
-        """
-        genes = self._tree_to_jax_executable()
-        
-        out_func = self.out_func
-        out_func = _operator_jax_map[out_func.name] if out_func is not None else None
-        
-        # 提取常量索引映射
-        constant_indices = self.constant_indices
-        const_idx_map = {idx: i for i, idx in enumerate(constant_indices)}
-        
-        def _execute_with_constants(X_jax: jnp.ndarray, constants: jnp.ndarray):
-            """JAX执行函数（可微分）"""
-            stack = []
-            
-            for i, gene in enumerate(genes):
-                if gene.degree == 0:
-                    if i in const_idx_map:
-                        # 使用可优化的常量
-                        stack.append(constants[const_idx_map[i]])
-                    else:
-                        # Variable或DynamicAggregation
-                        stack.append(gene(X_jax))
-                else:
-                    # Operator
-                    operands = [stack.pop() for _ in range(gene.degree)]
-                    operands.reverse()
-                    result = gene(*operands)
-                    stack.append(result)
-            
-            result = stack[0]
-            
-            # 处理标量
-            if result.ndim == 0:
-                result = jnp.full(X_jax.shape[0], result)
-            
-            # 应用输出函数
-            if out_func is not None:
-                result = out_func(result)
-            
-            return result
-        
-        return _execute_with_constants
-    
-    def _get_gradient_function(self):
-        """懒编译梯度函数"""
-        if self._grad_fn_compiled is None:
-            executable = self._build_jax_executable()
-            metric = _fitness_jax_map[self.metric.name]
-            
-            def loss_fn(constants, X_jax, y_jax):
-                """损失函数（用于计算梯度）"""
-                y_pred = executable(X_jax, constants)
-                loss = metric(y_jax, y_pred)
-                # 如果是最大化指标，取负数
-                if metric.greater_is_better:
-                    loss = -loss
-                return loss
-            
-            # JIT编译梯度函数
-            self._grad_fn_compiled = jax.jit(jax.grad(loss_fn, argnums=0))
-        
-        return self._grad_fn_compiled
-    
-    def compute_constant_gradient(self, X: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.float32]:
-        """
-        计算常量的梯度（使用JAX）
-        返回：(梯度数组, 当前损失值)
-        """
-        if not (len(self.constant_indices) > 0):
-            return None, None
-        
-        # 转换为JAX数组
-        X_jax = jnp.array(X)
-        y_jax = jnp.array(y)
-        
-        # 提取当前常量值
-        current_constants = jnp.array([
-            node.node_content.value for node in PostOrderIter(self.tree) 
-                if isinstance(node.node_content, Constant)
-        ])
-        
-        # 计算梯度
-        grad_fn = self._get_gradient_function()
-        gradients = grad_fn(current_constants, X_jax, y_jax)
-        
-        # 计算当前损失
-        executable = self._build_jax_executable()
-        y_pred = executable(X_jax, current_constants)
-        loss = self.metric(y_jax, y_pred)
-        if self.metric.greater_is_better:
-            loss = -loss
-        
-        return np.array(gradients), loss
     
     def update_constants(self, new_values: np.ndarray):
-        """更新常量值"""
+        """
+        Update constant values in the expression tree.
+
+        Parameters
+        ----------
+        new_values : ndarray
+            New values for constants in post-order traversal order.
+
+        Returns
+        -------
+        Expression
+            Self (modified in place).
+        """
         if len(new_values) != len(self.constant_indices):
             raise ValueError(f"Expected {len(self.constant_indices)} values, got {len(new_values)}")
         
-        new_expr = self.copy()
         constant_counter = 0
-        for i, node in enumerate(PostOrderIter(new_expr.tree)):
+        for i, node in enumerate(PostOrderIter(self.tree)):
             if isinstance(node.node_content, Constant):
                 node.node_content = Constant(new_values[constant_counter])
                 constant_counter += 1
         
-        return new_expr
+        return self
 
     def simplify(self, constants_tolerance: float = 1e-5) -> 'Expression':
         """
-        简化表达式：应用代数规则简化表达式
-        
-        简化规则包括：
-        1. 常量折叠：计算常量表达式
-        2. 恒等式：x + 0 = x, x * 1 = x, x / 1 = x
-        3. 零元素：x * 0 = 0, 0 / x = 0
-        4. 代数化简：x - x = 0, x / x = 1, -(-x) = x
-        5. 分配律和结合律的应用
-        
-        Args:
-            constants_tolerance: 判断常量是否接近0或1的容差
-            
-        Returns:
-            Expression: 简化后的新表达式
+        Simplify the expression by applying algebraic rewrite rules.
+
+        Simplification Rules
+        --------------------
+        1. Constant folding: Evaluate constant expressions (e.g., 2 + 3 -> 5)
+        2. Identity laws: x + 0 -> x, x * 1 -> x, x / 1 -> x
+        3. Zero laws: x * 0 -> 0, 0 / x -> 0
+        4. Algebraic absorption: x - x -> 0, x / x -> 1
+        5. Double negation: -(-x) -> x
+        6. Distribution and association where applicable
+
+        Parameters
+        ----------
+        constants_tolerance : float, default=1e-5
+            Tolerance for considering constants as zero or one.
+
+        Returns
+        -------
+        Expression
+            Simplified expression (new object).
         """
         new_expr = self.copy()
         
-        # 多次迭代简化，直到不再有变化
+        # Iterate simplification until no further changes
         max_iterations = 10
         for iteration in range(max_iterations):
             original_tree = clone_tree(new_expr.tree)
             new_expr.tree = self._recursive_simplify(new_expr.tree, constants_tolerance)
             
-            # 如果树没有变化，说明已经简化完成
+            # If tree unchanged, simplification is complete
             if Expression._trees_are_equal(original_tree, new_expr.tree):
                 break
         
@@ -454,49 +792,57 @@ class Expression(object):
 
     def _recursive_simplify(self, node: SymbolicNode, tolerance: float) -> SymbolicNode:
         """
-        递归简化函数，支持多种代数简化规则
-        
-        Args:
-            node: 要简化的节点
-            tolerance: 判断常量是否接近0或1的容差
-            
-        Returns:
-            SymbolicNode: 简化后的节点
+        Recursively simplify a symbolic tree node.
+
+        Applies algebraic simplification rules in post-order:
+        first simplifies children, then applies node-level rules.
+
+        Parameters
+        ----------
+        node : SymbolicNode
+            Node to simplify.
+        tolerance : float
+            Tolerance for considering constants as zero or one.
+
+        Returns
+        -------
+        SymbolicNode
+            Simplified node (may be a new node or the original).
         """
-        # --- Base Case: 叶子节点 ---
+        # Base Case: Leaf node
         if node.is_leaf:
             if isinstance(node.node_content, Constant):
                 value = node.node_content.value
-                # 接近0的值归零
+                # Values near zero become zero
                 if abs(value) < tolerance:
                     return SymbolicNode(node_content=Constant(0.0))
-                # 接近1的值归一
+                # Values near one become one
                 if abs(value - 1.0) < tolerance:
                     return SymbolicNode(node_content=Constant(1.0))
             return node
 
-        # --- Recursive Step: 先简化所有子节点 ---
+        # Recursive Step: Simplify all children first
         node.children = [self._recursive_simplify(child, tolerance) for child in node.children]
 
         op_name = node.node_content.name
         children = node.children
 
-        # --- 常量折叠 ---
+        # Constant folding: all children are constants
         if all(isinstance(child.node_content, Constant) for child in children):
             try:
                 child_values = [child.node_content.value for child in children]
                 new_value = node.node_content(*child_values)
                 return SymbolicNode(node_content=Constant(new_value))
             except Exception:
-                # 如果计算失败（如除以0），保持原样
+                # If computation fails (e.g., division by zero), keep as-is
                 pass
 
-        # --- 二元运算符简化规则 ---
+        # Binary operator simplification rules
         if node.degree == 2:
             left, right = children[0], children[1]
             left_op, right_op = left.node_content, right.node_content
 
-            # 加法规则
+            # Addition rules
             if op_name == 'add' or op_name == '+':
                 # x + 0 = x, 0 + x = x
                 if isinstance(right_op, Constant) and abs(right_op.value) < tolerance:
@@ -512,7 +858,7 @@ class Expression(object):
                             new_node.children = [left, right.children[0]]
                             return new_node
 
-            # 减法规则
+            # Subtraction rules
             elif op_name == 'sub' or op_name == '-':
                 # x - 0 = x
                 if isinstance(right_op, Constant) and abs(right_op.value) < tolerance:
@@ -536,7 +882,7 @@ class Expression(object):
                             new_node.children = [left, right.children[0]]
                             return new_node
 
-            # 乘法规则
+            # Multiplication rules
             elif op_name == 'mul' or op_name == '*':
                 # x * 1 = x, 1 * x = x
                 if isinstance(right_op, Constant) and abs(right_op.value - 1.0) < tolerance:
@@ -570,7 +916,7 @@ class Expression(object):
                     if Expression._trees_are_equal(right, left.children[1]):
                         return left.children[0]
 
-            # 除法规则
+            # Division rules
             elif op_name == 'div' or op_name == '/':
                 # x / 1 = x
                 if isinstance(right_op, Constant) and abs(right_op.value - 1.0) < tolerance:
@@ -578,7 +924,7 @@ class Expression(object):
                 # 0 / x = 0 (x != 0)
                 if isinstance(left_op, Constant) and abs(left_op.value) < tolerance:
                     return SymbolicNode(node_content=Constant(0.0))
-                # x / 0 = 1 (保护性处理)
+                # x / 0 = 1 (protective handling)
                 if isinstance(right_op, Constant) and abs(right_op.value) < tolerance:
                     return SymbolicNode(node_content=Constant(1.0))
                 # x / x = 1
@@ -604,7 +950,7 @@ class Expression(object):
                             new_node.children = [one_node, right.children[0]]
                             return new_node
 
-            # 加法的代数简化
+            # Algebraic addition simplification
             if op_name in ('add', '+'):
                 # x + (y - x) = y
                 if isinstance(right_op, Operator) and right_op.name in ('sub', '-'):
@@ -615,7 +961,7 @@ class Expression(object):
                     if Expression._trees_are_equal(right, left.children[1]):
                         return left.children[0]
 
-        # --- 一元运算符简化规则 ---
+        # Unary operator simplification rules
         if node.degree == 1:
             child = children[0]
             child_op = child.node_content
@@ -625,7 +971,7 @@ class Expression(object):
                 if isinstance(child_op, Operator) and child_op.name in ('neg', '-'):
                     if child_op.degree == 1:
                         return child.children[0]
-                # -(c) = -c (常量折叠)
+                # -(c) = -c (constant folding)
                 if isinstance(child_op, Constant):
                     return SymbolicNode(node_content=Constant(-child_op.value))
 
@@ -633,19 +979,20 @@ class Expression(object):
 
     def _get_operator_by_name(self, op_name: str) -> Optional[Operator]:
         """
-        根据名称获取操作符
-        
-        Args:
-            op_name: 操作符名称
-            
-        Returns:
-            Operator: 找到的操作符，如果不存在则返回 None
+        Retrieve an operator by its name.
+
+        Parameters
+        ----------
+        op_name : str
+            Name of the operator to find.
+
+        Returns
+        -------
+        Operator or None
+            The operator if found, None otherwise.
         """
-        # 需要从 Expression 对象中获取可用的操作符列表
-        # 这里假设有一个 operators 属性或类似的结构
-        # 如果没有，需要根据实际情况调整
+        # Requires access to the operators list
         if not hasattr(self, 'operators'):
-            # 如果没有 operators 属性，返回 None
             return None
         
         for op in self.operators:
@@ -656,12 +1003,76 @@ class Expression(object):
 
 
 class ExpressionSet(object):
+    """
+    A collection of Expression objects representing a multi-output symbolic model.
+
+    ExpressionSet is used for multi-output tasks such as multi-class classification
+    where each expression in the set corresponds to one output. The set evolves
+    as a single individual in the genetic programming framework, meaning that
+    crossover and mutation operations affect the entire set together.
+
+    The set maintains a fixed capacity (length) but individual expressions can be
+    None (placeholder) when the actual number of outputs is less than the capacity.
+
+    Parameters
+    ----------
+    expressions : list of Expression or None
+        List of Expression objects. The length determines the set's capacity.
+        Individual entries can be None to represent unused output slots.
+    out_func : Operator, optional
+        Output transformation applied to the combined output of all expressions.
+        For classification, this is typically softmax to produce probability estimates.
+    metric : Fitness, optional
+        The fitness function used to evaluate the entire expression set.
+
+    Attributes
+    ----------
+    expressions : list
+        The list of Expression objects (including None placeholders).
+    out_func : Operator or None
+        Output transformation function.
+    metric : Fitness
+        Fitness evaluation function.
+
+    Properties
+    ----------
+    size : int
+        Total number of nodes across all expressions in the set.
+    complexity : float
+        Sum of complexities of all non-None expressions.
+    order : int
+        Number of non-None expressions in the set.
+
+    Examples
+    --------
+    >>> # Create a 3-class classifier expression set
+    >>> expr1 = Expression(tree=tree1, ...)
+    >>> expr2 = Expression(tree=tree2, ...)
+    >>> expr3 = Expression(tree=tree3, ...)
+    >>> expr_set = ExpressionSet([expr1, expr2, expr3], out_func=softmax)
+    >>> # Evaluate all expressions on input data
+    >>> scores = expr_set.execute(X)  # Returns (n_samples, 3) array
+    >>> # Apply softmax to get probabilities
+    >>> probabilities = softmax(scores)
+
+    Notes
+    -----
+    ExpressionSet is particularly designed for:
+    - Multi-class classification (each expression computes a discriminant function)
+    - Multi-output regression
+    - Any problem requiring multiple symbolic expressions that evolve together
+
+    The genetic operators (mutation, crossover) defined in ExpressionSetGP operate
+    on the set level, allowing expressions to be added, deleted, swapped, or
+    mutated as a coordinated group.
+    """
+
     def __init__(self, 
                  expressions: List[Optional['Expression']], 
-                 out_func: Operator | None = None, 
-                 metric: Fitness | None = None):
-        self.out_func = out_func
+                 out_func: Optional[Operator] = None, 
+                 metric: Optional[Fitness] = None):
         self.metric = metric
+        self.out_func = out_func
         
         if not all(isinstance(expr, (type(None), Expression)) for expr in expressions):
             raise ValueError("All items in expressions must be Expression objects.")
@@ -670,12 +1081,6 @@ class ExpressionSet(object):
         
         # 预分析常量信息
         self._constant_info = None
-        
-        # 懒编译梯度函数
-        self._grad_fn_compiled = None
-        
-        # 预计算的执行计划（缓存）
-        self._execution_plan = None
 
     def __len__(self) -> int:
         return len(self.expressions)
@@ -695,101 +1100,240 @@ class ExpressionSet(object):
         return sum(expr.size for expr in self if expr is not None)
 
     @property
+    def complexity(self) -> float:
+        """
+        Total complexity of the expression set.
+
+        Returns the sum of complexities for all non-None expressions.
+        """
+        total = sum(expr.complexity for expr in self.expressions if expr is not None)
+        return round(total)
+
+    @property
     def order(self) -> int:
+        """
+        Number of non-None expressions in the set.
+        """
         return sum(1 if expr is not None else 0 for expr in self.expressions)
+
+    def is_valid(self, max_complexity: Optional[float] = None) -> bool:
+        """
+        Check whether the expression set is valid.
+
+        Parameters
+        ----------
+        max_complexity : float, optional
+            Maximum allowed complexity for individual expressions.
+
+        Returns
+        -------
+        bool
+            True if all expressions are valid.
+        """
+        
+        # Check each expression
+        for expr in self.expressions:
+            if expr is not None:
+                if not expr.is_valid(max_complexity):
+                    return False
+        
+        return True
+
+    def _check_constraints(self) -> bool:
+        """
+        Check whether all expressions in the set satisfy their constraints.
+
+        Returns
+        -------
+        bool
+            True if all constraints are satisfied by all expressions.
+        """
+        # Check operator argument complexity constraints
+        if not all(
+            expr._check_operator_constraints() for expr in self.expressions if expr is not None
+        ):
+            return False
+        
+        # Check nested operator depth constraints
+        if not all(
+            expr._check_nested_constraints() for expr in self.expressions if expr is not None
+        ):
+            return False
+        
+        return True
 
     def copy(self) -> 'ExpressionSet':
         return ExpressionSet(
             [expr.copy() if expr is not None else None for expr in self.expressions], 
-            out_func=self.out_func, 
-            metric=self.metric
+            out_func=self.out_func, metric=self.metric
         )
+    
+    @property
+    def constants(self) -> np.ndarray:
+        const_info = self._build_constant_info()
+        if const_info['total_constants'] == 0:
+            return np.array([])
+        current_constants = np.array([
+            node.node_content.value 
+            for expr_idx, node in const_info['flat_nodes']
+        ])
+        return current_constants
 
-    # ============ NumPy快速执行 ============
-    def execute(self, X: np.ndarray) -> np.ndarray:
-        """NumPy快速执行路径（不带常量参数）"""
-        outputs = [expr.execute(X).reshape(-1, 1) for expr in self.expressions if expr is not None]
-        if not outputs:
-            return np.array([]).reshape(X.shape[0], 0)
-
-        result = np.hstack(outputs)
-        return result if self.out_func is None else self.out_func(result)
-
-    def _execute_postorder(self, X: np.ndarray, constants: np.ndarray = None) -> np.ndarray:
+    def _execute_tree(self, X: np.ndarray) -> np.ndarray:
         """
-        使用后序遍历执行表达式集合（支持传入常量数组）
-        参考Expression._execute_postorder的实现
+        Fast NumPy execution path (without constant parameters).
+        Optimized for memory efficiency and 3D input support.
         """
-        if constants is None:
-            return self.execute(X)
+        # 1. Determine input shape and number of samples
+        if X.ndim == 3:
+            n_samples = X.shape[0] * X.shape[1]
+            spatial_shape = (X.shape[0], X.shape[1])
+        else:
+            n_samples = X.shape[0]
+            spatial_shape = None
         
-        # 构建常量信息（如果未缓存）
+        # 2. Identify valid expressions (filter out None)
+        valid_indices = [i for i, expr in enumerate(self.expressions) if expr is not None]
+        n_valid = len(valid_indices)
+        
+        # 3. Handle empty case
+        if n_valid == 0:
+            if spatial_shape:
+                return np.empty((*spatial_shape, 0), dtype=float)
+            return np.empty((n_samples, 0), dtype=float)
+        
+        # 4. Pre-allocate output buffer for efficiency
+        # Using float dtype to accommodate potential continuous values
+        output_buffer = np.empty((n_samples, n_valid), dtype=float)
+        
+        # 5. Execute each expression and fill the buffer column-wise
+        for col_idx, expr_idx in enumerate(valid_indices):
+            expr = self.expressions[expr_idx]
+            # Execute and flatten result directly into the buffer column
+            output_buffer[:, col_idx] = expr._execute_tree(X).ravel()
+        
+        # 6. Apply output transformation function if defined
+        if self.out_func is not None:
+            output_buffer = self.out_func(output_buffer)
+        
+        # 7. Restore spatial dimensions if input was 3D
+        if spatial_shape:
+            output_buffer = output_buffer.reshape(*spatial_shape, n_valid)
+        
+        return output_buffer
+
+    def _execute_postorder(self, X: np.ndarray, valid_mask: Optional[np.ndarray] = None, 
+                           constants: Optional[np.ndarray] = None) -> np.ndarray:
+        """
+        Execute expression set using post-order traversal (supports constant arrays).
+        Optimized for memory efficiency and 3D input support.
+        
+        Note: If valid_mask is provided, the output will be 2D (n_valid_samples, n_expressions),
+        regardless of whether X is 3D.
+        """
+        # 1. Determine input shape and number of samples
+        # Priority: valid_mask > X.ndim
+        if valid_mask is not None:
+            # If mask is provided, output is a list of valid points (2D)
+            n_samples = int(np.sum(valid_mask))
+            spatial_shape = None
+        elif X.ndim == 3:
+            # No mask, 3D input -> treat as spatial grid
+            n_samples = X.shape[0] * X.shape[1]
+            spatial_shape = (X.shape[0], X.shape[1])
+        else:
+            # No mask, 2D input
+            n_samples = X.shape[0]
+            spatial_shape = None
+        
+        # 2. Build constant information (cached internally if available)
         const_info = self._build_constant_info()
         
-        # 执行每个表达式
-        outputs = []
-        for expr_idx, expr in enumerate(self.expressions):
-            if expr is None:
-                continue
+        # 3. Identify valid expressions (filter out None)
+        valid_indices = [i for i, expr in enumerate(self.expressions) if expr is not None]
+        n_valid = len(valid_indices)
+        
+        # 4. Handle empty case
+        if n_valid == 0:
+            if spatial_shape:
+                return np.empty((*spatial_shape, 0), dtype=float)
+            return np.empty((n_samples, 0), dtype=float)
+        
+        # 5. Pre-allocate output buffer for efficiency
+        # Shape is always (n_samples, n_valid). 
+        # If mask is used, n_samples is count of True.
+        output_buffer = np.empty((n_samples, n_valid), dtype=float)
+        
+        # 6. Execute each expression and fill the buffer column-wise
+        for col_idx, expr_idx in enumerate(valid_indices):
+            expr = self.expressions[expr_idx]
             
-            # 获取该表达式的常量范围
+            # Get constant range for this specific expression index
             const_range = const_info['ranges'][expr_idx]
             
-            if const_range is None:
-                # 该表达式没有常量，直接执行
-                result = expr.execute(X)
-            else:
-                # 提取该表达式的常量
+            # Determine execution strategy
+            if const_range is not None and constants is not None:
                 expr_constants = constants[const_range[0]:const_range[1]]
-                # 使用表达式的后序执行方法
-                result = expr._execute_postorder(X, expr_constants)
+                result = expr._execute_postorder(X, valid_mask, expr_constants)
+            else:
+                # Even if no constants, use postorder to support mask
+                result = expr._execute_postorder(X, valid_mask, None)
             
-            outputs.append(result.reshape(-1, 1))
+            # Flatten and assign to buffer column
+            # If masked, result is already 1D (n_valid_samples).
+            # If not masked and 3D, result might be 2D/3D, ravel makes it 1D (n_total_samples).
+            output_buffer[:, col_idx] = result.ravel()
         
-        if not outputs:
-            return np.array([]).reshape(X.shape[0], 0)
+        # 7. Apply output transformation function if defined
+        if self.out_func is not None:
+            output_buffer = self.out_func(output_buffer)
         
-        result = np.hstack(outputs)
-        return result if self.out_func is None else self.out_func(result)
+        # 8. Restore spatial dimensions ONLY if input was 3D AND no mask was used
+        # If valid_mask was used, spatial structure is broken, output remains 2D.
+        if spatial_shape:
+            output_buffer = output_buffer.reshape(*spatial_shape, n_valid)
+        
+        return output_buffer
 
-    def fitness(self, X: np.ndarray, y: np.ndarray, 
-                constants: np.ndarray = None) -> np.float32:
-        """
-        评估表达式集合的适应度
-        
-        参数:
-            X: 输入数据
-            y: 目标数据
-            constants: 可选的常量数组，如果提供则替换表达式中的常量
-        """
-        if constants is None:
-            y_pred = self.execute(X)
+    def execute(self, X: np.ndarray, valid_mask: Optional[np.ndarray] = None, 
+                constants: Optional[np.ndarray] = None) -> np.ndarray:
+        """Execute the expression according to X."""
+        if constants is None and valid_mask is None:
+            result = self._execute_tree(X)
         else:
-            y_pred = self._execute_postorder(X, constants)
+            result = self._execute_postorder(X, valid_mask, constants)
         
-        if y is None:
-            raw_fitness = self.metric(X, y_pred)
-        else:
-            raw_fitness = self.metric(y, y_pred)
+        return result
+
+    def fitness(self, X: np.ndarray, y: np.ndarray,
+                sample_weight: Optional[np.ndarray] = None, 
+                constants: Optional[np.ndarray] = None) -> np.float32:
+        """Evaluate the raw fitness of the expressionset according to X, y."""
+        raw_fitness = self.metric(self, X, y, constants=constants,
+                                  sample_weight=sample_weight)
         
         return np.float32(raw_fitness)
 
-    # ============ 常量信息预处理 ============
     def _build_constant_info(self):
         """
-        预计算常量信息，扁平化所有表达式的常量索引
-        返回：
-            {
-                'flat_indices': [(expr_idx, node), ...],  # 所有常量的扁平列表
-                'ranges': [(start, end), ...],            # 每个表达式的常量范围
-                'total_constants': int                    # 总常量数
-            }
+        Pre-compute and cache constant information across all expressions.
+
+        Flattens constant nodes from all expressions into a single list with
+        their ranges for efficient batch constant optimization.
+
+        Returns
+        -------
+        dict
+            Dictionary containing:
+            - 'flat_nodes': List of (expr_idx, node) tuples for all constants
+            - 'ranges': List of (start, end) tuples for each expression's constants
+            - 'total_constants': Total number of constants across all expressions
         """
         if self._constant_info is not None:
             return self._constant_info
         
-        flat_constant_nodes = []  # 存储 (expr_idx, node)
-        expr_constant_ranges = []  # 存储每个表达式的常量范围
+        flat_constant_nodes = []  # Store (expr_idx, node)
+        expr_constant_ranges = []  # Store range for each expression
         
         global_const_idx = 0
         for expr_idx, expr in enumerate(self.expressions):
@@ -797,7 +1341,7 @@ class ExpressionSet(object):
                 expr_constant_ranges.append(None)
                 continue
             
-            # 收集该表达式的所有常量节点
+            # Collect all constant nodes from this expression
             expr_constants = []
             for node in PostOrderIter(expr.tree):
                 if isinstance(node.node_content, Constant):
@@ -808,7 +1352,7 @@ class ExpressionSet(object):
                 end_idx = global_const_idx + len(expr_constants)
                 expr_constant_ranges.append((start_idx, end_idx))
                 
-                # 记录每个常量节点
+                # Record each constant node
                 for node in expr_constants:
                     flat_constant_nodes.append((expr_idx, node))
                 
@@ -823,211 +1367,6 @@ class ExpressionSet(object):
         }
         
         return self._constant_info
-
-    # ============ JAX梯度计算 ============
-    def _build_execution_plan(self):
-        """
-        构建静态执行计划
-        为每个表达式预处理指令序列
-        """
-        if self._execution_plan is not None:
-            return self._execution_plan
-        
-        const_info = self._build_constant_info()
-        
-        # 为每个表达式构建指令序列
-        expr_plans = []
-        for expr_idx, expr in enumerate(self.expressions):
-            if expr is None:
-                expr_plans.append(None)
-                continue
-            
-            # 转换为JAX可执行的基因列表
-            genes_jax = self._expr_to_jax_genes(expr)
-            const_range = const_info['ranges'][expr_idx]
-            
-            # 构建指令序列
-            instructions = []
-            local_const_idx = 0
-            
-            for gene_idx, gene in enumerate(genes_jax):
-                if gene.degree == 0:
-                    # 检查是否是常量
-                    if const_range is not None:
-                        # 需要检查该位置是否对应常量节点
-                        nodes = list(PostOrderIter(expr.tree))
-                        if isinstance(nodes[gene_idx].node_content, Constant):
-                            # 记录在全局常量数组中的位置
-                            global_const_idx = const_range[0] + local_const_idx
-                            instructions.append(('const', global_const_idx))
-                            local_const_idx += 1
-                        else:
-                            # 变量或聚合
-                            instructions.append(('term', gene))
-                    else:
-                        # 该表达式没有常量
-                        instructions.append(('term', gene))
-                else:
-                    # 操作符
-                    instructions.append(('op', gene))
-            
-            expr_plans.append({
-                'instructions': tuple(instructions),
-                'genes': genes_jax
-            })
-        
-        # 转换输出函数
-        out_func_jax = None
-        if self.out_func is not None:
-            out_func_jax = _operator_jax_map[self.out_func.name]
-        
-        self._execution_plan = {
-            'expr_plans': expr_plans,
-            'out_func': out_func_jax,
-            'const_info': const_info
-        }
-        
-        return self._execution_plan
-
-    def _expr_to_jax_genes(self, expr):
-        """
-        将表达式转换为JAX可执行的基因列表
-        参考Expression._tree_to_jax_executable
-        """
-        genes = []
-        for node in PostOrderIter(expr.tree):
-            if node.degree > 0:
-                # 操作符
-                genes.append(_operator_jax_map[node.name])
-            elif hasattr(node.node_content, 'op_name'):
-                # DynamicAggregation
-                genes.append(
-                    DynamicAggregation_jax(
-                        v_start=node.node_content.v_start,
-                        v_end=node.node_content.v_end,
-                        op_name=node.node_content.op_name,
-                        n_variables=node.node_content.n_variables,
-                        valid_op=getattr(node.node_content, 'valid_op', None)
-                    )
-                )
-            else:
-                # Variable 或 Constant
-                genes.append(node.node_content)
-        return genes
-
-    def _build_jax_executable(self):
-        """
-        构建优化的JAX可执行版本
-        """
-        plan = self._build_execution_plan()
-        expr_plans = plan['expr_plans']
-        out_func = plan['out_func']
-        
-        def _execute_single_expr(instructions, X_jax, constants):
-            """执行单个表达式（优化版）"""
-            stack = []
-            
-            for instr_type, instr_data in instructions:
-                if instr_type == 'const':
-                    # 直接从扁平常量数组中取值
-                    stack.append(constants[instr_data])
-                elif instr_type == 'term':
-                    # 变量或聚合
-                    stack.append(instr_data(X_jax))
-                elif instr_type == 'op':
-                    # 操作符
-                    gene = instr_data
-                    operands = [stack.pop() for _ in range(gene.degree)]
-                    operands.reverse()
-                    result = gene(*operands)
-                    stack.append(result)
-            
-            result = stack[0]
-            
-            # 处理标量
-            if result.ndim == 0:
-                result = jnp.full(X_jax.shape[0], result)
-            
-            return result
-        
-        def _execute_with_constants(X_jax, constants):
-            """执行整个表达式集合"""
-            results = []
-            
-            for expr_plan in expr_plans:
-                if expr_plan is None:
-                    continue
-                
-                result = _execute_single_expr(
-                    expr_plan['instructions'], 
-                    X_jax, 
-                    constants
-                )
-                results.append(result.reshape(-1, 1))
-            
-            if not results:
-                return jnp.array([]).reshape(X_jax.shape[0], 0)
-            
-            results = jnp.hstack(results)
-            
-            # 应用输出函数
-            if out_func is not None:
-                results = out_func(results)
-            
-            return results
-        
-        return _execute_with_constants
-
-    def _get_gradient_function(self):
-        """懒编译梯度函数"""
-        if self._grad_fn_compiled is None:
-            executable = self._build_jax_executable()
-            metric = _fitness_jax_map[self.metric.name]
-            
-            def loss_fn(constants, X_jax, y_jax):
-                y_pred = executable(X_jax, constants)
-                loss = metric(y_jax, y_pred)
-                if metric.greater_is_better:
-                    loss = -loss
-                return loss
-            
-            # JIT编译梯度函数
-            self._grad_fn_compiled = jax.jit(jax.grad(loss_fn, argnums=0))
-        
-        return self._grad_fn_compiled
-
-    def compute_constant_gradient(self, X: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.float32]:
-        """
-        计算常量的梯度（优化版）
-        返回：(梯度数组, 当前损失值)
-        """
-        const_info = self._build_constant_info()
-        
-        if const_info['total_constants'] == 0:
-            return None, None
-        
-        # 转换为JAX数组
-        X_jax = jnp.array(X)
-        y_jax = jnp.array(y)
-        
-        # 提取当前常量值（扁平化）
-        current_constants = jnp.array([
-            node.node_content.value 
-            for expr_idx, node in const_info['flat_nodes']
-        ])
-        
-        # 计算梯度
-        grad_fn = self._get_gradient_function()
-        gradients = grad_fn(current_constants, X_jax, y_jax)
-        
-        # 计算当前损失
-        executable = self._build_jax_executable()
-        y_pred = executable(X_jax, current_constants)
-        loss = self.metric(y_jax, y_pred)
-        if self.metric.greater_is_better:
-            loss = -loss
-        
-        return np.array(gradients), np.float32(loss)
 
     def update_constants(self, new_values: np.ndarray) -> 'ExpressionSet':
         const_info = self._build_constant_info()
@@ -1049,10 +1388,10 @@ class ExpressionSet(object):
                 expr_constants = new_values[const_range[0]:const_range[1]]
                 new_expressions.append(expr.update_constants(expr_constants))
             else:
-                new_expressions.append(expr.copy())
+                new_expressions.append(expr)
         
-        # 直接创建新对象（避免先copy再修改）
-        return ExpressionSet(new_expressions, self.out_func, self.metric)
+        self.expressions = new_expressions
+        return self
 
     def simplify(self, constants_tolerance: float = 1e-5) -> 'Expression':
         expressions = [None] * len(self.expressions)
@@ -1062,8 +1401,7 @@ class ExpressionSet(object):
                 expressions[i] = simplified_expr
         
         new_expr_set = ExpressionSet(
-            expressions,
-            out_func=self.out_func, metric=self.metric
+            expressions, out_func=self.out_func, metric=self.metric
         )
         
         return new_expr_set

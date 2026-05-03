@@ -1,78 +1,91 @@
 import re
+import warnings
 import pandas as pd
 from typing import List, Optional, Callable, Union
 
 
 from src.node import _operator_map, Variable, Constant, DynamicAggregation, Operator
 from src.expression import Expression, ExpressionSet
-from src.fitness import Fitness, _fitness_map
+from src.fitness import Fitness, _loss_function_map
 from src.tree import SymbolicNode
 
 
 class TreeParser:
-    """解析字符串表达式为SymbolicNode对象"""
-    
-    def __init__(self, 
-                 operators: List[str], 
+    """Parse string expressions into SymbolicNode objects.
+
+    This class provides functionality to parse mathematical expressions
+    represented as strings into a tree structure (SymbolicNode) that
+    can be executed within the genetic programming framework.
+
+    Parameters
+    ----------
+    operators : List[str]
+        List of available operators (e.g., '+', '*', 'tanh', 'softplus').
+    n_variables : int
+        Total number of features/variables in the dataset.
+    spectral_stats : List[str]
+        List of available dynamic aggregation functions (e.g., 'mean', 'max').
+    maxsize : Optional[int], default=None
+        Maximum number of nodes allowed in an expression. None means no limit.
+    variable_names : Optional[List[str]]
+        Custom names for variables. If None, defaults to 'x0', 'x1', ...
+    metric : Optional[Callable | str | Operator]
+        Fitness metric for expression evaluation.
+    out_func : Optional[Callable | str | Operator]
+        Output transformation function.
+    """
+
+    def __init__(self,
+                 operators: List[str],
                  n_variables: int,
-                 aggregation_operators: List[str],
+                 spectral_stats: List[str],
                  maxsize: Optional[int] = None,
                  variable_names: Optional[List[str]] = None,
                  metric: Optional[Callable | str | Operator] = None,
                  out_func: Optional[Callable | str | Operator] = None):
-        """
-        初始化解析器
-        
-        Parameters
-        ----------
-        operators : List[str]
-            可用的运算符列表 (例如 +, *, tanh, softplus)
-        n_variables : int
-            特征/变量的总数。
-        aggregation_operators : List[str]
-            可用的动态聚合函数列表 (e.g., 'mean', 'max')
-        maxsize : Optional[int], default=None
-            表达式允许的最大节点数。如果为 None，则不限制。
-        variable_names : Optional[List[str]]
-            变量的自定义名称列表。如果为 None，则默认为 'x0', 'x1', ...
-        """
+        """Initialize the TreeParser."""
+        self.maxsize = maxsize
         self.operators = operators
         self.n_variables = n_variables
-        self.aggregation_operators = aggregation_operators
-        self.maxsize = maxsize
-        self.metric = self._init_metric(metric)
+        self.spectral_stats = spectral_stats
         self.out_func = self._init_out_func(out_func)
+        self.metric = self._init_metric(metric) if metric else None
 
-        # 构建运算符查找字典
+        # Build operator lookup dictionary
         self._op_map = {op_name: _operator_map[op_name] for op_name in operators}
-        
-        # --- 构建变量 ---
+
+        # --- Build Variables ---
         self.variables = []
         if variable_names:
             if len(variable_names) != n_variables:
-                raise ValueError(f"variable_names 的长度 ({len(variable_names)}) 必须等于 n_variables ({n_variables})")
+                raise ValueError(
+                    f"Length of variable_names ({len(variable_names)}) must equal "
+                    f"n_variables ({n_variables})"
+                )
             self.variables = [Variable(i, name=name) for i, name in enumerate(variable_names)]
         else:
             self.variables = [Variable(i) for i in range(n_variables)]
-            
+
         self._var_map = {var.name: var for var in self.variables}
-        
-        # --- 动态构建聚合函数正则表达式 ---
-        if not aggregation_operators:
-            self._agg_pattern = re.compile(r'^\b\B') 
+
+        # --- Dynamically Build Aggregation Function Regex ---
+        if not spectral_stats:
+            self._agg_pattern = re.compile(r'^\b\B')
         else:
-            agg_ops_regex = '|'.join(re.escape(op) for op in aggregation_operators)
-            self._agg_pattern = re.compile(rf'({agg_ops_regex})\(v(\d+)-v(\d+)\)')
+            agg_ops_regex = '|'.join(re.escape(op) for op in spectral_stats)
+            self._agg_pattern = re.compile(rf'({agg_ops_regex})\(v(\d+)-(\d+)\)')
 
     def _init_metric(self, metric: Union[str, Fitness]):
         if isinstance(metric, Fitness):
             _metric = metric
         elif isinstance(metric, str):
-            if metric not in _fitness_map:
+            if metric not in _loss_function_map:
                 raise ValueError('Unsupported metric: %s' % metric)
-            _metric = _fitness_map[metric]
+            loss_func, greater_is_better = _loss_function_map[metric]
+            _metric = Fitness(loss_func, greater_is_better)
         else:
-            return None
+            raise ValueError('Invalid type %s found in `metric`.' % type(metric))
+        
         return _metric
 
     def _init_out_func(self, out_func: Optional[Union[str, Operator, callable]] = None):
@@ -87,55 +100,66 @@ class TreeParser:
         elif out_func is None:
             _out_func = out_func
         else:
-            return None
+            raise ValueError('Unsupported out_func: %s, ' % out_func,
+                             "out_func must be a Operator class, None or operator with degree 1. ")
         return _out_func
 
     def parse_expression_str(self, expr_str: str, part_of_set: bool = False) -> Expression:
-        """
-        解析单个表达式字符串为Expression对象
-        
+        """Parse a single expression string into an Expression object.
+
         Parameters
         ----------
         expr_str : str
-            表达式字符串，例如 "(x1 + x2)"
-            
+            Expression string, e.g., "(x1 + x2)" or "mul(add(x0, x1), x2)".
+
         Returns
         -------
         Expression
-        
+            The parsed Expression object.
+
         Raises
         ------
         ValueError
-            如果表达式无法解析，或者解析后的节点数超过 self.maxsize
+            If the expression cannot be parsed, or if the parsed tree exceeds maxsize.
         """
         expr_str = expr_str.strip()
         tree = self._parse_to_tree(expr_str)
-        
-        # --- 检查 maxsize ---
-        # tree.size 会触发 SymbolicNode 中缓存的计算
+
+        # --- Check maxsize ---
+        # tree.size triggers the cached computation in SymbolicNode
         if self.maxsize is not None and tree.size > self.maxsize:
             raise ValueError(
-                f"表达式 '{expr_str[:100]}...' 解析后的节点数 ({tree.size}) "
-                f"超过了 maxsize ({self.maxsize})"
+                f"Expression '{expr_str[:100]}...' parsed to {tree.size} nodes, "
+                f"which exceeds maxsize ({self.maxsize})"
             )
         if part_of_set:
             return Expression(tree)
-        
+
         return Expression(tree, metric=self.metric, out_func=self.out_func)
     
     def parse_expression_set_str(self, set_str: str) -> ExpressionSet:
-        """
-        解析ExpressionSet字符串为多个Expression对象
-        
-        如果
+        """Parse an ExpressionSet string into multiple Expression objects.
+
+        Splits the string by semicolons (respecting parentheses depth) and
+        parses each component expression. Empty or 'None' strings become None.
+
+        Parameters
+        ----------
+        set_str : str
+            ExpressionSet string, e.g., "[x0 + x1; x2 * x3; None]".
+
+        Returns
+        -------
+        ExpressionSet
+            The parsed ExpressionSet object containing individual Expressions.
         """
         set_str = set_str.strip()
-        
+
         if set_str.startswith('[') and set_str.endswith(']'):
             set_str = set_str[1:-1]
-        
+
         expr_strs = self._split_expressions(set_str)
-        
+
         expressions = []
         for expr_str in expr_strs:
             expr_str = expr_str.strip()
@@ -143,11 +167,25 @@ class TreeParser:
                 expressions.append(None)
             else:
                 expressions.append(self.parse_expression_str(expr_str, True))
-        
+
         return ExpressionSet(expressions, metric=self.metric, out_func=self.out_func)
     
     def _split_expressions(self, set_str: str) -> List[str]:
-        """分割ExpressionSet字符串中的各个表达式"""
+        """Split an ExpressionSet string into individual expression strings.
+
+        Splits by semicolons while respecting parentheses depth to avoid
+        breaking expressions that contain function calls.
+
+        Parameters
+        ----------
+        set_str : str
+            The concatenated expression string.
+
+        Returns
+        -------
+        List[str]
+            List of individual expression strings.
+        """
         expressions = []
         current = []
         depth = 0
@@ -171,7 +209,18 @@ class TreeParser:
         return expressions
     
     def _is_balanced_parentheses(self, s: str) -> bool:
-        """检查字符串中的括号是否平衡且匹配"""
+        """Check if parentheses in a string are balanced and properly nested.
+
+        Parameters
+        ----------
+        s : str
+            Input string to check.
+
+        Returns
+        -------
+        bool
+            True if all parentheses are properly balanced, False otherwise.
+        """
         depth = 0
         for char in s:
             if char == '(':
@@ -183,11 +232,30 @@ class TreeParser:
         return depth == 0
     
     def _parse_to_tree(self, expr_str: str) -> SymbolicNode:
-        """
-        将表达式字符串递归解析为树结构
+        """Recursively parse an expression string into a tree structure.
+
+        Handles three cases:
+        1. Leaf nodes: constants, variables, or aggregation operations
+        2. Prefix (function) notation: op(arg1, arg2, ...)
+        3. Infix (binary operator) notation: arg1 op arg2
+
+        Parameters
+        ----------
+        expr_str : str
+            The expression string to parse.
+
+        Returns
+        -------
+        SymbolicNode
+            The root node of the parsed expression tree.
+
+        Raises
+        ------
+        ValueError
+            If the expression cannot be parsed.
         """
         expr_str = expr_str.strip()
-        
+
         open_count = expr_str.count('(')
         close_count = expr_str.count(')')
         if open_count == close_count + 1:
@@ -195,56 +263,59 @@ class TreeParser:
         elif close_count == open_count + 1:
             expr_str = '(' + expr_str
 
-        while (expr_str.startswith('(') and 
-               expr_str.endswith(')') and 
+        while (expr_str.startswith('(') and
+               expr_str.endswith(')') and
                self._is_balanced_parentheses(expr_str[1:-1])):
             expr_str = expr_str[1:-1].strip()
 
-        # --- 步骤 1: 基本情况 (叶子节点) ---
-        
+        # --- Step 1: Base Case (Leaf Nodes) ---
+
+        # Try to parse as a numeric constant
         try:
             val = float(expr_str)
             return SymbolicNode(Constant(val))
         except ValueError:
-            pass 
+            pass
 
+        # Try to parse as a variable
         if expr_str in self._var_map:
             return SymbolicNode(self._var_map[expr_str])
 
+        # Try to parse as a spectral aggregation (e.g., mean(v1-v90))
         agg_match = self._agg_pattern.match(expr_str)
         if agg_match and agg_match.group(0) == expr_str:
             op_name = agg_match.group(1)
             v_start = int(agg_match.group(2)) - 1
             v_end = int(agg_match.group(3)) - 1
-            
-            content = DynamicAggregation(v_start, v_end, 
-                                         op_name, self.n_variables, 
-                                         valid_op=self.aggregation_operators)
+
+            content = DynamicAggregation(v_start=v_start, v_end=v_end,
+                                         stat_name_spectral=op_name,
+                                         n_variables=self.n_variables)
             return SymbolicNode(content)
 
-        # --- 步骤 2: 递归情况 (内部节点) ---
+        # --- Step 2: Recursive Case (Internal Nodes) ---
 
-        # 2a: 前缀函数
+        # 2a: Prefix function notation (e.g., sin(x), add(x, y))
         idx_paren = expr_str.find('(')
         if idx_paren != -1 and expr_str.endswith(')'):
             op_name = expr_str[:idx_paren]
-            
+
             if op_name in self._op_map:
                 op = self._op_map[op_name]
-                
+
                 args_str_outer = expr_str[idx_paren:]
-                if (args_str_outer.startswith('(') and 
-                    args_str_outer.endswith(')') and 
+                if (args_str_outer.startswith('(') and
+                    args_str_outer.endswith(')') and
                     self._is_balanced_parentheses(args_str_outer[1:-1])):
-                    
+
                     args_str_inner = args_str_outer[1:-1]
                     arg_list = self._split_args(args_str_inner)
-                    
+
                     if len(arg_list) == op.degree:
                         children = [self._parse_to_tree(arg) for arg in arg_list]
                         return SymbolicNode(node_content=op, children=children)
 
-        # 2b: 中缀函数
+        # 2b: Infix binary operator notation (e.g., x + y, x * y)
         inner_str = expr_str
         depth = 0
         
@@ -269,12 +340,25 @@ class TreeParser:
                             
                             return SymbolicNode(node_content=op, children=[left_child, right_child])
 
-        # --- 步骤 3: 失败 ---
-        raise ValueError(f"无法解析表达式: '{expr_str[:200]}...'")
+        # --- Step 3: Failure ---
+        raise ValueError(f"Cannot parse expression: '{expr_str[:200]}...'")
 
 
     def _split_args(self, args_str: str) -> List[str]:
-        """分割函数参数"""
+        """Split a function argument string into individual arguments.
+
+        Respects parentheses depth and comma separators at depth 0.
+
+        Parameters
+        ----------
+        args_str : str
+            The argument string to split.
+
+        Returns
+        -------
+        List[str]
+            List of individual argument strings.
+        """
         args = []
         current = []
         depth = 0
@@ -301,45 +385,45 @@ class TreeParser:
 
 def load_expressions_from_csv(
     csv_path: str,
-    operators: List[str], 
+    operators: List[str],
     n_variables: int,
     maxsize: Optional[int] = None,
-    aggregation_operators: List[str] = None,
+    spectral_stats: List[str] = None,
     variable_names: Optional[List[str]] = None,
     metric: Optional[Callable | str | Operator] = None,
     out_func: Optional[Callable | str | Operator] = None,
     expression_col: str = 'expression'
 ) -> pd.DataFrame:
-    """
-    从CSV文件加载表达式，并将字符串转换为Expression或ExpressionSet对象
-    
+    """Load expressions from a CSV file and parse them into Expression/ExpressionSet objects.
+
     Parameters
     ----------
     csv_path : str
-        CSV文件路径
+        Path to the CSV file containing expression strings.
     operators : List[Operator]
-        可用的运算符列表 (例如 +, *, tanh, softplus)
+        List of available operators (e.g., '+', '*', 'tanh', 'softplus').
     n_variables : int
-        特征/变量的总数。
-        这对于创建 DynamicAggregation (例如 min(v1-v90)) 
-        和变量 (例如 x99) 都至关重要。
+        Total number of features/variables.
+        Essential for creating DynamicAggregation nodes (e.g., min(v1-v90))
+        and variable references (e.g., x99).
     variable_names : Optional[List[str]], default=None
-        可用的变量名称列表。
+        List of available variable names.
     maxsize : Optional[int], default=None
-        表达式允许的最大节点数。如果为 None，则不限制。
-    aggregation_operators : List[str]
-        可用的动态聚合函数列表 (e.g., 'mean', 'max')
-    metric : Optional[Callable | str | Operator], default=None
-        可用的度量函数，可以是函数或字符串。
-    out_func : Optional[Callable | str | Operator], default=None
-        可用的输出函数，可以是函数或字符串。
+        Maximum number of nodes allowed per expression. None means unlimited.
+    spectral_stats : List[str]
+        List of available dynamic aggregation functions (e.g., 'mean', 'max').
+    metric : Fitness, default=None
+        Fitness metric for expression evaluation.
+    out_func : Operator, default=None
+        Output transformation function.
     expression_col : str
-        包含表达式字符串的列名，默认为'expression'
-    
+        Name of the column containing expression strings. Default is 'expression'.
+
     Returns
     -------
     pd.DataFrame
-        处理后的DataFrame，expression列包含Expression或ExpressionSet对象
+        Processed DataFrame where the expression column contains Expression
+        or ExpressionSet objects.
 
     Examples
     --------
@@ -348,39 +432,38 @@ def load_expressions_from_csv(
     >>> print(type(df.loc[0, 'expression']))
     <class 'ExpressionSet'>
     """
-    # 读取CSV
+    # Read CSV file
     df = pd.read_csv(csv_path)
-    
-    # 检查expression列是否存在
+
+    # Check if expression column exists
     if expression_col not in df.columns:
-        raise ValueError(f"列'{expression_col}'不存在于CSV文件中")
-    
-    # 创建解析器
+        raise ValueError(f"Column '{expression_col}' not found in CSV file")
+
+    # Create parser
     parser = TreeParser(
         maxsize=maxsize,
         operators=operators,
         n_variables=n_variables,
-        variable_names=variable_names, 
-        aggregation_operators=aggregation_operators,
-        **({'metric': metric} if metric is not None else {}),
-        **({'out_func': out_func} if out_func is not None else {})
+        variable_names=variable_names,
+        spectral_stats=spectral_stats,
+        metric=metric, out_func=out_func
     )
-    
-    # 解析每一行的表达式
+
+    # Parse each row's expression string
     def parse_row(expr_str):
         if pd.isna(expr_str):
             return None
-        
+
         expr_str = str(expr_str).strip()
-        
-        # 判断是ExpressionSet还是Expression
+
+        # Determine whether it's an ExpressionSet or single Expression
         if expr_str.startswith('[') and expr_str.endswith(']'):
             return parser.parse_expression_set_str(expr_str)
         else:
             return parser.parse_expression_str(expr_str)
-    
+
     df[expression_col] = df[expression_col].apply(parse_row)
-    
+
     return df
 
 

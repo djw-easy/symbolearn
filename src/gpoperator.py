@@ -1,19 +1,15 @@
-import jax
-import optax
 import warnings
 import numpy as np
-import jax.numpy as jnp
 from functools import lru_cache
 from scipy.optimize import minimize
-from typing import Union, Optional, List, Tuple, Iterator
+from typing import Union, Optional, List, Tuple
 
 
-from src.tree import PreOrderIter, PostOrderIter, SymbolicNode, clone_tree, RenderTree
-from src.node import Operator, Constant, Variable, NodeContent, DynamicAggregation
+from src.tree import PreOrderIter, PostOrderIter, SymbolicNode, clone_tree
+from src.node import Operator, Constant, Variable, DynamicAggregation
 from src.generator import ExprGenerator, ExprSetGenerator
 from src.expression import Expression, ExpressionSet
 from src.utils import check_random_state
-from src.fitness import _fitness_jax_map
 
 
 
@@ -23,11 +19,11 @@ METHODS_WITH_EPS = ['CG', 'BFGS', 'Newton-CG', 'L-BFGS-B', 'SLSQP']
 def weighted_random_choice_expr(weights_dict: dict, random_state: np.random.RandomState) -> str:
     random_state = check_random_state(random_state)
     
-    # 将字典转换为可哈希的元组用于缓存
+    # Convert the dictionary into a hashable tuple for caching.
     weights_tuple = tuple(sorted(weights_dict.items()))
     names, cumulative_probs = _get_cumulative_probs_expr(weights_tuple)
     
-    # 轮盘赌选择
+    # Perform roulette-wheel selection.
     random_value = random_state.uniform()
     idx = np.searchsorted(cumulative_probs, random_value, side='right')
     return names[idx]
@@ -38,14 +34,14 @@ def _get_cumulative_probs_expr(weights_tuple):
     names, weights = zip(*weights_tuple)
     weights_array = np.array(weights, dtype=np.float64)
     
-    # 归一化并计算累积概率
+    # Normalize the weights and compute cumulative probabilities.
     total_weight = weights_array.sum()
     if total_weight <= 0:
-        raise ValueError("总权重必须为正数")
+        raise ValueError("Total weight must be positive")
     
     probabilities = weights_array / total_weight
     cumulative_probs = np.cumsum(probabilities)
-    cumulative_probs[-1] = 1.0  # 修正浮点误差
+    cumulative_probs[-1] = 1.0  # Correct floating-point accumulation error.
     
     return names, cumulative_probs
 
@@ -54,12 +50,84 @@ def _get_cumulative_probs_expr(weights_tuple):
 
 class ExpressionGP:
     """
-    优化后的遗传编程类
-    
-    关键改进:
-    1. 移除不必要的get_node_by_index调用
-    2. 直接对复制后的树进行操作
-    3. 简化逻辑，提高效率
+    Genetic Programming operators for single-expression individuals.
+
+    ExpressionGP implements crossover and mutation operators that operate on
+    individual Expression trees. These operators are used by the Population class
+    to evolve expressions toward better fitness.
+
+    Mutation Operators
+    -----------------
+    The following mutation types are available, each with configurable probability:
+    - add_node: Insert a new subtree at a random location
+    - insert_node: Insert a new node between an existing node and its parent
+    - delete_node: Remove a subtree, replacing with a terminal
+    - mutate_constant: Perturb constant values by a random factor
+    - mutate_operator: Change one operator to another of the same arity
+    - mutate_aggregation: Change aggregation parameters
+    - swap_operands: Swap left/right children of a binary operator
+    - rotate_tree: Re-root the tree at a different node
+    - hoist_tree: Replace tree with a random subtree
+    - randomize_tree: Replace with an entirely new random tree
+    - simplify_tree: Apply algebraic simplification
+    - do_nothing_tree: No change (for weighted selection schemes)
+
+    Crossover Operators
+    -------------------
+    - subtree_crossover: Swap random subtrees between two parents
+
+    Parameters
+    ----------
+    generator : ExprGenerator
+        Factory for creating new random subtrees for mutation.
+    mutation_weights : dict, optional
+        Relative probability weights for each mutation type.
+        Format: {'mutation_type': weight}. Weights are normalized to sum to 1.
+    constants_tolerance : float, default=1e-5
+        Tolerance for constant comparisons and simplification.
+    perturbation_factor : float, default=0.129
+        Scale factor for constant perturbation. New = old * (1 ± factor * random).
+    probability_negate_constant : float, default=0.00743
+        Probability of negating a constant during mutation.
+    random_state : int or RandomState, optional
+        Random seed for reproducibility.
+
+    Methods
+    -------
+    mutation(parent)
+        Apply a random mutation to an expression.
+    crossover(parent1, parent2)
+        Create two offspring by swapping subtrees.
+
+    Examples
+    --------
+    >>> from src.gpoperator import ExpressionGP
+    >>> from src.generator import ExprGenerator
+    >>> gen = ExprGenerator(maxsize=21, operators=['add', 'sub', 'mul', 'div'], ...)
+    >>> gp = ExpressionGP(gen, mutation_weights={'add_node': 2.0, 'mutate_constant': 0.5, ...})
+    >>> # Mutate an expression
+    >>> mutated, success, op_name = gp.mutation(parent_expr)
+    >>> # Cross over two expressions
+    >>> child1, child2, success = gp.crossover(parent1, parent2)
+
+    Notes
+    -----
+    Mutation operators are selected using weighted random choice where the
+    weights determine relative probability. This allows different mutation
+    strategies to be explored by adjusting the weight distribution.
+
+    The crossover operator uses subtree crossover where a random node is
+    selected in each parent and the subtrees are swapped. This preserves
+    valid tree structure while combining genetic material.
+
+    All operators check constraint validity before returning. Invalid
+    offspring (e.g., violating maxsize) result in mutation_succeeded=False
+    or crossover_succeeded=False.
+
+    See Also
+    --------
+    ExpressionSetGP : Operators for multi-output ExpressionSet individuals.
+    Population : Uses these operators for evolution.
     """
     def __init__(self,
                  generator: ExprGenerator,
@@ -77,16 +145,16 @@ class ExpressionGP:
         self.probability_negate_constant = probability_negate_constant
 
     def _contains_forbidden_patterns(self, tree: SymbolicNode) -> bool:
-        """检查树是否包含禁止模式如 x-x, x/x, *0, /0"""
+        """Check whether the tree contains forbidden patterns such as x-x, x/x, *0, or /0."""
         for node in PreOrderIter(tree):
             if node.degree == 2:
                 left, right = node.children[0], node.children[1]
-                op_name = node.node_content.name
-                # 检查相同子树的减法或除法
-                if op_name in ['sub', 'div'] and Expression._trees_are_equal(left, right):
+                stat_name = node.node_content.name
+                # Check subtraction or division between identical subtrees.
+                if stat_name in ['sub', 'div'] and Expression._trees_are_equal(left, right):
                     return True
-                # 检查乘以0或除以0
-                if op_name in ['mul', 'div']:
+                # Check multiplication by zero or division by zero.
+                if stat_name in ['mul', 'div']:
                     for child in [left, right]:
                         if isinstance(child.node_content, Constant) and abs(child.node_content.value) < self.constants_tolerance:
                             return True
@@ -95,9 +163,10 @@ class ExpressionGP:
                     return True
                 if isinstance(node.node_content, Variable) and not self.generator.use_variables:
                     return True
-                if isinstance(node.node_content, DynamicAggregation) and not self.generator.use_aggregations:
+                if isinstance(node.node_content, DynamicAggregation) and not self.generator.use_aggregation:
                     return True
         return False
+
 
     def _get_random_operator(self, degree: Optional[int] = None, exclude: Operator = None):
         return self.generator._get_random_operator(degree, exclude)
@@ -111,10 +180,12 @@ class ExpressionGP:
     def get_subtree(self, tree: Optional[SymbolicNode], 
                     not_root: bool = False, not_leaf: bool = False):
         """
-        获取一个随机子树
+        Select a random subtree.
         
-        Returns:
-            node: 返回选中的节点（直接返回节点对象）
+        Returns
+        -------
+        SymbolicNode or None
+            The selected node itself, or None when no valid candidates exist.
         """
         nodes = []
         for node in PreOrderIter(tree):
@@ -132,7 +203,7 @@ class ExpressionGP:
 
     @staticmethod
     def _crossover(parent_subtree: SymbolicNode, donor_subtree: SymbolicNode):
-        """替换父节点的子节点"""
+        """Replace a child subtree under the parent node."""
         if parent_subtree.is_root:
             raise ValueError('Cannot crossover the root node.')
         
@@ -143,193 +214,136 @@ class ExpressionGP:
         parent_node.children = children_list
 
     def reproduce(self, parent: Expression) -> Expression:
-        """创建副本（深拷贝树）"""
+        """Create a deep-copied expression tree."""
         new_expr = Expression(
             tree=clone_tree(parent.tree), 
             metric=self.generator.metric, 
-            out_func=self.generator.out_func
+            ndigits=self.generator.ndigits,
+            out_func=self.generator.out_func,
+            constraints=self.generator.constraints,
+            nested_constraints=self.generator.nested_constraints
         )
         return new_expr
 
-    # def crossover(self, parent: Expression, donor: Expression) -> Tuple[Expression, Expression, bool]:
-    #     """
-    #     交叉操作：交换两个表达式的子树
-        
-    #     策略：
-    #     1. 检查两个父代是否相同
-    #     2. 检查大小约束（预估）
-    #     3. 复制两棵树
-    #     4. 直接在新树上选择交叉点
-    #     5. 交换子树
-        
-    #     Args:
-    #         parent: 父代表达式1
-    #         donor: 父代表达式2（供体）
-            
-    #     Returns:
-    #         (offspring1, offspring2, success): 两个后代表达式和成功标志
-    #     """
-    #     # 1. 提前检查：如果父代相同，直接返回失败
-    #     if parent == donor:
-    #         return None, None, False
-
-    #     # 2. 粗略检查大小约束（假设交叉最坏情况）
-    #     # 如果两棵树都已经很大，交叉可能失败
-    #     if parent.size >= self.maxsize or donor.size >= self.maxsize:
-    #         return None, None, False
-
-    #     # 3. 创建副本
-    #     offspring1 = self.reproduce(parent)
-    #     offspring2 = self.reproduce(donor)
-
-    #     # 4. 在新树上选择交叉点
-    #     point1 = self.get_subtree(offspring1.tree)
-    #     point2 = self.get_subtree(offspring2.tree)
-        
-    #     if point1 is None or point2 is None:
-    #         return None, None, False
-
-    #     # 5. 检查交叉后的大小约束
-    #     new_size1 = offspring1.size - point1.size + point2.size
-    #     new_size2 = offspring2.size - point2.size + point1.size
-        
-    #     if new_size1 > self.maxsize or new_size2 > self.maxsize:
-    #         return None, None, False
-
-    #     # 6. 执行交叉
-    #     # 克隆要交换的子树（避免引用问题）
-    #     point1_clone = clone_tree(point1)
-    #     point2_clone = clone_tree(point2)
-        
-    #     # 交换子树
-    #     if point1.is_root:
-    #         # 如果point1是根节点，直接替换整棵树
-    #         offspring1.tree = point2_clone
-    #     else:
-    #         # 否则在父节点中替换
-    #         parent1 = point1.parent
-    #         children_list1 = list(parent1.children)
-    #         replace_index1 = children_list1.index(point1)
-    #         children_list1[replace_index1] = point2_clone
-    #         parent1.children = children_list1
-        
-    #     if point2.is_root:
-    #         # 如果point2是根节点，直接替换整棵树
-    #         offspring2.tree = point1_clone
-    #     else:
-    #         # 否则在父节点中替换
-    #         parent2 = point2.parent
-    #         children_list2 = list(parent2.children)
-    #         replace_index2 = children_list2.index(point2)
-    #         children_list2[replace_index2] = point1_clone
-    #         parent2.children = children_list2
-
-    #     return offspring1, offspring2, True
-
     def crossover(self, parent: Expression, donor: Expression) -> Tuple[Expression, Expression, bool]:
         """
-        交叉操作：交换两个表达式的子树（使用路径匹配优化）
+        Perform subtree crossover between two expressions using path matching.
         
-        策略：
-        1. 在原树上选择交叉点
-        2. 提前检查大小约束
-        3. 通过检查后再复制树（避免不必要的复制）
-        4. 通过路径匹配找到新树上的对应节点
-        5. 交换子树
+        Strategy
+        --------
+        1. Select crossover points on the original trees.
+        2. Check size constraints before cloning.
+        3. Clone the trees only after the size check passes.
+        4. Find the corresponding nodes in the cloned trees via path matching.
+        5. Swap the cloned subtrees.
         
-        优势：
-        - 提前检查，减少不必要的复制
-        - 路径匹配比重新选择更可靠
+        Advantages
+        ----------
+        - Early validation reduces unnecessary copying.
+        - Path matching is more reliable than re-sampling crossover points.
         
-        Args:
-            parent: 父代表达式1
-            donor: 父代表达式2（供体）
+        Parameters
+        ----------
+        parent : Expression
+            First parent expression.
+        donor : Expression
+            Second parent expression that provides the donor subtree.
             
-        Returns:
-            (offspring1, offspring2, success): 两个后代表达式和成功标志
+        Returns
+        -------
+        tuple
+            ``(offspring1, offspring2, success)`` containing the two offspring
+            expressions and a success flag.
         """
-        # 1. 提前检查：如果父代相同，直接返回失败
+        # Early check: identical parents cannot produce a useful crossover.
         if parent == donor:
             return None, None, False
 
-        # 2. 在原树上选择交叉点（不复制，节省开销）
+        # Select crossover points on the original trees without copying them.
         point1 = self.get_subtree(parent.tree)
         point2 = self.get_subtree(donor.tree)
         
         if point1 is None or point2 is None:
             return None, None, False
 
-        # 3. 提前检查大小约束（避免不必要的复制）
+        # Check size constraints before any cloning occurs.
         new_size1 = parent.size - point1.size + point2.size
         new_size2 = donor.size - point2.size + point1.size
         
         if new_size1 > self.maxsize or new_size2 > self.maxsize:
             return None, None, False
 
-        # 4. 通过检查后再创建副本（节省不必要的复制）
+        # Clone the parents only after the early checks succeed.
         offspring1 = self.reproduce(parent)
         offspring2 = self.reproduce(donor)
 
-        # 5. 通过路径匹配找到新树上的对应节点
+        # Locate the matching nodes inside the cloned offspring trees.
         new_point1 = self._find_corresponding_node(offspring1.tree, point1)
         new_point2 = self._find_corresponding_node(offspring2.tree, point2)
 
         if new_point1 is None or new_point2 is None:
             return None, None, False
 
-        # 6. 克隆要交换的子树（避免引用问题）
-        # 重要：必须先克隆，否则在断开关系时会影响原树
+        # Clone the subtrees to avoid sharing references between offspring.
         point1_clone = clone_tree(new_point1)
         point2_clone = clone_tree(new_point2)
         
-        # 7. 执行交叉
+        # Execute the subtree swap.
         if new_point1.is_root:
-            # point1是根节点，直接替换整棵树
             offspring1.tree = point2_clone
         else:
-            # point1不是根节点，在父节点中替换
             parent1 = new_point1.parent
             children_list1 = list(parent1.children)
             replace_index1 = children_list1.index(new_point1)
             children_list1[replace_index1] = point2_clone
             parent1.children = children_list1
-            # ✅ 重要：设置新子树的父节点为None，断开与新树的连接
-            # 注意：new_point1已经被替换掉了，不需要手动断开
         
         if new_point2.is_root:
-            # point2是根节点，直接替换整棵树
             offspring2.tree = point1_clone
         else:
-            # point2不是根节点，在父节点中替换
             parent2 = new_point2.parent
             children_list2 = list(parent2.children)
             replace_index2 = children_list2.index(new_point2)
             children_list2[replace_index2] = point1_clone
             parent2.children = children_list2
-            # ✅ 同样，new_point2已经被替换掉了
+
+        # Validate resulting size and structural constraints.
+        if not offspring1.is_valid(self.maxsize):
+            return None, None, False
+        if not offspring2.is_valid(self.maxsize):
+            return None, None, False
 
         return offspring1, offspring2, True
 
     def _find_corresponding_node(self, new_tree: SymbolicNode, 
                                 old_node: SymbolicNode) -> SymbolicNode:
         """
-        在新树中找到与旧节点对应的节点（通过路径匹配）
+        Locate the node in a cloned tree that corresponds to a node in the old tree.
         
-        注意：这个方法在当前版本中不需要使用，因为所有操作都直接在新树上进行
-        保留此方法以保持向后兼容
+        Notes
+        -----
+        This helper is no longer strictly required in the current implementation
+        because the main operations are performed directly on cloned trees.
+        It is kept for backward compatibility and for any logic that still needs
+        stable node mapping through root-to-node paths.
         
-        Args:
-            new_tree: 新树的根节点
-            old_node: 旧树中的目标节点
+        Parameters
+        ----------
+        new_tree : SymbolicNode
+            Root node of the cloned tree.
+        old_node : SymbolicNode
+            Target node in the original tree.
             
-        Returns:
-            new_tree中对应的节点，如果找不到则返回None
+        Returns
+        -------
+        SymbolicNode or None
+            The corresponding node in ``new_tree``, or None if the path cannot be followed.
         """
-        # 特殊情况：如果旧节点就是根节点
+        # Special case: the old node itself is the root.
         if old_node.parent is None:
             return new_tree
         
-        # 计算旧节点的路径（从根到节点的子节点索引序列）
+        # Reconstruct the child-index path from root to the old node.
         path = []
         current = old_node
         while current.parent is not None:
@@ -338,9 +352,9 @@ class ExpressionGP:
             path.append(child_index)
             current = parent
         
-        path.reverse()  # 从根到节点的路径
+        path.reverse()  # Path from root to the target node.
         
-        # 在新树中按路径查找
+        # Follow the same path on the cloned tree.
         current = new_tree
         for child_index in path:
             if child_index >= len(current.children):
@@ -382,7 +396,7 @@ class ExpressionGP:
             weights['mutate_constant'] = 0.0
         
         # Adjust mutate_variable weight based on number of variables
-        if len(self.generator.variables) > 5:
+        if self.generator.use_variables:
             n_variables = expr._count_scalar_variables()
             if n_variables == 0:
                 weights['mutate_variable'] = 0.0
@@ -393,7 +407,7 @@ class ExpressionGP:
             weights['mutate_variable'] = 0.0
         
         # Adjust mutate_aggregation weight based on number of aggregations
-        if self.generator.use_aggregations:
+        if self.generator.use_aggregation:
             n_aggregations = expr._count_scalar_aggregations()
             if n_aggregations == 0:
                 weights['mutate_aggregation'] = 0.0
@@ -422,6 +436,8 @@ class ExpressionGP:
         conditioned_weights = self._condition_mutation_weights(parent)
         # Select a mutation
         mutation_name = weighted_random_choice_expr(conditioned_weights, self.random_state)
+        
+        # Execute the selected mutation operator.
         if mutation_name == 'rotate_tree':
             new_expr, mutation_succeeded = self.rotate_tree(parent)
         elif mutation_name == 'add_node':
@@ -451,46 +467,59 @@ class ExpressionGP:
         else:
             raise ValueError(f'Invalid mutation name: {mutation_name}')
         
+        # Validate size constraints and structural rules.
+        if mutation_succeeded and new_expr is not None:
+            if (not new_expr.is_valid(self. maxsize)) or \
+                (not new_expr._check_constraints()):
+                return None, False, mutation_name
+        
         return new_expr, mutation_succeeded, mutation_name
 
     def add_node(self, parent: Expression):
         """
-        添加节点突变：在树中添加一个新的操作符节点
+        Add a new operator node to the expression tree.
         
-        策略：
-        1. 随机选择一个degree > 0的操作符
-        2. 50%概率替换根节点，或当树大小=1时必须替换根节点
-        3. 否则选择一个叶子节点，将其作为新算子的一个子节点
-        4. 新算子的其他子节点用随机生成的叶子填充
+        Strategy
+        --------
+        1. Randomly choose an operator with degree greater than zero.
+        2. With probability 0.5, replace the root directly; if the tree size is 1,
+           root replacement is mandatory.
+        3. Otherwise, choose a leaf and make it one child of the new operator.
+        4. Fill the remaining child positions with randomly generated leaves.
         
-        Args:
-            parent: 父代表达式
+        Parameters
+        ----------
+        parent : Expression
+            Parent expression to mutate.
             
-        Returns:
-            (new_expr, success): 新表达式和成功标志
+        Returns
+        -------
+        tuple
+            A pair ``(new_expr, success)`` containing the mutated expression and
+            a Boolean success flag.
         """
-        # 1. 检查大小限制
+        # Check how much additional size can still be inserted.
         min_new_size = self.maxsize - parent.tree.size
         if min_new_size <= 0:
             return None, False
         
-        valid_degrees = np.array(self.generator.valid_degrees[1:])  # 排除degree=0
+        valid_degrees = np.array(self.generator.degrees[1:])  # Exclude degree 0.
         if not any(valid_degrees <= min_new_size):
             return None, False
         
-        # 2. 选择操作符
+        # Choose a feasible operator arity.
         target_degree = self.random_state.choice(valid_degrees[valid_degrees <= min_new_size])
         new_operator = self._get_random_operator(int(target_degree))
         
-        # 3. 确定操作策略
+        # Decide whether to replace the root or a leaf.
         should_replace_root = (self.random_state.random() < 0.5) or (parent.tree.size == 1)
         
-        # 4. 创建新表达式
+        # Clone the parent expression before editing it.
         new_expr = self.reproduce(parent)
         
-        # 5. 执行操作
+        # Apply the mutation.
         if should_replace_root:
-            # 替换根节点：原根节点成为新算子的一个子节点
+            # Replace the root: the original root becomes one child of the new operator.
             original_root = new_expr.tree
             new_root = SymbolicNode(node_content=new_operator)
             children = [original_root]
@@ -501,7 +530,7 @@ class ExpressionGP:
             new_root.children = children
             new_expr.tree = new_root
         else:
-            # 替换叶子节点：叶子节点成为新算子的一个子节点
+            # Replace a leaf: the selected leaf becomes one child of the new operator.
             leaves = new_expr.tree.leaves
             if not leaves:
                 return None, False
@@ -527,47 +556,53 @@ class ExpressionGP:
 
     def insert_node(self, parent: Expression):
         """
-        插入节点突变：在树的中间插入一个新的操作符节点
+        Insert a new operator node inside the tree.
         
-        策略：
-        1. 随机选择一个degree > 0的操作符
-        2. 选择一个非叶子且非根的节点作为目标
-        3. 将目标节点（整个子树）作为新算子的一个子节点
-        4. 新算子的其他子节点用随机生成的叶子填充
-        5. 新算子替换原目标节点的位置
+        Strategy
+        --------
+        1. Randomly choose an operator with degree greater than zero.
+        2. Select a target node that is neither a leaf nor the root.
+        3. Use the target subtree as one child of the new operator.
+        4. Fill the remaining child positions with randomly generated leaves.
+        5. Replace the original target node with the new operator node.
         
-        Args:
-            parent: 父代表达式
+        Parameters
+        ----------
+        parent : Expression
+            Parent expression to mutate.
             
-        Returns:
-            (new_expr, success): 新表达式和成功标志
+        Returns
+        -------
+        tuple
+            A pair ``(new_expr, success)`` containing the mutated expression and
+            a Boolean success flag.
         """
-        # 1. 检查大小限制
+        # Check how much additional size can still be inserted.
         min_new_size = self.maxsize - parent.tree.size
         if min_new_size <= 0:
             return None, False
         
-        valid_degrees = np.array(self.generator.valid_degrees[1:])
+        valid_degrees = np.array(self.generator.degrees[1:])
         if not any(valid_degrees <= min_new_size):
             return None, False
         
-        # 2. 创建新表达式
+        # Clone the parent expression before editing it.
         new_expr = self.reproduce(parent)
         
-        # 3. 在新树上选择目标节点
+        # Select the target node on the cloned tree.
         target_node = self.get_subtree(new_expr.tree, not_leaf=True, not_root=True)
         if target_node is None:
             return None, False
         
-        # 4. 选择操作符
+        # Choose a feasible operator.
         target_degree = self.random_state.choice(valid_degrees[valid_degrees <= min_new_size])
         new_operator = self._get_random_operator(int(target_degree))
         
         target_parent = target_node.parent
         
-        # 5. 执行插入
+        # Insert the new operator above the target subtree.
         new_node = SymbolicNode(node_content=new_operator)
-        children = [target_node]  # 直接使用target_node
+        children = [target_node]  # Reuse the selected subtree directly.
         for _ in range(new_operator.degree - 1):
             other_child = SymbolicNode(node_content=self._get_random_leaf())
             children.append(other_child)
@@ -583,44 +618,50 @@ class ExpressionGP:
 
     def delete_node(self, parent: Expression):
         """
-        删除节点突变：从树中删除一个随机节点
+        Delete a randomly selected node from the tree.
         
-        策略：
-        1. 如果删除的是叶子节点：替换为另一个随机叶子
-        2. 如果删除的是非叶子节点：随机提升其一个子节点
+        Strategy
+        --------
+        1. If the selected node is a leaf, replace it with another random leaf.
+        2. If the selected node is internal, randomly promote one of its children.
         
-        Args:
-            parent: 父代表达式
+        Parameters
+        ----------
+        parent : Expression
+            Parent expression to mutate.
             
-        Returns:
-            (new_expr, success): 新表达式和成功标志
+        Returns
+        -------
+        tuple
+            A pair ``(new_expr, success)`` containing the mutated expression and
+            a Boolean success flag.
         """
-        # 1. 检查大小限制
+        # Trees of size 1 cannot be reduced further.
         if parent.tree.size <= 1:
             return None, False
         
-        # 2. 创建新表达式
+        # Clone the parent expression before editing it.
         new_expr = self.reproduce(parent)
         
-        # 3. 选择目标节点（直接在新树上选择）
+        # Select the target node directly on the cloned tree.
         target_node = self.get_subtree(new_expr.tree)
         if target_node is None:
             return None, False
         
-        # 4. 执行删除
+        # Apply the deletion.
         if target_node.is_leaf:
-            # 叶子节点：替换为新的随机叶子
+            # Leaf case: replace the node with a new random leaf.
             new_leaf_op = self._get_leaf_with_rules(target_node)
             target_node.node_content = new_leaf_op
         else:
-            # 非叶子节点：提升一个子节点
+            # Internal-node case: promote one of the children.
             promoted_child = self.random_state.choice(list(target_node.children))
             target_parent = target_node.parent
             if target_parent is None:
-                # 如果是根节点，直接替换树
+                # If the target is the root, replace the whole tree.
                 new_expr.tree = promoted_child
             else:
-                # 否则替换父节点的子节点
+                # Otherwise, replace the corresponding child pointer in the parent.
                 children_list = list(target_parent.children)
                 idx = children_list.index(target_node)
                 children_list[idx] = promoted_child
@@ -630,104 +671,127 @@ class ExpressionGP:
 
     def do_nothing_tree(self, parent: Expression):
         """
-        空操作：返回一个新的、相同的表达式
+        Return an unchanged copy of the parent expression.
         
-        用途：在突变策略中保持部分个体不变
+        This operator is useful when the mutation schedule intentionally keeps a
+        fraction of individuals unchanged.
         
-        Args:
-            parent: 父代表达式
+        Parameters
+        ----------
+        parent : Expression
+            Parent expression to copy.
             
-        Returns:
-            (new_expr, success): 新表达式和成功标志
+        Returns
+        -------
+        tuple
+            A pair ``(new_expr, success)`` containing the copied expression and
+            ``True``.
         """
         new_expr = self.reproduce(parent)
         return new_expr, True
 
     def mutate_constant(self, parent: Expression):
         """
-        常量突变：随机选择一个常量并改变其值
+        Mutate a randomly selected constant value.
         
-        策略：
-        1. 随机选择一个常量节点
-        2. 对其值施加随机扰动（乘以一个扰动因子）
-        3. 小概率取负值
+        Strategy
+        --------
+        1. Randomly choose a constant node.
+        2. Apply a multiplicative perturbation to its value.
+        3. With small probability, flip the sign of the perturbation.
         
-        扰动公式：
-            perturbation = 1 + perturbation_factor * random() + 0.1
-            new_value = old_value * perturbation (或 * (1/perturbation))
-            如果random() < probability_negate_constant: perturbation = -perturbation
+        Perturbation rule
+        -----------------
+        ``perturbation = 1 + perturbation_factor * random() + 0.1``
         
-        Args:
-            parent: 父代表达式
+        The new value is either ``old_value * perturbation`` or
+        ``old_value / perturbation``. With probability
+        ``probability_negate_constant``, the perturbation is negated.
+        
+        Parameters
+        ----------
+        parent : Expression
+            Parent expression to mutate.
             
-        Returns:
-            (new_expr, success): 新表达式和成功标志
+        Returns
+        -------
+        tuple
+            A pair ``(new_expr, success)`` containing the mutated expression and
+            a Boolean success flag.
         """
-        # 1. 检查是否包含常量
+        # Skip expressions that do not contain constants.
         if not parent._has_constants():
             return None, False
         
-        # 2. 创建新表达式
+        # Clone the parent expression before editing it.
         new_expr = self.reproduce(parent)
         
-        # 3. 在新树上收集候选节点
+        # Collect candidate constant nodes on the cloned tree.
         candidates = [node for node in PreOrderIter(new_expr.tree) 
                     if isinstance(node.node_content, Constant)]
         
         if not candidates:
             return None, False
         
-        # 4. 随机选择一个常量节点
+        # Select a constant node at random.
         target_node = self.random_state.choice(candidates)
         
-        # 5. 计算新值
+        # Compute the new constant value.
         perturbation = 1 + self.perturbation_factor * self.random_state.random() + 0.1
         perturbation = perturbation if self.random_state.uniform() > 0.5 else 1/perturbation
         if self.random_state.uniform() < self.probability_negate_constant:
             perturbation = -perturbation
         new_value = target_node.node_content.value * perturbation
         
-        # 6. 在新树上修改
+        # Apply the updated constant value on the cloned tree.
         target_node.node_content = Constant(value=new_value)
         
         return new_expr, True
 
     def mutate_variable(self, parent: Expression):
         """
-        变量突变：随机选择一个变量并替换为另一个变量
+        Replace a randomly selected variable with another variable.
         
-        策略：
-        1. 随机选择一个变量节点
-        2. 使用高斯加权选择新变量（偏向选择相邻的变量索引）
+        Strategy
+        --------
+        1. Randomly choose a variable node.
+        2. Select a replacement variable using Gaussian-like weights so that
+           nearby variable indices are preferred.
         
-        高斯权重公式：
-            weight[i] = exp(-0.5 * distance^2)
-            其中distance = |i - current_variable_index|
+        Weight rule
+        -----------
+        ``weight[i] = exp(-0.5 * distance^2)``, where
+        ``distance = |i - current_variable_index|``.
         
-        Args:
-            parent: 父代表达式
+        Parameters
+        ----------
+        parent : Expression
+            Parent expression to mutate.
             
-        Returns:
-            (new_expr, success): 新表达式和成功标志
+        Returns
+        -------
+        tuple
+            A pair ``(new_expr, success)`` containing the mutated expression and
+            a Boolean success flag.
         """
-        # 1. 检查是否包含变量
+        # Skip expressions that do not contain variables.
         if not parent._has_variables():
             return None, False
         
-        # 2. 创建新表达式
+        # Clone the parent expression before editing it.
         new_expr = self.reproduce(parent)
         
-        # 3. 在新树上收集候选节点
+        # Collect candidate variable nodes on the cloned tree.
         candidates = [node for node in PreOrderIter(new_expr.tree) 
                     if isinstance(node.node_content, Variable)]
 
         if not candidates:
             return None, False
 
-        # 4. 随机选择一个变量节点
+        # Select a variable node at random.
         target_node = self.random_state.choice(candidates)
         
-        # 5. 选择新变量（高斯加权）
+        # Choose a replacement variable with Gaussian-style weighting.
         old_variable = target_node.node_content
         variable_idx = self.generator.variables.index(old_variable)
         variable_indices = np.delete(np.arange(len(self.generator.variables)), variable_idx)
@@ -737,37 +801,42 @@ class ExpressionGP:
         
         distances = np.abs(variable_indices - variable_idx)
         weights = np.exp(-0.5 * distances ** 2)
-        new_idx = np.random.choice(variable_indices, p=weights/weights.sum())
+        new_idx = self.random_state.choice(variable_indices, p=weights/weights.sum())
         new_variable = self.generator.variables[new_idx]
         
-        # 6. 在新树上修改
+        # Apply the new variable on the cloned tree.
         target_node.node_content = new_variable
         
         return new_expr, True
 
     def mutate_operator(self, parent: Expression):
         """
-        操作符突变：随机选择一个操作符并替换为同degree的另一个操作符
+        Replace a randomly selected operator with another operator of the same degree.
         
-        Args:
-            parent: 父代表达式
+        Parameters
+        ----------
+        parent : Expression
+            Parent expression to mutate.
             
-        Returns:
-            (new_expr, success): 新表达式和成功标志
+        Returns
+        -------
+        tuple
+            A pair ``(new_expr, success)`` containing the mutated expression and
+            a Boolean success flag.
         """
-        # 1. 检查是否包含算子
+        # Trees of size 1 contain no internal operators to replace.
         if parent.size == 1:
             return None, False
         
-        # 2. 创建新表达式
+        # Clone the parent expression before editing it.
         new_expr = self.reproduce(parent)
         
-        # 3. 在新树上选择目标节点
+        # Select the target internal node on the cloned tree.
         target_node = self.get_subtree(new_expr.tree, not_leaf=True)
         if target_node is None:
             return None, False
         
-        # 4. 选择新算子（相同degree，排除当前算子）
+        # Choose a replacement operator with the same arity, excluding the current one.
         target_degree = target_node.degree
         target_operator = target_node.node_content
         new_operator = self._get_random_operator(target_degree, exclude=target_operator)
@@ -775,67 +844,132 @@ class ExpressionGP:
         if not new_operator:
             return None, False
         
-        # 5. 在新树上修改
+        # Apply the replacement on the cloned tree.
         target_node.node_content = new_operator
         
         return new_expr, True
 
+
     def mutate_aggregation(self, parent: Expression):
         """
-        聚合节点突变：改变聚合操作的窗口范围或操作类型
+        Mutate aggregation nodes: modify window ranges, operation types, or neighbor counts
+        for DynamicAggregation nodes (supporting both spatial and spectral dimensions).
         
-        突变类型：
-        1. 改变操作类型（mean, max, min等）- 低概率（0.0001 * valid_op数量）
-        2. 改变窗口范围 - 高概率：
-        - shift_both: 整体平移窗口
-        - shift_start: 移动起始位置
-        - shift_end: 移动结束位置
-        - expand: 扩展窗口（向左、向右或两边）
-        - shrink: 收缩窗口（从左、从右或两边）
+        Mutation types:
+        1. Change operation type (mean, max, min, etc.) - low probability 
+           (0.0001 * number of valid operations)
+        2. Change window range (spectral dimension) - high probability:
+           - shift_both: translate window as a whole
+           - shift_start: move start position
+           - shift_end: move end position
+           - expand: expand window (left, right, or both)
+           - shrink: shrink window (from left, right, or both)
+        3. Change neighbor count (spatial dimension) - high probability:
+           - increase/decrease k_neighbors within valid bounds
         
         Args:
-            parent: 父代表达式
+            parent: Parent expression tree
             
         Returns:
-            (new_expr, success): 新表达式和成功标志
+            tuple: (new_expr, success) - New expression and success flag
         """
-        # 1. 检查是否包含聚合节点
+        # 1. Check if expression contains aggregation nodes
         if not parent._has_aggregations():
             return None, False
         
-        # 2. 创建新表达式
+        # 2. Create new expression via reproduction
         new_expr = self.reproduce(parent)
         
-        # 3. 在新树上收集候选节点
-        candidates = [node for node in PreOrderIter(new_expr.tree) 
-                    if isinstance(node.node_content, DynamicAggregation)]
+        # 3. Collect candidate nodes: support both legacy DynamicAggregation 
+        #    and new DynamicAggregation
+        candidates = []
+        for node in PreOrderIter(new_expr.tree):
+            content = node.node_content
+            if isinstance(content, DynamicAggregation):
+                candidates.append(node)
         
         if not candidates:
             return None, False
         
-        # 4. 选择目标节点
+        # 4. Select target node randomly
         target_node = self.random_state.choice(candidates)
         aggregation = target_node.node_content
         
-        # 5. 计算新的聚合参数
-        valid_op_num = len(aggregation.valid_op) if aggregation.valid_op else 1
+        # Ensure we're working with DynamicAggregation
+        if not isinstance(aggregation, DynamicAggregation):
+            return None, False
+        
+        # 5. Determine which dimensions are active for mutation
+        spectral_active = aggregation._spectral_active
+        spatial_active = aggregation._spatial_active
+        
+        if not spectral_active and not spatial_active:
+            # Identity node, nothing to mutate
+            return None, False
+        
+        # 6. Decide which dimension(s) to mutate
+        # If both active, randomly choose one; if only one active, mutate that
+        if spectral_active and spatial_active:
+            mutate_dimension = self.random_state.choice(['spectral', 'spatial'])
+        elif spectral_active:
+            mutate_dimension = 'spectral'
+        else:
+            mutate_dimension = 'spatial'
+        
+        # 7. Perform mutation based on selected dimension
+        if mutate_dimension == 'spectral' and spectral_active:
+            new_aggregation = self._mutate_spectral_dimension(aggregation)
+        elif mutate_dimension == 'spatial' and spatial_active:
+            new_aggregation = self._mutate_spatial_dimension(aggregation)
+        else:
+            # Fallback: should not reach here if logic is correct
+            return None, False
+        
+        if new_aggregation is None:
+            return None, False
+        
+        # 8. Apply mutation to tree
+        target_node.node_content = new_aggregation
+        
+        return new_expr, True
+
+    def _mutate_spectral_dimension(self, aggregation: DynamicAggregation):
+        """
+        Mutate the spectral (feature) dimension of a DynamicAggregation node.
+        
+        Args:
+            aggregation: DynamicAggregation instance with spectral aggregation active
+            
+        Returns:
+            DynamicAggregation: New aggregation instance with mutated parameters,
+                               or None if mutation failed
+        """
+        valid_stats = self.generator.spectral_stats
+        valid_op_num = len(valid_stats) if valid_stats else 1
         prob_mutate_operator = 0.0001 * valid_op_num if valid_op_num > 1 else 0.0
         
-        if self.random_state.random() < prob_mutate_operator and aggregation.valid_op:
-            # 改变操作类型
-            new_op_name = self.random_state.choice(aggregation.valid_op)
+        if self.random_state.random() < prob_mutate_operator and valid_stats:
+            # Mutate operation type
+            new_stat_name = self.random_state.choice(valid_stats)
             new_aggregation = DynamicAggregation(
                 v_start=aggregation.v_start,
                 v_end=aggregation.v_end,
-                op_name=new_op_name,
-                n_variables=aggregation.n_variables,
-                valid_op=aggregation.valid_op
+                stat_name_spectral=new_stat_name,
+                window_size=aggregation.window_size,
+                stat_name_spatial=aggregation.stat_name_spatial,
+                target_feature=aggregation.target_feature,
+                n_variables=aggregation.n_variables
             )
+            return new_aggregation
         else:
-            # 改变窗口范围
+            # Mutate window range [v_start, v_end]
             v_start, v_end = aggregation.v_start, aggregation.v_end
             n_variables = aggregation.n_variables
             current_window_size = v_end - v_start + 1
+            
+            if current_window_size < 2:
+                # Window too small to mutate range, skip or force minimal expansion
+                return None
             
             max_change_ratio = 0.5
             max_shift = max(1, int(current_window_size * max_change_ratio))
@@ -844,11 +978,11 @@ class ExpressionGP:
             )
             
             if mutation_type == 'shift_both':
-                # 整体平移窗口
+                # Translate window as a whole
                 shift = self.random_state.randint(-max_shift, max_shift + 1)
                 new_start = v_start + shift
                 new_end = v_end + shift
-                # 边界处理
+                # Boundary handling
                 if new_start < 0:
                     offset = -new_start
                     new_start = 0
@@ -859,21 +993,18 @@ class ExpressionGP:
                     new_start = max(new_start - offset, 0)
                 if new_end <= new_start:
                     new_start = max(0, new_end - 1)
-                    
             elif mutation_type == 'shift_start':
-                # 移动起始位置
+                # Move start position only
                 shift = self.random_state.randint(-max_shift, max_shift + 1)
                 new_start = max(0, min(v_start + shift, v_end - 1))
                 new_end = v_end
-                
             elif mutation_type == 'shift_end':
-                # 移动结束位置
+                # Move end position only
                 shift = self.random_state.randint(-max_shift, max_shift + 1)
                 new_end = max(v_start + 1, min(v_end + shift, n_variables - 1))
                 new_start = v_start
-                
             elif mutation_type == 'expand':
-                # 扩展窗口
+                # Expand window
                 expand_amount = self.random_state.randint(1, max_shift + 1)
                 expand_direction = self.random_state.choice(['left', 'right', 'both'])
                 if expand_direction == 'left' and v_start > 0:
@@ -888,10 +1019,10 @@ class ExpressionGP:
                     new_start = max(0, v_start - left_expand)
                     new_end = min(n_variables - 1, v_end + right_expand)
             else:  # shrink
-                # 收缩窗口
+                # Shrink window
                 max_shrink = min(max_shift, current_window_size - 2)
                 if max_shrink < 1:
-                    # 窗口太小，无法收缩，改为平移
+                    # Window too small to shrink, fallback to shift
                     shift = self.random_state.randint(-max_shift, max_shift + 1)
                     new_start = max(0, min(v_start + shift, n_variables - 2))
                     new_end = min(new_start + 1, n_variables - 1)
@@ -910,51 +1041,117 @@ class ExpressionGP:
                         new_start = min(v_start + left_shrink, v_end - 1)
                         new_end = max(new_start + 1, v_end - right_shrink)
             
-            # 最终边界检查
+            # Final boundary validation
             new_start = max(0, min(new_start, n_variables - 2))
             new_end = max(new_start + 1, min(new_end, n_variables - 1))
+            
+            # Validate derivative order compatibility
+            deriv_order = aggregation.deriv_order
+            if new_end - new_start < deriv_order:
+                # Adjust to satisfy derivative requirement
+                new_end = new_start + deriv_order + 1
+                if new_end >= n_variables:
+                    new_start = max(0, n_variables - deriv_order - 2)
+                    new_end = n_variables - 1
+            
+            length = new_end - new_start + 1
+            if isinstance(self.generator.valid_spectral_length, int):
+                if length > self.generator.valid_spectral_length:
+                    return None
+            elif isinstance(self.generator.valid_spectral_length, tuple):
+                min_length, max_length = self.generator.valid_spectral_length
+                if length < min_length or length > max_length:
+                    return None
+
             new_aggregation = DynamicAggregation(
                 v_start=new_start, v_end=new_end,
-                op_name=aggregation.op_name,
-                n_variables=aggregation.n_variables,
-                valid_op=aggregation.valid_op
+                stat_name_spectral=aggregation.stat_name_spectral,
+                window_size=aggregation.window_size,
+                stat_name_spatial=aggregation.stat_name_spatial,
+                target_feature=aggregation.target_feature,
+                n_variables=aggregation.n_variables
             )
+            return new_aggregation
+
+    def _mutate_spatial_dimension(self, aggregation: DynamicAggregation):
+        """
+        Mutate the spatial (sample) dimension of a DynamicAggregation node.
         
-        # 6. 在新树上修改
-        target_node.node_content = new_aggregation
+        Args:
+            aggregation: DynamicAggregation instance with spatial aggregation active
+            
+        Returns:
+            DynamicAggregation: New aggregation instance with mutated parameters,
+                               or None if mutation failed
+        """
+        valid_stats = self.generator.spatial_stats
+        valid_op_num = len(valid_stats) if valid_stats else 1
+        prob_mutate_operator = 0.0001 * valid_op_num if valid_op_num > 1 else 0.0
         
-        return new_expr, True
+        if self.random_state.random() < prob_mutate_operator and valid_stats:
+            # Mutate spatial operation type
+            new_stat_name = self.random_state.choice(valid_stats)
+            new_aggregation = DynamicAggregation(
+                v_start=aggregation.v_start,
+                v_end=aggregation.v_end,
+                stat_name_spectral=aggregation.stat_name_spectral,
+                window_size=aggregation.window_size,
+                stat_name_spatial=new_stat_name,
+                target_feature=aggregation.target_feature,
+                n_variables=aggregation.n_variables
+            )
+            return new_aggregation
+        else:
+            # Mutate window size in sample dimension
+            new_window_size = self.random_state.choice(self.generator.valid_window_sizes)
+            
+            new_aggregation = DynamicAggregation(
+                v_start=aggregation.v_start,
+                v_end=aggregation.v_end,
+                stat_name_spectral=aggregation.stat_name_spectral,
+                window_size=new_window_size,
+                stat_name_spatial=aggregation.stat_name_spatial,
+                target_feature=aggregation.target_feature,
+                n_variables=aggregation.n_variables
+            )
+            return new_aggregation
 
     def swap_operands(self, parent: Expression):
         """
-        交换操作数：随机选择一个二元操作符并交换其两个子节点
+        Swap the two children of a randomly selected binary operator.
         
-        适用于：所有degree=2的操作符
-        效果：改变表达式结构但可能不改变语义（对于交换律成立的操作）
+        This mutation applies to degree-2 operators only. It changes the tree
+        structure and may or may not change the semantics, depending on whether
+        the operator is commutative.
         
-        Args:
-            parent: 父代表达式
+        Parameters
+        ----------
+        parent : Expression
+            Parent expression to mutate.
             
-        Returns:
-            (new_expr, success): 新表达式和成功标志
+        Returns
+        -------
+        tuple
+            A pair ``(new_expr, success)`` containing the mutated expression and
+            a Boolean success flag.
         """
-        # 1. 检查是否有二元操作符
+        # Check whether the tree contains any binary operator.
         if not parent._has_binary_operator():
             return None, False
         
-        # 2. 创建新表达式
+        # Clone the parent expression before editing it.
         new_expr = self.reproduce(parent)
         
-        # 3. 在新树上收集候选节点
+        # Collect candidate binary nodes on the cloned tree.
         candidates = [node for node in PreOrderIter(new_expr.tree) if node.degree == 2]
         
         if not candidates:
             return None, False
         
-        # 4. 选择目标节点
+        # Select a target node.
         target_node = self.random_state.choice(candidates)
         
-        # 5. 交换子节点
+        # Reverse the child order.
         swapped_children = list(target_node.children)[::-1]
         target_node.children = swapped_children
         
@@ -962,64 +1159,72 @@ class ExpressionGP:
 
     def rotate_tree(self, parent: Expression):
         r"""
-        树旋转：对树进行左旋或右旋操作
+        Perform a left or right tree rotation on a selected subtree.
         
-        右旋示例（A是父节点，B是左子节点）：
-        A              B
-        / \            / \
-        B   C    =>    D   A
-        / \                / \
+        Right-rotation example (``A`` is the parent, ``B`` is the left child)::
+        
+            A              B
+           / \            / \
+          B   C    =>    D   A
+         / \                / \
         D   E              E   C
         
-        左旋示例（A是父节点，B是右子节点）：
-        A                B
-        / \              / \
-        C   B      =>    A   E
-            / \          / \
-            D  E        C   D
+        Left-rotation example (``A`` is the parent, ``B`` is the right child)::
         
-        适用条件：
-        - 右旋：左子节点不是叶子
-        - 左旋：右子节点不是叶子且父节点是二元的
+            A                B
+           / \              / \
+          C   B      =>    A   E
+             / \          / \
+            D   E        C   D
         
-        Args:
-            parent: 父代表达式
+        Validity conditions
+        -------------------
+        - Right rotation requires a non-leaf left child.
+        - Left rotation requires a degree-2 parent and a non-leaf right child.
+        
+        Parameters
+        ----------
+        parent : Expression
+            Parent expression to mutate.
             
-        Returns:
-            (new_expr, success): 新表达式和成功标志
+        Returns
+        -------
+        tuple
+            A pair ``(new_expr, success)`` containing the rotated expression and
+            a Boolean success flag.
         """
         def is_valid_rotation_node(node: SymbolicNode) -> bool:
-            """检查节点是否可以旋转"""
+            """Return whether a node can serve as a rotation root."""
             if node.is_leaf:
                 return False
             return any(not child.is_leaf for child in node.children)
 
-        # 1. 检查是否可以执行旋转
+        # Check whether the original tree contains any rotatable node.
         for node in PreOrderIter(parent.tree):
             if is_valid_rotation_node(node):
                 break
         else:
             return None, False
 
-        # 2. 创建新表达式
+        # Clone the parent expression before editing it.
         new_expr = self.reproduce(parent)
 
-        # 3. 在新树上收集可旋转的节点
+        # Collect rotatable nodes on the cloned tree.
         candidates = [node for node in PreOrderIter(new_expr.tree) if is_valid_rotation_node(node)]
         if not candidates:
             return None, False
 
-        # 4. 选择目标节点
+        # Select the subtree root to rotate.
         subtree_root = self.random_state.choice(candidates)
         
-        # 5. 确定可以进行的旋转方向
+        # Determine which rotation directions are valid.
         can_rotate_right = not subtree_root.children[0].is_leaf
         can_rotate_left = subtree_root.degree == 2 and not subtree_root.children[1].is_leaf
         
         if not can_rotate_left and not can_rotate_right:
             return None, False
 
-        # 6. 选择旋转方向
+        # Choose the rotation direction.
         if can_rotate_left and can_rotate_right:
             direction = self.random_state.choice(['left', 'right'])
         elif can_rotate_left:
@@ -1029,9 +1234,9 @@ class ExpressionGP:
 
         original_parent = subtree_root.parent
         
-        # 7. 执行旋转
+        # Apply the rotation.
         if direction == 'right':
-            # 右旋
+            # Right rotation.
             A = subtree_root
             B = A.children[0]
             C = A.children[1] if A.degree == 2 else None
@@ -1045,7 +1250,7 @@ class ExpressionGP:
             new_C = clone_tree(C) if C is not None else None
             
             if B.degree == 1:
-                # B是一元操作符
+                # B is a unary operator.
                 if A.degree == 1:
                     return None, False
                 elif A.degree == 2:
@@ -1060,7 +1265,7 @@ class ExpressionGP:
                     return None, False
                 
             elif B.degree == 2:
-                # B是二元操作符
+                # B is a binary operator.
                 children_A = []
                 if new_E: children_A.append(new_E)
                 if new_C: children_A.append(new_C)
@@ -1080,7 +1285,7 @@ class ExpressionGP:
             else:
                 return None, False
             
-            # 替换原节点
+            # Replace the original subtree root.
             if original_parent is None:
                 new_expr.tree = new_B
             else:
@@ -1090,7 +1295,7 @@ class ExpressionGP:
                 original_parent.children = children_list
                 
         else:  # left rotation
-            # 左旋
+            # Left rotation.
             A = subtree_root
             C = A.children[0]
             B = A.children[1]
@@ -1104,7 +1309,7 @@ class ExpressionGP:
             new_E = clone_tree(E) if E is not None else None
             
             if B.degree == 1:
-                # B是一元操作符
+                # B is a unary operator.
                 if A.degree == 1:
                     return None, False
                 elif A.degree == 2:
@@ -1113,7 +1318,7 @@ class ExpressionGP:
                 else:
                     return None, False
             elif B.degree == 2:
-                # B是二元操作符
+                # B is a binary operator.
                 if A.degree == 1:
                     new_A.children = [new_C]
                 elif A.degree == 2:
@@ -1130,7 +1335,7 @@ class ExpressionGP:
             else:
                 return None, False
             
-            # 替换原节点
+            # Replace the original subtree root.
             if original_parent is None:
                 new_expr.tree = new_B
             else:
@@ -1143,47 +1348,54 @@ class ExpressionGP:
 
     def randomize_tree(self, parent: Expression):
         """
-        随机化树：随机选择一个子树并替换为随机生成的新子树
+        Replace a randomly selected subtree with a newly generated random subtree.
         
-        策略：
-        1. 随机选择树中的一个节点
-        2. 根据可用大小确定新子树的大小
-        3. 生成一棵随机新子树
-        4. 用新子树替换选中的节点
+        Strategy
+        --------
+        1. Randomly choose a node in the tree.
+        2. Determine the maximum allowed size for the replacement subtree.
+        3. Sample a valid target size.
+        4. Generate a new random subtree of that size.
+        5. Replace the selected node with the new subtree.
         
-        Args:
-            parent: 父代表达式
+        Parameters
+        ----------
+        parent : Expression
+            Parent expression to mutate.
             
-        Returns:
-            (new_expr, success): 新表达式和成功标志
+        Returns
+        -------
+        tuple
+            A pair ``(new_expr, success)`` containing the mutated expression and
+            a Boolean success flag.
         """
-        # 1. 创建新表达式
+        # Clone the parent expression before editing it.
         new_expr = self.reproduce(parent)
         
-        # 2. 在新树上选择目标节点
+        # Select the target node on the cloned tree.
         target_node = self.get_subtree(new_expr.tree)
         if target_node is None:
             return None, False
         
-        # 3. 计算可用大小
+        # Compute the maximum admissible size for the replacement subtree.
         max_target_size = self.maxsize - (new_expr.tree.size - target_node.size)
-        valid_sizes = np.array(list(self.generator.size_prob.keys()))
-        size_probs = np.array(list(self.generator.size_prob.values()))
+        valid_sizes = np.array(list(self.generator.complexity_probs.keys()))
+        size_probs = np.array(list(self.generator.complexity_probs.values()))
         mask = valid_sizes <= max_target_size
         
         if not np.any(mask):
             return None, False
         
-        # 4. 选择新子树大小
+        # Sample the new subtree size.
         target_size = self.random_state.choice(
             valid_sizes[mask], 
             p=size_probs[mask]/size_probs[mask].sum()
         )
         
-        # 5. 生成新子树
+        # Generate a new subtree with the sampled size.
         new_subtree = self.generator.build_tree(target_size)
         
-        # 6. 替换节点
+        # Replace the target node.
         if target_node.is_root:
             new_expr.tree = new_subtree
         else:
@@ -1197,44 +1409,51 @@ class ExpressionGP:
 
     def hoist_tree(self, parent: Expression):
         """
-        提升子树：选择一个子树，用其子树之一替换它
+        Replace a subtree with one of its own descendants.
         
-        策略：
-        1. 随机选择一个非叶子节点作为子树
-        2. 从该子树中随机选择一个非根节点作为子子树
-        3. 用子子树替换子树的位置
+        Strategy
+        --------
+        1. Randomly choose a non-leaf subtree.
+        2. Randomly choose a non-root node inside that subtree.
+        3. Replace the selected subtree with the chosen descendant.
         
-        效果：减小树的大小，保留部分结构
+        This mutation typically reduces tree size while preserving part of the
+        original structure.
         
-        Args:
-            parent: 父代表达式
+        Parameters
+        ----------
+        parent : Expression
+            Parent expression to mutate.
             
-        Returns:
-            (new_expr, success): 新表达式和成功标志
+        Returns
+        -------
+        tuple
+            A pair ``(new_expr, success)`` containing the mutated expression and
+            a Boolean success flag.
         """
-        # 1. 检查大小限制
+        # Trees of size 1 cannot be hoisted further.
         if parent.tree.size <= 1:
             return None, False
         
-        # 2. 创建新表达式
+        # Clone the parent expression before editing it.
         new_expr = self.reproduce(parent)
         
-        # 3. 在新树上选择子树（非叶子节点）
+        # Select a non-leaf subtree on the cloned tree.
         subtree = self.get_subtree(new_expr.tree, not_leaf=True)
         if subtree is None:
             return None, False
         
-        # 4. 在子树中选择子子树（非根节点）
+        # Select a non-root descendant inside the chosen subtree.
         subsubtree = self.get_subtree(subtree, not_root=True)
         if subsubtree is None:
             return None, False
         
-        # 5. 执行提升：用子子树替换子树
+        # Replace the subtree by the selected descendant.
         if subtree.is_root:
-            # 如果子树是根节点，直接替换整棵树
+            # If the selected subtree is the root, replace the entire tree.
             new_expr.tree = subsubtree
         else:
-            # 否则在父节点中替换
+            # Otherwise, replace the corresponding child reference in the parent.
             target_parent = subtree.parent
             children_list = list(target_parent.children)
             replacement_idx = children_list.index(subtree)
@@ -1245,77 +1464,93 @@ class ExpressionGP:
 
     def simplify(self, parent: Expression):
         """
-        简化树：应用代数规则简化表达式
+        Simplify an expression using algebraic rewrite rules.
         
-        简化规则包括：
-        1. 常量折叠：计算常量表达式
-        2. 恒等式：x + 0 = x, x * 1 = x, x / 1 = x
-        3. 零元素：x * 0 = 0, 0 / x = 0
-        4. 代数化简：x - x = 0, x / x = 1, -(-x) = x
-        5. 分配律和结合律的应用
+        Typical simplifications include constant folding, identity rules such as
+        ``x + 0 = x`` and ``x * 1 = x``, zero rules such as ``x * 0 = 0``, and
+        algebraic rewrites such as ``x - x = 0`` or ``x / x = 1``.
         
-        Args:
-            parent: 父代表达式
+        Parameters
+        ----------
+        parent : Expression
+            Parent expression to simplify.
             
-        Returns:
-            (new_expr, success): 新表达式和成功标志
+        Returns
+        -------
+        tuple
+            A pair ``(new_expr, success)`` containing the mutated expression and
+            a Boolean success flag.
         """
         new_expr = parent.simplify(self.constants_tolerance)
         
-        # 判断是否发生了简化
+        # Judge whether simplification has occurred.
         simplified = not Expression._trees_are_equal(parent.tree, new_expr.tree)
         return new_expr, simplified
 
     def optimize_constants(
-        self, parent: Expression, X: np.ndarray, y: np.ndarray,
+        self, parent: Expression, 
+        X: np.ndarray, y: np.ndarray, 
+        sample_weight: Optional[np.ndarray] = None,
         optimizer_algorithm='L-BFGS-B', optimizer_nrestarts=3, optimizer_iterations=10
     ):
-        # 检查是否有常量
+        """
+        Optimize constant values in an expression using numerical optimization.
+
+        Uses scipy.optimize.minimize with multiple restarts to find optimal
+        constant values that minimize (or maximize) the fitness function.
+
+        Parameters
+        ----------
+        parent : Expression
+            Parent expression containing constants to optimize.
+        X : ndarray, shape (n_samples, n_features)
+            Input features.
+        y : ndarray, shape (n_samples,)
+            Target values.
+        sample_weight : ndarray, optional, shape (n_samples,)
+            Sample weights for weighted fitness evaluation.
+        optimizer_algorithm : str, default='L-BFGS-B'
+            Optimization algorithm (e.g., 'L-BFGS-B', 'SLSQP', 'CG').
+        optimizer_nrestarts : int, default=3
+            Number of optimization restarts with perturbed initial points.
+        optimizer_iterations : int, default=10
+            Maximum iterations per optimization run.
+
+        Returns
+        -------
+        tuple
+            ``(optimized_expr, success, final_fitness)`` where:
+            - optimized_expr: Expression with optimized constants, or None if failed
+            - success: bool indicating whether optimization improved fitness
+            - final_fitness: float fitness value of the optimized expression
+        """
+        # Check if expression contains constants
         total_constants = len(parent.constant_indices)
         if not (total_constants > 0):
             return None, False, np.nan
 
-        use_jax_optimization = (
-            parent.metric.name in _fitness_jax_map and 
-            parent.size >= 9 and
-            (parent.size >= 15 or X.shape[0] >= 5000)
-        )
-
-        if use_jax_optimization:
-            return self._optimize_constants_jax(
-                parent, X, y, optimizer_algorithm, 
-                optimizer_nrestarts, optimizer_iterations
-            )
-        else:
-            return self._optimize_constants_numpy(
-                parent, X, y, optimizer_algorithm, 
-                optimizer_nrestarts, optimizer_iterations
-            )
-
-    def _optimize_constants_numpy(
-        self, parent: Expression, X: np.ndarray, y: np.ndarray,
-        optimizer_algorithm='L-BFGS-B', optimizer_nrestarts=3, optimizer_iterations=10
-    ):
-        # 获取初始常量
+        parent = parent.copy()
+        # Extract initial constant values
         initial_constants = np.array([
             node.node_content.value for node in PostOrderIter(parent.tree) 
                 if isinstance(node.node_content, Constant)
         ])
 
-        # 定义优化目标（使用预编译的梯度）
+        # Define optimization objective function (using pre-compiled gradients)
         def objective(constants_np: np.ndarray):
-            # 计算损失（使用快速的NumPy执行）
-            fitness = parent.fitness(X, y, constants_np)
-            loss = -fitness if parent.metric.greater_is_better else fitness
+            # Compute loss using fast NumPy execution
+            updated_parent = parent.update_constants(constants_np)
+            fitness = updated_parent.fitness(X, y, sample_weight, constants=constants_np)
+            loss = -fitness if updated_parent.metric.greater_is_better else fitness
             
             return loss
 
-        # 多次重启优化
+        # Multi-restart optimization
         best_loss = float('inf')
         best_constants = initial_constants.copy()
         
         for restart in range(optimizer_nrestarts):
-            # 初始点
+            # Initial point
             if restart == 0:
                 x0 = initial_constants.copy()
             else:
@@ -1324,7 +1559,7 @@ class ExpressionGP:
                 constants_scale = np.abs(initial_constants) + 1e-6
                 x0 = initial_constants + noise * constants_scale
             
-            # 执行优化
+            # Execute optimization
             if optimizer_algorithm in METHODS_WITH_EPS:
                 result = minimize(
                     objective, x0, method=optimizer_algorithm, 
@@ -1336,140 +1571,83 @@ class ExpressionGP:
                     method=optimizer_algorithm, 
                     options={'maxiter': optimizer_iterations}
                 )
-            # 更新最佳结果
+            # Update best result
             if result.fun < best_loss:
                 best_loss = result.fun
                 best_constants = result.x
 
-        # 创建优化后的表达式
+        # Create optimized expression
         optimized_expr = parent.update_constants(best_constants)
         final_fitness = -best_loss if parent.metric.greater_is_better else best_loss
         
         return optimized_expr, True, final_fitness
 
-    def _optimize_constants_jax(
-        self, parent: Expression, X: np.ndarray, y: np.ndarray,
-        optimizer_algorithm='L-BFGS-B', optimizer_nrestarts=3, optimizer_iterations=10
-    ):
-        # 获取初始常量
-        initial_constants = jnp.array([
-            node.node_content.value for node in PostOrderIter(parent.tree) 
-                if isinstance(node.node_content, Constant)
-        ])
-        
-        # 预编译JAX梯度函数（只编译一次）
-        grad_fn = parent._get_gradient_function()
-        X_jax = jnp.array(X)
-        y_jax = jnp.array(y)
-        
-        # 定义优化目标（使用预编译的梯度）
-        def objective_and_grad(constants_np):
-            constants_jax = jnp.array(constants_np)
-            
-            # 计算梯度（使用预编译的函数）
-            grad = grad_fn(constants_jax, X_jax, y_jax)
-            
-            # 计算损失（使用快速的NumPy执行）
-            fitness = parent.fitness(X, y, constants_np)
-            loss = -fitness if parent.metric.greater_is_better else fitness
-            
-            return float(loss), np.array(grad)
-        
-        # 多次重启优化
-        best_loss = float('inf')
-        best_constants = initial_constants.copy()
-        
-        for restart in range(optimizer_nrestarts):
-            # 初始点
-            if restart == 0:
-                x0 = initial_constants.copy()
-            else:
-                noise_scale = 0.1 / np.sqrt(restart)
-                noise = self.random_state.uniform(-noise_scale, noise_scale, size=len(initial_constants))
-                constants_scale = np.abs(initial_constants) + 1e-6
-                x0 = initial_constants + noise * constants_scale
-            
-            # 执行优化
-            if optimizer_algorithm in METHODS_WITH_EPS:
-                result = minimize(
-                    objective_and_grad, x0,
-                    method=optimizer_algorithm, jac=True,
-                    options={'maxiter': optimizer_iterations, 'eps': 0.00001}
-                )
-            else:
-                result = minimize(
-                    objective_and_grad, x0,
-                    method=optimizer_algorithm, jac=True,
-                    options={'maxiter': optimizer_iterations}
-                )
-            # 更新最佳结果
-            if result.fun < best_loss:
-                best_loss = result.fun
-                best_constants = result.x
-        
-        # 创建优化后的表达式
-        optimized_expr = parent.update_constants(best_constants)
-        final_fitness = -best_loss if parent.metric.greater_is_better else best_loss
-        
-        return optimized_expr, True, final_fitness
-
-    def optimize_aggregations(self, parent: Expression, X, y, 
+    def optimize_aggregations(self, parent: Expression, 
+                              X: np.ndarray, y: np.ndarray, 
+                              sample_weight: Optional[np.ndarray] = None,
                               optimizer_iterations=10, max_shift_ratio=0.1, 
                               early_exaggeration_iter=3, early_stopping_patience=4, 
                               exaggeration_factor=2.5) -> Tuple[Optional['Expression'], bool]:
         """
-        优化表达式中的 DynamicAggregation 节点参数（局部搜索）
-        
-        使用贪心爬山算法优化聚合窗口的位置和大小
-        
-        参数
+        Optimize DynamicAggregation node parameters using local search (greedy hill climbing).
+
+        Uses a greedy hill climbing algorithm to optimize aggregation window positions
+        and sizes for spectral aggregation nodes.
+
+        Parameters
         ----------
-        X : array-like, shape (n_samples, n_features)
-            输入特征
-        y : array-like, shape (n_samples,)
-            目标变量
-        sample_weight : array-like, shape (n_samples,)
-            样本权重
-        optimizer_iterations : int
-            最大迭代次数
-        max_shift_ratio : float
-            窗口移动的最大比例（相对于当前窗口大小）
-        early_exaggeration_iter : int
-            早期放大阶段的迭代次数（使用更大的搜索步长）
-        early_stopping_patience : int
-            早停耐心值（连续无改进的迭代次数）
-        exaggeration_factor : float
-            早期阶段的步长放大因子
-        
-        返回
+        parent : Expression
+            Parent expression containing aggregation nodes to optimize.
+        X : ndarray, shape (n_samples, n_features)
+            Input features.
+        y : ndarray, shape (n_samples,)
+            Target values.
+        sample_weight : ndarray, optional, shape (n_samples,)
+            Sample weights for weighted fitness evaluation.
+        optimizer_iterations : int, default=10
+            Maximum number of optimization iterations.
+        max_shift_ratio : float, default=0.1
+            Maximum window shift ratio relative to current window size.
+        early_exaggeration_iter : int, default=3
+            Number of iterations in the early exaggeration phase (larger step sizes).
+        early_stopping_patience : int, default=4
+            Number of consecutive non-improving iterations before early stopping.
+        exaggeration_factor : float, default=2.5
+            Step size multiplier for the early exaggeration phase.
+
+        Returns
         -------
-        new_expr : AdvancedLinearExpression
-            优化后的表达式
-        success : bool
-            优化是否成功（相比初始表达式有改进）
-        
-        优化策略：
-        1. 移动窗口（左/右平移）
-        2. 扩展窗口（增加覆盖范围）
-        3. 收缩窗口（减少覆盖范围）
-        4. 调整边界（单独移动 v_start 或 v_end）
-        
-        时间复杂度：O(iterations * neighbors * n_samples)
-        其中 neighbors ≈ O(n_aggregations * shift_amount * 操作类型)
+        tuple
+            ``(new_expr, success, raw_fitness)`` where:
+            - new_expr: Expression with optimized aggregation parameters
+            - success: bool indicating optimization success
+            - raw_fitness: float fitness value of the optimized expression
+
+        Optimization Strategy
+        ---------------------
+        1. Shift window (left/right translation)
+        2. Expand window (increase coverage)
+        3. Shrink window (decrease coverage)
+        4. Adjust boundaries (move v_start or v_end independently)
+
+        Time Complexity
+        ---------------
+        O(iterations * neighbors * n_samples)
+        where neighbors ≈ O(n_aggregations * shift_amount * operation_types)
         """
         if parent._count_scalar_aggregations() == 0:
             return None, False, np.nan
         
-        # 1. 收集所有聚合节点的索引（一次遍历）
+        # Step 1: Collect all aggregation nodes in a single traversal
         agg_nodes = [node for node in PreOrderIter(parent.tree) 
                     if isinstance(node.node_content, DynamicAggregation)]
         
-        # 2. 创建副本并记录初始状态
+        # Step 2: Create copy and record initial states
         new_expr = parent.copy()
         n_variables = X.shape[1]
         early_exaggeration_iter = min(early_exaggeration_iter, optimizer_iterations)
         
-        # 初始状态：[(index, v_start, v_end, op_name, valid_op), ...]
+        # Initial states: [(index, v_start, v_end, stat_name, valid_op), ...]
         initial_states = []
         for node in agg_nodes:
             agg = node.node_content
@@ -1477,93 +1655,125 @@ class ExpressionGP:
                 'node': node,
                 'v_start': agg.v_start,
                 'v_end': agg.v_end,
-                'op_name': agg.op_name,
-                'valid_op': agg.valid_op
+                'stat_name_spectral': agg.stat_name_spectral
             })
         
-        # 3. 计算初始适应度
+        # Step 3: Compute initial fitness
         best_fitness = new_expr.fitness(X, y)
         best_states = [s.copy() for s in initial_states]
         
-        # 4. 定义快速应用状态的函数
+        # Step 4: Define fast state application function
         def apply_states(states):
-            """将参数状态应用到节点"""
+            """Apply parameter states to nodes in-place."""
             for state in states:
                 node = state['node']
                 node.node_content = DynamicAggregation(
                     v_start=state['v_start'],
                     v_end=state['v_end'],
-                    op_name=state['op_name'],
-                    n_variables=n_variables,
-                    valid_op=state['valid_op']
+                    stat_name_spectral=state['stat_name_spectral'],
+                    n_variables=n_variables
                 )
             return True
         
-        # 6. 贪心爬山算法
+        # Step 6: Greedy hill climbing algorithm
         current_states = initial_states
         current_fitness = best_fitness
         
         iterations = 0
-        no_improvement_count = 0  # 记录连续无改进的迭代次数
+        no_improvement_count = 0  # Consecutive non-improving iterations
         
         while iterations < optimizer_iterations and no_improvement_count < early_stopping_patience:
             iterations += 1
             improved = False
             
-            # 动态调整步长（早期放大）
+            # Dynamic step size adjustment (early exaggeration)
             current_exaggeration_factor = (exaggeration_factor 
                                           if iterations <= early_exaggeration_iter 
                                           else 1.0)
             
-            # 生成邻居
+            # Generate neighbor states
             neighbors = self._get_neighbors(
                 n_variables, current_states, max_shift_ratio, 
-                current_exaggeration_factor, self.random_state
+                current_exaggeration_factor, self.random_state,
+                self.generator.valid_spectral_length
             )
             
-            # 评估邻居（首次改进即停止）
+            # Evaluate neighbors (first-improvement strategy)
             for neighbor_states in neighbors:
                 apply_states(neighbor_states)
                 
-                neighbor_fitness = new_expr.fitness(X, y)
+                neighbor_fitness = new_expr.fitness(X, y, sample_weight)
                 
-                # 检查是否改进
+                # Check for improvement
                 is_better = (neighbor_fitness > current_fitness 
                             if parent.metric.greater_is_better 
                             else neighbor_fitness < current_fitness)
                 
                 if is_better:
-                    # 接受改进
+                    # Accept improvement
                     current_states = neighbor_states
                     current_fitness = neighbor_fitness
                     improved = True
                     
-                    # 更新全局最佳
+                    # Update global best
                     best_states = [s.copy() for s in current_states]
                     best_fitness = current_fitness
                     no_improvement_count = 0
-                    break  # 首次改进策略
+                    break  # First-improvement strategy
             
-            # 早停计数（跳过早期放大阶段）
+            # Early stopping counter (skip during exaggeration phase)
             if not improved and iterations > early_exaggeration_iter:
                 no_improvement_count += 1
         
-        # 7. 应用最佳状态
+        # Step 7: Apply best states
         apply_states(best_states)
         raw_fitness = best_fitness
         
         return new_expr, True, raw_fitness
 
-    # 5. 邻居生成函数（批量生成候选）
     @staticmethod
     def _get_neighbors(n_variables, states, max_shift_ratio, 
-                       current_exaggeration_factor, random_state):
+                       current_exaggeration_factor, random_state, valid_spectral_length=None):
         """
-        生成邻居状态
-        
-        返回：[(new_states, operation_description), ...]
+        Generate neighbor states for greedy hill climbing.
+
+        Creates candidate neighbor states by applying various window operations
+        including shifts, expansions, and shrinks to each aggregation node.
+
+        Parameters
+        ----------
+        n_variables : int
+            Total number of variables (features) in the spectral dimension.
+        states : list of dict
+            Current states of aggregation nodes.
+        max_shift_ratio : float
+            Maximum shift ratio relative to window size.
+        current_exaggeration_factor : float
+            Multiplier for step size (greater than 1 during exaggeration phase).
+        random_state : RandomState
+            Random state for stochastic neighbor generation.
+        valid_spectral_length : int or tuple, optional
+            Valid length constraint for spectral windows.
+
+        Returns
+        -------
+        list
+            List of neighbor state configurations.
         """
         neighbors = []
+
+        def check_and_append(new_states, new_start, new_end):
+            """Validate and append neighbor state if within constraints."""
+            length = new_end - new_start + 1
+            if isinstance(valid_spectral_length, int):
+                if length > valid_spectral_length:
+                    return None
+            elif isinstance(valid_spectral_length, tuple):
+                min_length, max_length = valid_spectral_length
+                if length < min_length or length > max_length:
+                    return None
+            
+            neighbors.append(new_states)
         
         for i, state in enumerate(states):
             v_start, v_end = state['v_start'], state['v_end']
@@ -1588,7 +1798,7 @@ class ExpressionGP:
                     new_states = [s.copy() for s in states]
                     new_states[i]['v_start'] = new_start
                     new_states[i]['v_end'] = new_end
-                    neighbors.append(new_states)
+                    check_and_append(new_states, new_start, new_end)
             
             # --- 操作2: 仅移动 v_start ---
             for direction in [-1, 1]:
@@ -1599,7 +1809,7 @@ class ExpressionGP:
                         (new_start != v_start):
                     new_states = [s.copy() for s in states]
                     new_states[i]['v_start'] = new_start
-                    neighbors.append(new_states)
+                    check_and_append(new_states, new_start, new_states[i]['v_end'])
             
             # --- 操作3: 仅移动 v_end ---
             for direction in [-1, 1]:
@@ -1610,7 +1820,7 @@ class ExpressionGP:
                         (new_end != v_end):
                     new_states = [s.copy() for s in states]
                     new_states[i]['v_end'] = new_end
-                    neighbors.append(new_states)
+                    check_and_append(new_states, new_states[i]['v_start'], new_end)
             
             # --- 操作4: 扩展窗口 ---
             expand_amount = random_state.randint(1, max_shift + 1)
@@ -1626,21 +1836,21 @@ class ExpressionGP:
                 new_states = [s.copy() for s in states]
                 new_states[i]['v_start'] = new_start
                 new_states[i]['v_end'] = new_end
-                neighbors.append(new_states)
+                check_and_append(new_states, new_start, new_end)
             
             # 仅左扩展
             if (v_start > 0) and (new_start != v_start):
                 new_start = max(0, v_start - expand_amount)
                 new_states = [s.copy() for s in states]
                 new_states[i]['v_start'] = new_start
-                neighbors.append(new_states)
+                check_and_append(new_states, new_start, new_states[i]['v_end'])
             
             # 仅右扩展
             if (v_end < n_variables - 1) and (new_end != v_end):
                 new_end = min(n_variables - 1, v_end + expand_amount)
                 new_states = [s.copy() for s in states]
                 new_states[i]['v_end'] = new_end
-                neighbors.append(new_states)
+                check_and_append(new_states, new_states[i]['v_start'], new_end)
             
             # --- 操作5: 收缩窗口（保持至少2个元素）---
             if window_size > 2:
@@ -1658,34 +1868,49 @@ class ExpressionGP:
                     new_states = [s.copy() for s in states]
                     new_states[i]['v_start'] = new_start
                     new_states[i]['v_end'] = new_end
-                    neighbors.append(new_states)
+                    check_and_append(new_states, new_start, new_end)
                 
                 # 仅左收缩
                 new_start = min(v_start + shrink_amount, v_end - 1)
                 if new_start < v_end and new_start != v_start:
                     new_states = [s.copy() for s in states]
                     new_states[i]['v_start'] = new_start
-                    neighbors.append(new_states)
+                    check_and_append(new_states, new_start, new_states[i]['v_end'])
                 
                 # 仅右收缩
                 new_end = max(v_start + 1, v_end - shrink_amount)
                 if v_start < new_end and new_end != v_end:
                     new_states = [s.copy() for s in states]
                     new_states[i]['v_end'] = new_end
-                    neighbors.append(new_states)
+                    check_and_append(new_states, new_states[i]['v_start'], new_end)
         
         return neighbors
 
 
 
 def weighted_random_choice_expr_set(weights_dict: dict, random_state: np.random.RandomState) -> str:
+    """
+    Select an item using weighted random choice for ExpressionSet operations.
+
+    Parameters
+    ----------
+    weights_dict : dict
+        Mapping of item names to their selection weights.
+    random_state : RandomState
+        Random state for reproducible selection.
+
+    Returns
+    -------
+    str
+        Selected item name.
+    """
     random_state = check_random_state(random_state)
     
-    # 将字典转换为可哈希的元组用于缓存
+    # Convert dict to hashable tuple for caching
     weights_tuple = tuple(sorted(weights_dict.items()))
     names, cumulative_probs = _get_cumulative_probs_expr_set(weights_tuple)
     
-    # 轮盘赌选择
+    # Roulette wheel selection
     random_value = random_state.uniform()
     idx = np.searchsorted(cumulative_probs, random_value, side='right')
     return names[idx]
@@ -1693,23 +1918,84 @@ def weighted_random_choice_expr_set(weights_dict: dict, random_state: np.random.
 
 @lru_cache(maxsize=128)
 def _get_cumulative_probs_expr_set(weights_tuple):
+    """
+    Compute normalized cumulative probabilities for weighted selection.
+
+    Parameters
+    ----------
+    weights_tuple : tuple
+        Tuple of (name, weight) pairs.
+
+    Returns
+    -------
+    tuple
+        ``(names, cumulative_probs)`` where cumulative_probs is normalized.
+    """
     names, weights = zip(*weights_tuple)
     weights_array = np.array(weights, dtype=np.float64)
     
-    # 归一化并计算累积概率
+    # Normalize and compute cumulative probabilities
     total_weight = weights_array.sum()
     if total_weight <= 0:
-        raise ValueError("总权重必须为正数")
+        raise ValueError("Total weight must be positive")
     
     probabilities = weights_array / total_weight
     cumulative_probs = np.cumsum(probabilities)
-    cumulative_probs[-1] = 1.0  # 修正浮点误差
+    cumulative_probs[-1] = 1.0  # Correct floating-point accumulation error
     
     return names, cumulative_probs
 
 
 
 class ExpressionSetGP:
+    """
+    Genetic Programming operators for multi-output ExpressionSet individuals.
+
+    ExpressionSetGP implements crossover and mutation operators that operate on
+    collections of Expression trees (ExpressionSet). These operators are used by
+    the Population class to evolve multi-output models such as multi-class
+    classifiers.
+
+    Mutation Operators
+    ------------------
+    The following mutation types are available for set-level operations:
+    - add_expr: Add a new expression to the set (in a None slot)
+    - delete_expr: Remove an expression from the set
+    - swap_exprs: Swap two expressions in the set
+    - mutate_expr: Apply expression-level mutation to one member
+    - mutate_constant: Mutate constants in a random expression
+    - randomize_expr: Replace a single expression with a new random one
+    - randomize_set: Replace all expressions with new random ones
+    - simplify_set: Simplify all expressions in the set
+    - do_nothing_set: No change (for weighted selection schemes)
+
+    Crossover Operators
+    -------------------
+    - single_point: Swap all expressions after a random crossover point
+    - two_point: Swap expressions between two crossover points
+    - multi_point: Swap expressions at multiple random points
+    - subtree_crossover: Apply subtree crossover within corresponding expressions
+
+    Parameters
+    ----------
+    generator : ExprSetGenerator
+        Factory for creating new random expressions.
+    gpoperator : ExpressionGP
+        Expression-level genetic operators for subtree operations.
+    set_mutation_weights : dict, optional
+        Relative probability weights for each mutation type.
+    set_crossover_method : str, default='single_point'
+        Method for set-level crossover ('single_point', 'two_point', 'multi_point').
+    set_crossover_probability : float, default=0.0369
+        Probability of performing set-level crossover vs. subtree crossover.
+    random_state : int or RandomState, optional
+        Random seed for reproducibility.
+
+    See Also
+    --------
+    ExpressionGP : Operators for single-expression individuals.
+    ExpressionSet : The multi-output expression container.
+    """
     def __init__(self,
                  generator: ExprSetGenerator,
                  gpoperator: ExpressionGP,
@@ -1726,7 +2012,19 @@ class ExpressionSetGP:
         self.set_crossover_probability = set_crossover_probability
 
     def reproduce(self, expressions: List[Optional['Expression']]) -> 'ExpressionSet':
-        """Returns a list of nodes in the tree in pre-order."""
+        """
+        Create a new ExpressionSet from a list of expressions.
+
+        Parameters
+        ----------
+        expressions : list
+            List of Expression objects (may include None placeholders).
+
+        Returns
+        -------
+        ExpressionSet
+            New expression set with the given expressions.
+        """
         return ExpressionSet(
             expressions=expressions,
             metric=self.generator.metric,
@@ -1737,12 +2035,32 @@ class ExpressionSetGP:
                   parent: ExpressionSet, donor: ExpressionSet, 
         ) -> Tuple[Optional[ExpressionSet], Optional[ExpressionSet], bool]:
         """
-        Performs crossover between two ExpressionSets, producing two new offspring.
+        Perform crossover between two ExpressionSets, producing two offspring.
+
+        Strategy
+        ---------
+        With probability set_crossover_probability, performs set-level crossover
+        (swapping entire expressions between sets). Otherwise, performs subtree
+        crossover within corresponding expressions.
+
+        Parameters
+        ----------
+        parent : ExpressionSet
+            First parent expression set.
+        donor : ExpressionSet
+            Second parent expression set (provides genetic material).
+
+        Returns
+        -------
+        tuple
+            ``(offspring1, offspring2, success)`` containing two new offspring
+            and a success flag.
         """
         if len(parent) != len(donor):
             raise ValueError("Crossover requires the same length of expressions for both parents.")
 
-        if self.random_state.uniform() < self.set_crossover_probability:
+        if self.random_state.uniform()<self.set_crossover_probability and len(parent.expressions)>1:
+            # Set-level crossover
             if self.set_crossover_method == 'single_point':
                 cross_point = self.random_state.randint(1, len(parent.expressions))
                 exprs1 = parent.expressions[:cross_point] + donor.expressions[cross_point:]
@@ -1767,6 +2085,7 @@ class ExpressionSetGP:
             else:
                 raise ValueError(f"Invalid set_crossover_method: {self.set_crossover_method}")
         else:
+            # Subtree-level crossover
             exprs1 = [None] * len(parent.expressions)
             exprs2 = [None] * len(parent.expressions)
             for i in range(len(parent.expressions)):
@@ -1782,6 +2101,12 @@ class ExpressionSetGP:
 
         offspring1 = self.reproduce(exprs1)
         offspring2 = self.reproduce(exprs2)
+        
+        # Validate complexity and constraints
+        if not offspring1.is_valid(self. maxsize):
+            return None, None, False
+        if not offspring2.is_valid(self. maxsize):
+            return None, None, False
 
         return offspring1, offspring2, True
 
@@ -1819,7 +2144,7 @@ class ExpressionSetGP:
         
         # Dispatch to the correct mutation method
         if mutation_name == 'mutate_expr':
-            new_expr_set, mutation_succeeded = self.mutate_expr(parent)
+            new_expr_set, mutation_succeeded, mutation_name = self.mutate_expr(parent)
         elif mutation_name == 'randomize_expr':
             new_expr_set, mutation_succeeded = self.randomize_expr(parent)
         elif mutation_name == 'do_nothing_set':
@@ -1839,10 +2164,28 @@ class ExpressionSetGP:
         else:
             raise ValueError(f'Invalid mutation name: {mutation_name}')
 
+        # 验证复杂度和约束
+        if mutation_succeeded and new_expr_set is not None:
+            if not new_expr_set.is_valid(self. maxsize):
+                return None, False, mutation_name
+
         return new_expr_set, mutation_succeeded, mutation_name
 
     def mutate_expr(self, parent: ExpressionSet):
-        """Perform the mutation operation on a single GeneticExpression."""
+        """
+        Apply expression-level mutation to a randomly selected expression in the set.
+
+        Parameters
+        ----------
+        parent : ExpressionSet
+            Parent expression set to mutate.
+
+        Returns
+        -------
+        tuple
+            ``(new_expr_set, success, mutation_name)`` containing the mutated
+            expression set and success flag.
+        """
         valid_points = [i for i, v in enumerate(parent.expressions) if v is not None]
         if not valid_points:
             return None, False
@@ -1850,81 +2193,117 @@ class ExpressionSetGP:
         mutation_point = self.random_state.choice(valid_points)
         parent_expr = parent.expressions[mutation_point]
         
-        mutated_expr, mutation_succeeded, _ = self.gpoperator.mutation(parent_expr)
+        mutated_expr, mutation_succeeded, mutation_name = self.gpoperator.mutation(parent_expr)
         
-        # 1. 提早失败
+        # Early failure check
         if not mutation_succeeded:
-            return None, False
+            return None, False, mutation_name
         
-        # 2. 构建一个全新的列表
+        # Build new expression list
         new_exprs = (
             parent.expressions[:mutation_point] + 
             [mutated_expr] + 
             parent.expressions[mutation_point+1:]
         )
         
-        # 3. 使用新列表创建副本
+        # Create copy with new list
         new_expr_set = self.reproduce(new_exprs)
         
-        return new_expr_set, True
+        return new_expr_set, True, mutation_name
 
     def mutate_constant(self, parent: ExpressionSet):
-        """Mutate a random constant in the expression set."""
-        # 1. 找到可突变的表达式
+        """
+        Mutate a constant value in a random expression within the set.
+
+        Parameters
+        ----------
+        parent : ExpressionSet
+            Parent expression set containing constants to mutate.
+
+        Returns
+        -------
+        tuple
+            ``(new_expr_set, success)`` containing the mutated expression set.
+        """
+        # Find expressions that can be mutated
         valid_points = [i for i, v in enumerate(parent.expressions) if v is not None]
         if not valid_points:
             return None, False
         
-        # 尝试随机选择一个进行突变
-        #（注意：如果选中的没有常量，parent_expr.mutate_constant() 会自动返回 False）
+        # Randomly select an expression for mutation
+        # Note: If selected expression has no constants, mutate_constant() returns False
         mutation_point = self.random_state.choice(valid_points)
         parent_expr = parent.expressions[mutation_point]
 
-        # 2. 尝试突变
+        # Attempt mutation
         mutated_expr, mutation_succeeded = self.gpoperator.mutate_constant(parent_expr)
 
         if not mutation_succeeded:
             return None, False
             
-        # 3. 构建新列表
+        # Build new list
         new_exprs = (
             parent.expressions[:mutation_point] + 
             [mutated_expr] + 
             parent.expressions[mutation_point+1:]
         )
         
-        # 4. 创建副本
+        # Create copy
         new_expr_set = self.reproduce(new_exprs)
         
         return new_expr_set, True
 
     def delete_expr(self, parent: ExpressionSet):
-        """Deletes an expression from the set."""
+        """
+        Delete an expression from the set by replacing it with None.
+
+        Parameters
+        ----------
+        parent : ExpressionSet
+            Parent expression set.
+
+        Returns
+        -------
+        tuple
+            ``(new_expr_set, success)`` containing the modified expression set.
+        """
         valid_points = [i for i, v in enumerate(parent.expressions) if v is not None]
         
-        # 1. 检查是否满足删除条件
+        # Check if deletion is allowed
         if len(valid_points) <= self.generator.minorder:
             return None, False
         if not valid_points:
             return None, False
 
-        # 2. 选择删除点
+        # Select deletion point
         point_to_delete = self.random_state.choice(valid_points)
         
-        # 3. 构建新列表 (用 None 替换)
+        # Build new list (replace with None)
         new_exprs = (
             parent.expressions[:point_to_delete] + 
             [None] + 
             parent.expressions[point_to_delete+1:]
         )
         
-        # 4. 创建副本
+        # Create copy
         new_expr_set = self.reproduce(new_exprs)
         
         return new_expr_set, True
 
     def swap_exprs(self, parent: ExpressionSet):
-        """Swaps two expressions in the set."""
+        """
+        Swap two expressions within the set.
+
+        Parameters
+        ----------
+        parent : ExpressionSet
+            Parent expression set.
+
+        Returns
+        -------
+        tuple
+            ``(new_expr_set, success)`` containing the modified expression set.
+        """
         valid_points = [i for i, v in enumerate(parent.expressions) if v is not None]
         if len(valid_points) < 2:
             return None, False
@@ -1933,7 +2312,7 @@ class ExpressionSetGP:
         if idx1 > idx2:
             idx1, idx2 = idx2, idx1
         
-        # Swap in the new set
+        # Swap expressions in new set
         new_exprs = (
             parent.expressions[:idx1] + 
             [parent.expressions[idx2]] + 
@@ -1946,32 +2325,69 @@ class ExpressionSetGP:
         return new_expr_set, True
 
     def randomize_set(self, parent: ExpressionSet):
-        """Replace all expressions with new, randomly generated."""
+        """
+        Replace all expressions with newly generated random expressions.
+
+        Parameters
+        ----------
+        parent : ExpressionSet
+            Parent expression set to replace.
+
+        Returns
+        -------
+        tuple
+            ``(new_expr_set, success)`` containing the new random expression set.
+        """
         new_expr_set = self.generator.generate_random_exprset()
         return new_expr_set, True
 
     def randomize_expr(self, parent: ExpressionSet):
-        """Replace a random expression with a new, randomly generated one."""
-        # 1. 随机选择一个替换点（可以替换 None）
+        """
+        Replace a single expression with a newly generated random expression.
+
+        Parameters
+        ----------
+        parent : ExpressionSet
+            Parent expression set.
+
+        Returns
+        -------
+        tuple
+            ``(new_expr_set, success)`` containing the modified expression set.
+        """
+        # Randomly select a replacement point (can replace None)
         mutation_point = self.random_state.choice(len(parent.expressions))
         
-        # 2. 生成新表达式
+        # Generate new expression
         new_expr = self.generator.generate_random_expr()
         
-        # 3. 构建新列表
+        # Build new list
         new_exprs = (
             parent.expressions[:mutation_point] + 
             [new_expr] + 
             parent.expressions[mutation_point+1:]
         )
 
-        # 4. 创建副本
+        # Create copy
         new_expr_set = self.reproduce(new_exprs)
         
         return new_expr_set, True
 
     def simplify(self, parent: ExpressionSet):
-        """Simplifies all expressions in the set."""
+        """
+        Simplify all expressions in the set using algebraic rules.
+
+        Parameters
+        ----------
+        parent : ExpressionSet
+            Parent expression set to simplify.
+
+        Returns
+        -------
+        tuple
+            ``(new_expr_set, success)`` where success is True if any
+            simplification occurred.
+        """
         expressions = [None] * len(parent.expressions)
         any_simplified = False
         for i, expr in enumerate(parent.expressions):
@@ -1988,93 +2404,130 @@ class ExpressionSetGP:
         
         new_expr_set = self.reproduce(expressions)
         
-        return new_expr_set, False
+        return new_expr_set, True
 
     def do_nothing_set(self, parent: ExpressionSet):
-        """Return a new, identical expression set."""
+        """
+        Return an unchanged copy of the expression set.
+
+        This operator is useful when the mutation schedule intentionally keeps
+        a fraction of individuals unchanged.
+
+        Parameters
+        ----------
+        parent : ExpressionSet
+            Parent expression set to copy.
+
+        Returns
+        -------
+        tuple
+            ``(new_expr_set, True)`` containing an identical copy.
+        """
         new_expr_set = self.reproduce(
             [expr.copy() if expr is not None else None for expr in parent.expressions]
         )
         return new_expr_set, True
 
     def add_expr(self, parent: ExpressionSet):
-        """Add a new expression to the expression set (in a None slot)."""
-        # 1. 找到一个空位
+        """
+        Add a new randomly generated expression to an empty slot in the set.
+
+        Parameters
+        ----------
+        parent : ExpressionSet
+            Parent expression set with empty slots.
+
+        Returns
+        -------
+        tuple
+            ``(new_expr_set, success)`` containing the modified expression set.
+        """
+        # Find empty slots
         empty_indices = [i for i, expr in enumerate(parent.expressions) if expr is None]
         if not empty_indices:
             return None, False
 
         point_to_add = self.random_state.choice(empty_indices)
         
-        # 2. 生成新表达式
+        # Generate new expression
         new_expr = self.generator.generate_random_expr()
         
-        # 3. 构建新列表
+        # Build new list
         new_exprs = (
             parent.expressions[:point_to_add] + 
             [new_expr] + 
             parent.expressions[point_to_add+1:]
         )
         
-        # 4. 创建副本
+        # Create copy
         new_expr_set = self.reproduce(new_exprs)
         
         return new_expr_set, True
 
     def optimize_constants(
-        self, parent: Expression, X: np.ndarray, y: np.ndarray,
+        self, parent: ExpressionSet, 
+        X: np.ndarray, y: np.ndarray, 
+        sample_weight: Optional[np.ndarray] = None, 
         optimizer_algorithm='L-BFGS-B', optimizer_nrestarts=3, optimizer_iterations=10
-    ):
-        # 检查是否有常量
-        const_info = parent._build_constant_info()
-        if const_info['total_constants'] == 0:
-            return None, False, np.nan
+    ) -> Tuple[Optional['ExpressionSet'], bool]:
+        """
+        Optimize constant values across all expressions in the set.
 
-        use_jax_optimization = (
-            parent.metric.name in _fitness_jax_map
-            and parent.size >= parent.order * 5
-            and (parent.size >= parent.order * 11 or X.shape[0] >= 3000)
-        )
+        Uses scipy.optimize.minimize with multiple restarts to find optimal
+        constant values that minimize (or maximize) the fitness function.
 
-        if use_jax_optimization:
-            return self._optimize_constants_jax(
-                parent, X, y, optimizer_algorithm, 
-                optimizer_nrestarts, optimizer_iterations
-            )
-        else:
-            return self._optimize_constants_numpy(
-                parent, X, y, optimizer_algorithm, 
-                optimizer_nrestarts, optimizer_iterations
-            )
+        Parameters
+        ----------
+        parent : ExpressionSet
+            Parent expression set containing constants to optimize.
+        X : ndarray, shape (n_samples, n_features)
+            Input features.
+        y : ndarray, shape (n_samples,)
+            Target values.
+        sample_weight : ndarray, optional, shape (n_samples,)
+            Sample weights for weighted fitness evaluation.
+        optimizer_algorithm : str, default='L-BFGS-B'
+            Optimization algorithm (e.g., 'L-BFGS-B', 'SLSQP', 'CG').
+        optimizer_nrestarts : int, default=3
+            Number of optimization restarts with perturbed initial points.
+        optimizer_iterations : int, default=10
+            Maximum iterations per optimization run.
 
-    def _optimize_constants_numpy(self, parent: ExpressionSet, X: np.ndarray, y: np.ndarray, 
-                                  optimizer_algorithm='L-BFGS-B', optimizer_nrestarts=3, 
-                                  optimizer_iterations=10) -> Tuple[Optional['ExpressionSet'], bool]:
-        # 1. 检查是否有常量
+        Returns
+        -------
+        tuple
+            ``(optimized_exprset, success, final_fitness)`` where:
+            - optimized_exprset: ExpressionSet with optimized constants
+            - success: bool indicating whether optimization improved fitness
+            - final_fitness: float fitness value of the optimized expression
+        """
+        # Check if expression contains constants
         const_info = parent._build_constant_info()
         if const_info['total_constants'] == 0:
             return None, False, np.nan
         
-        # 2. 提取初始常量
+        parent = parent.copy()
+        # Extract initial constant values
         initial_constants = np.array([
             node.node_content.value 
             for expr_idx, node in const_info['flat_nodes']
         ])
         
-        # 3. 定义优化目标
+        # Define optimization objective
         def objective(constants):
-            # 计算损失（使用NumPy快速执行）
-            fitness = parent.fitness(X, y, constants=constants)
-            loss = -fitness if parent.metric.greater_is_better else fitness
+            # Compute loss using fast NumPy execution
+            updated_parent = parent.update_constants(constants)
+            fitness = updated_parent.fitness(X, y, sample_weight, constants=constants)
+            loss = -fitness if updated_parent.metric.greater_is_better else fitness
             
             return loss
         
-        # 4. 多次重启优化
+        # Multi-restart optimization
         best_loss = float('inf')
         best_constants = initial_constants.copy()
         
         for restart in range(optimizer_nrestarts):
-            # 初始点
+            # Initial point
             if restart == 0:
                 x0 = initial_constants.copy()
             else:
@@ -2083,7 +2536,7 @@ class ExpressionSetGP:
                 constants_scale = np.abs(initial_constants) + 1e-6
                 x0 = initial_constants + noise * constants_scale
             
-            # 执行优化
+            # Execute optimization
             if optimizer_algorithm in METHODS_WITH_EPS:
                 result = minimize(
                     objective, x0, method=optimizer_algorithm, 
@@ -2097,124 +2550,84 @@ class ExpressionSetGP:
                     method=optimizer_algorithm, 
                     options={'maxiter': optimizer_iterations}
                 )
-            # 更新最佳结果
+            # Update best result
             if result.fun < best_loss:
                 best_loss = result.fun
                 best_constants = result.x
         
-        # 5. 创建优化后的表达式
+        # Create optimized expression set
         optimized_expr = parent.update_constants(best_constants)
         final_fitness = -best_loss if parent.metric.greater_is_better else best_loss
         
         return optimized_expr, True, final_fitness
 
-    def _optimize_constants_jax(self, parent: ExpressionSet, X: np.ndarray, y: np.ndarray, 
-                                optimizer_algorithm='L-BFGS-B', optimizer_nrestarts=3, 
-                                optimizer_iterations=10) -> Tuple[Optional['ExpressionSet'], bool]:
-        # 1. 检查是否有常量
-        const_info = parent._build_constant_info()
-        if const_info['total_constants'] == 0:
-            return None, False, np.nan
-        
-        # 2. 准备JAX数组（只转换一次）
-        X_jax = jnp.array(X)
-        y_jax = jnp.array(y)
-        
-        # 3. 预编译梯度函数
-        grad_fn = parent._get_gradient_function()
-        
-        # 4. 定义优化目标
-        def objective_and_grad(constants):
-            constants_jax = jnp.array(constants)
-            
-            # 计算梯度（使用预编译的函数）
-            grad = grad_fn(constants_jax, X_jax, y_jax)
-            
-            # 计算损失（使用NumPy快速执行）
-            fitness = parent.fitness(X, y, constants=constants)
-            loss = -fitness if parent.metric.greater_is_better else fitness
-            
-            return float(loss), np.array(grad)
-        
-        # 5. 提取初始常量
-        initial_constants = np.array([
-            node.node_content.value 
-            for expr_idx, node in const_info['flat_nodes']
-        ])
-        
-        # 6. 执行优化
-        best_loss = float('inf')
-        best_constants = initial_constants.copy()
-        
-        for restart in range(optimizer_nrestarts):
-            # 第一次使用原始值，后续添加噪声
-            if restart == 0:
-                x0 = initial_constants.copy()
-            else:
-                # 噪声强度递减（避免后期扰动过大）
-                noise_scale = 0.1 / np.sqrt(restart)
-                # restart=1: 10%, restart=2: 7.1%, restart=3: 5.8%
-                noise = self.random_state.uniform(-noise_scale, noise_scale, size=len(initial_constants))
-                constants_scale = np.abs(initial_constants) + 1e-6  # 处理零值
-                x0 = initial_constants + noise * constants_scale
-            
-            # 执行优化
-            if optimizer_algorithm in METHODS_WITH_EPS:
-                result = minimize(
-                    objective_and_grad, x0,
-                    method=optimizer_algorithm, jac=True,
-                    options={
-                        'maxiter': optimizer_iterations,
-                        'eps': self.gpoperator.constants_tolerance
-                    }
-                )
-            else:
-                result = minimize(
-                    objective_and_grad, x0,
-                    method=optimizer_algorithm, jac=True,
-                    options={'maxiter': optimizer_iterations}
-                )
-            
-            # 更新最佳结果
-            if result.fun < best_loss:
-                best_loss = result.fun
-                best_constants = result.x
-        
-        # 7. 返回优化后的表达式集合
-        optimized_expr_set = parent.update_constants(best_constants)
-        final_fitness = -best_loss if parent.metric.greater_is_better else best_loss
-        
-        return optimized_expr_set, True, final_fitness
-
     def optimize_aggregations(
-        self, parent: ExpressionSet, X, y, 
+        self, parent: ExpressionSet, 
+        X: np.ndarray, y: np.ndarray, 
+        sample_weight: Optional[np.ndarray] = None, 
         optimizer_iterations=10, max_shift_ratio=0.1, 
         early_exaggeration_iter=3, early_stopping_patience=4, exaggeration_factor=2.5
     ) -> Tuple[Optional['ExpressionSet'], bool]:
         """
-        优化表达式集合中的聚合节点（高效版本）
-        
-        关键优化：
-        1. 一次性收集所有聚合节点
-        2. 状态字典批量操作（减少对象创建）
-        3. 快速状态应用（原地修改节点）
-        4. 向量化邻居生成（减少循环开销）
-        
-        时间复杂度：
-        - 节点收集: O(sum(tree_size)) 一次
-        - 每次迭代: O(neighbors × k) 其中 k = 聚合节点数
-        - 总计: O(iterations × neighbors × k)
-        
-        性能提升：相比原实现约 2-3x
+        Optimize DynamicAggregation parameters across all expressions in the set.
+
+        Uses a greedy hill climbing algorithm to optimize aggregation window
+        positions and sizes for all spectral aggregation nodes in the set.
+
+        Key Optimizations
+        -----------------
+        1. Single-pass collection of all aggregation nodes
+        2. Batch state dictionary operations (reduced object creation)
+        3. Fast state application (in-place node modification)
+        4. Vectorized neighbor generation (reduced loop overhead)
+
+        Time Complexity
+        ---------------
+        - Node collection: O(sum(tree_size)) once
+        - Per iteration: O(neighbors × k) where k = number of aggregation nodes
+        - Total: O(iterations × neighbors × k)
+
+        Performance
+        -----------
+        Approximately 2-3x faster than the original implementation.
+
+        Parameters
+        ----------
+        parent : ExpressionSet
+            Parent expression set containing aggregation nodes to optimize.
+        X : ndarray, shape (n_samples, n_features)
+            Input features.
+        y : ndarray, shape (n_samples,)
+            Target values.
+        sample_weight : ndarray, optional, shape (n_samples,)
+            Sample weights for weighted fitness evaluation.
+        optimizer_iterations : int, default=10
+            Maximum number of optimization iterations.
+        max_shift_ratio : float, default=0.1
+            Maximum window shift ratio relative to current window size.
+        early_exaggeration_iter : int, default=3
+            Number of iterations in the early exaggeration phase.
+        early_stopping_patience : int, default=4
+            Number of consecutive non-improving iterations before stopping.
+        exaggeration_factor : float, default=2.5
+            Step size multiplier for the early exaggeration phase.
+
+        Returns
+        -------
+        tuple
+            ``(new_exprset, success, raw_fitness)`` where:
+            - new_exprset: ExpressionSet with optimized aggregations
+            - success: bool indicating optimization success
+            - raw_fitness: float fitness value of the optimized expression
         """
-        # 1. 检查是否满足条件
+        # Check if any expression contains aggregations
         if sum(expr._count_scalar_aggregations() for expr in parent.expressions if expr is not None) <= 0:
             return None, False, np.nan
         
-        # 2. 复制原始表达式集合
-        new_expr_set = self.reproduce([expr.copy() if expr is not None else None for expr in parent.expressions])
+        # Copy original expression set
+        new_expr_set = parent.copy()
         
-        # 3. 一次性收集所有聚合节点（关键优化）
+        # Collect all aggregation nodes in single pass (key optimization)
         agg_nodes = []
         for expr in new_expr_set.expressions:
             if expr is not None:
@@ -2224,36 +2637,34 @@ class ExpressionSetGP:
         n_variables = X.shape[1]
         early_exaggeration_iter = min(early_exaggeration_iter, optimizer_iterations)
         
-        # 3. 记录初始状态（使用列表推导式）
+        # Record initial states
         initial_states = []
         for node in agg_nodes:
             agg = node.node_content
             initial_states.append({
-                'node': node,            # 节点对象
-                'v_start': agg.v_start,  # 窗口起始索引
-                'v_end': agg.v_end,      # 窗口结束索引
-                'op_name': agg.op_name,  # 聚合操作名称
-                'valid_op': agg.valid_op # 有效操作标志
+                'node': node,             # Node object
+                'v_start': agg.v_start,   # Window start index
+                'v_end': agg.v_end,       # Window end index
+                'stat_name_spectral': agg.stat_name_spectral  # Aggregation name
             })
         
-        # 4. 计算初始适应度
+        # Compute initial fitness
         best_fitness = new_expr_set.fitness(X, y)
         best_states = [s.copy() for s in initial_states]
         
-        # 5. 定义快速状态应用函数（闭包优化）
+        # Fast state application function (closure optimization)
         def apply_states(states):
-            """快速应用聚合参数（原地修改）"""
+            """Apply aggregation parameters in-place."""
             for state in states:
                 node = state['node']
                 node.node_content = DynamicAggregation(
                     v_start=state['v_start'],
                     v_end=state['v_end'],
-                    op_name=state['op_name'],
-                    n_variables=n_variables,
-                    valid_op=state['valid_op']
+                    stat_name_spectral=state['stat_name_spectral'],
+                    n_variables=n_variables
                 )
         
-        # 7. 贪心爬山算法
+        # Greedy hill climbing algorithm
         current_states = initial_states
         current_fitness = best_fitness
         
@@ -2264,24 +2675,25 @@ class ExpressionSetGP:
             iterations += 1
             improved = False
             
-            # 动态调整步长
+            # Dynamic step size adjustment
             current_exaggeration_factor = (exaggeration_factor 
                                         if iterations <= early_exaggeration_iter 
                                         else 1.0)
             
-            # 生成邻居
+            # Generate neighbor states
             neighbors = self.gpoperator._get_neighbors(
                 n_variables, current_states, max_shift_ratio, 
-                current_exaggeration_factor, self.random_state
+                current_exaggeration_factor, self.random_state,
+                self.generator.valid_spectral_length
             )
             
-            # 评估邻居（首次改进即停止）
+            # Evaluate neighbors (first-improvement strategy)
             for neighbor_states in neighbors:
                 apply_states(neighbor_states)
                 
-                neighbor_fitness = new_expr_set.fitness(X, y)
+                neighbor_fitness = new_expr_set.fitness(X, y, sample_weight)
                 
-                # 检查是否改进
+                # Check for improvement
                 is_better = (neighbor_fitness > current_fitness 
                         if parent.metric.greater_is_better 
                         else neighbor_fitness < current_fitness)
@@ -2291,17 +2703,17 @@ class ExpressionSetGP:
                     current_fitness = neighbor_fitness
                     improved = True
                     
-                    # 更新全局最佳
+                    # Update global best
                     best_states = [s.copy() for s in current_states]
                     best_fitness = current_fitness
                     no_improvement_count = 0
-                    break  # 首次改进策略
+                    break  # First-improvement strategy
             
-            # 早停计数（跳过早期放大阶段）
+            # Early stopping counter (skip during exaggeration phase)
             if not improved and iterations > early_exaggeration_iter:
                 no_improvement_count += 1
         
-        # 8. 应用最佳状态
+        # Apply best states
         apply_states(best_states)
         raw_fitness = best_fitness
         
