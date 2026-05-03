@@ -22,18 +22,18 @@ The code implements our data-driven symbolic learning framework for discovering 
 - Class-specific spectral indices with full interpretability
 - **Dynamic Spectral Aggregation Terminals (DSATs)** — terminal nodes that aggregate adjacent spectral bands on demand
 - **Complexity-guided population initialization** — seeds the initial population with expressions spanning a wide range of structural complexity
-- Synergistic Softmax–Focal Loss optimization for multiclass expression sets
+- **Hinge Loss-based expression-set optimization** — jointly optimizes a set of expressions, a key distinguishing feature of this algorithm that enables coherent multiclass discrimination
 - Support for both multispectral and hyperspectral datasets
 - Reproduction of all experiments reported in the paper
 
 ### 🔧 Evolutionary Engine
 
-The GP engine is inspired by [SymbolicRegression.jl](https://github.com/M厂暑暑暑暑暑/SymbolicRegression.jl) and shares many of its design characteristics (e.g., typed function sets, hall-of-fame archiving). The key novel contributions over that baseline are:
+The GP engine is inspired by [SymbolicRegression.jl](https://github.com/astroautomata/SymbolicRegression.jl) and shares many of its design characteristics (e.g., typed function sets, hall-of-fame archiving). The key novel contributions over that baseline are:
 
 - **DSATs**: terminals that adaptively aggregate neighboring spectral channels, enabling the discovery of indices that would be impractical to express with raw bands alone
 - **Complexity-guided initialization**: seeds the population across the full spectrum of expression complexity, improving exploration without sacrificing diversity
 
-Performance is lower than a compiled Julia implementation, but the NumPy/Numba backend provides reasonable speed for datasets of typical遥感 size.
+Performance is lower than a compiled Julia implementation, but the NumPy/Numba backend provides reasonable speed for datasets of typical size.
 
 ---
 
