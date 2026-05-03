@@ -24,7 +24,6 @@ The code implements our data-driven symbolic learning framework for discovering 
 - **Complexity-guided population initialization** — seeds the initial population with expressions spanning a wide range of structural complexity
 - **Hinge Loss-based expression-set optimization** — jointly optimizes a set of expressions, a key distinguishing feature of this algorithm that enables coherent multiclass discrimination
 - Support for both multispectral and hyperspectral datasets
-- Reproduction of all experiments reported in the paper
 
 ### 🔧 Evolutionary Engine
 
