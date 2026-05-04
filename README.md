@@ -86,7 +86,7 @@ The repository includes example datasets under `./example_data`:
 
 The hyperspectral datasets used in the paper (e.g., **Pavia University**, **Salinas**) can be downloaded from:
 
-👉 [Hyperspectral Remote Sensing Scenes](https://www.ehu.eus/ccwintco/index.php?title=Hyperspectral_Remote_Sensing_Scenes)
+👉 [Hyperspectral_Image_Datasets_Collection](https://github.com/Sellifake/Hyperspectral_Image_Datasets_Collection)
 
 Due to data size limitations, a preview of the Pavia University dataset is included in:
 
