@@ -1,4 +1,4 @@
-# **Transparent class-specific spectral indices via data-driven symbolic learning: Toward interpretable land-cover mapping**
+# **Symbolic Discovery of Transparent Class-Specific Spectral Indices for Interpretable Land Cover Mapping**
 
 **Authors:** Junwu Dong, Tao Pei, Ci Song, Xi Wang, Yahui Qi, Dayu Cheng, Yanmin Jiang
 
@@ -6,7 +6,7 @@
 
 This repository provides the official implementation of the paper:
 
-**"Transparent class-specific spectral indices via data-driven symbolic learning: Toward interpretable land-cover mapping."**
+**"Symbolic Discovery of Transparent Class-Specific Spectral Indices for Interpretable Land Cover Mapping."**
 
 The code implements our data-driven symbolic learning framework for discovering transparent, class-specific spectral indices that support both single-index threshold segmentation and multiclass land-cover classification.
 
