@@ -1,8 +1,8 @@
 import pandas as pd
 
 
-from src.utils import _calculate_scores
-from src.expression import Expression, ExpressionSet
+from symbolearn.utils import _calculate_scores
+from symbolearn.expression import Expression, ExpressionSet
 
 
 
@@ -51,7 +51,7 @@ class HallOfFame:
 
     Examples
     --------
-    >>> from src.halloffame import HallOfFame
+    >>> from symbolearn.halloffame import HallOfFame
     >>> hof = HallOfFame(greater_is_better=False)
     >>> # Add some expressions
     >>> hof.add(expr_simple, error=0.1)  # Simple but higher error

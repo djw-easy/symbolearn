@@ -11,9 +11,9 @@ from sklearn.utils.validation import check_X_y, check_array, _check_sample_weigh
 
 
 
-from src.node import softmax
-from src.base import BaseSymbolic
-from src.utils import extract_and_aggregate_spatial
+from symbolearn.node import softmax
+from symbolearn.base import BaseSymbolic
+from symbolearn.utils import extract_and_aggregate_spatial
 
 
 

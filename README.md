@@ -39,7 +39,8 @@ Performance is lower than a compiled Julia implementation, but the NumPy/Numba b
 ## 📦 Installation
 
 ```bash
-pip install -r requirements.txt
+pip install -e .                    # development (editable)
+pip install -e .[acceleration]      # + numba for JIT speedup
 ```
 
 The core library requires only NumPy, pandas, scipy, scikit-learn, joblib, and tqdm. Numba is optional — if installed, computationally intensive fitness functions are JIT-compiled for a significant speedup; if absent, the pure-NumPy fallback is used transparently.
@@ -49,9 +50,9 @@ The core library requires only NumPy, pandas, scipy, scikit-learn, joblib, and t
 ## 🚀 Quick Start
 
 ```python
-from src.symbolic_estimators import SymbolicClassifier, SymbolicRegressor
 from sklearn.datasets import make_classification
 from sklearn.model_selection import train_test_split
+from symbolearn import SymbolicClassifier, SymbolicRegressor
 
 X, y = make_classification(n_samples=1000, n_features=20, random_state=42)
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
@@ -102,7 +103,7 @@ Due to data size limitations, a preview of the Pavia University dataset is inclu
 .
 ├── example_data/               # Example multispectral & hyperspectral data
 ├── figs/                       # Figures and diagrams used in README/paper
-├── src/                        # Core implementation
+├── symbolearn/                 # Core implementation
 │   ├── base.py                 # Base estimator class
 │   ├── expression.py           # Expression and ExpressionSet (chromosome) representation
 │   ├── fitness.py              # Fitness evaluation
@@ -121,7 +122,7 @@ Due to data size limitations, a preview of the Pavia University dataset is inclu
 ├── example.ipynb               # Main demo notebook
 ├── train_sc.py                 # Training script for hyperspectral classification
 ├── test.py                     # Lightweight smoke test
-├── requirements.txt            # Python dependencies
+├── pyproject.toml              # Package configuration & dependencies
 └── README.md
 ```
 

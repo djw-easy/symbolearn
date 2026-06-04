@@ -23,16 +23,16 @@ from sklearn.exceptions import NotFittedError
 from sklearn.utils.validation import check_is_fitted
 
 
-from src.halloffame import HallOfFame
-from src.population import Population
-from src.log import LogAnalyzer, EvolutionLogger
-from src.fitness import _loss_function_map, Fitness
-from src.expression import Expression, ExpressionSet
-from src.tree_parser import load_expressions_from_csv
-from src.gpoperator import ExpressionGP, ExpressionSetGP
-from src.generator import ExprGenerator, ExprSetGenerator
-from src.node import Operator, _operator_map, op_name_alias
-from src.utils import check_random_state, _idx_model_selection, poisson_sample
+from symbolearn.halloffame import HallOfFame
+from symbolearn.population import Population
+from symbolearn.log import LogAnalyzer, EvolutionLogger
+from symbolearn.fitness import _loss_function_map, Fitness
+from symbolearn.expression import Expression, ExpressionSet
+from symbolearn.tree_parser import load_expressions_from_csv
+from symbolearn.gpoperator import ExpressionGP, ExpressionSetGP
+from symbolearn.generator import ExprGenerator, ExprSetGenerator
+from symbolearn.node import Operator, _operator_map, op_name_alias
+from symbolearn.utils import check_random_state, _idx_model_selection, poisson_sample
 
 
 MAX_INT = np.iinfo(np.int32).max

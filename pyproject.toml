@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "symbolearn"
+version = "0.1.0"
+description = "Symbolic discovery of transparent class-specific spectral indices for interpretable land cover mapping"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=2.0",
+    "pandas>=2.0",
+    "scipy>=1.10",
+    "scikit-learn>=1.3",
+    "joblib>=1.3",
+    "tqdm>=4.0",
+    "numba>=0.58",
+]
+
+[tool.setuptools.packages.find]
+include = ["symbolearn", "symbolearn.*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+required_plugins = []
+filterwarnings = ["ignore::UserWarning"]

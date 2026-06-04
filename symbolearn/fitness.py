@@ -3,21 +3,21 @@ from typing import Literal, Union, Optional, TYPE_CHECKING, Callable
 
 
 if TYPE_CHECKING:
-    from src.expression import Expression, ExpressionSet
+    from symbolearn.expression import Expression, ExpressionSet
 
-from src.metrics.regression import (
+from symbolearn.metrics.regression import (
     mean_square_error,
     mean_absolute_error,
     root_mean_square_error
 )
-from src.metrics.classification import (
+from symbolearn.metrics.classification import (
     cross_entropy_loss,
     focal_loss,
     nll_loss,
     accuracy,
     hinge_loss
 )
-from src.metrics.transformer import (
+from symbolearn.metrics.transformer import (
     weighted_pearson,
     weighted_spearman,
     silhouette_loss,

@@ -9,12 +9,10 @@ import pandas as pd
 import numpy as np
 import os
 
-pd.set_option('display.max_colwidth', 150)
 
-
-from src.fitness import Fitness
-from src.utils import stratified_train_test_split, extract_and_aggregate_spatial
-from src.symbolic_estimators import SymbolicRegressor, SymbolicClassifier, SymbolicTransformer
+from symbolearn.fitness import Fitness
+from symbolearn.utils import stratified_train_test_split, extract_and_aggregate_spatial
+from symbolearn.symbolic_estimators import SymbolicRegressor, SymbolicClassifier, SymbolicTransformer
 
 
 datasets_info = {

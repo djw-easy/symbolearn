@@ -2,8 +2,8 @@ from typing import Union, Optional, List, Dict, Tuple
 import numpy as np
 
 
-from src.node import NodeContent
-from src.utils import check_random_state
+from symbolearn.node import NodeContent
+from symbolearn.utils import check_random_state
 
 
 class SymbolicNode:
@@ -73,7 +73,7 @@ class SymbolicNode:
 
     Examples
     --------
-    >>> from src.node import add2, Variable, Constant
+    >>> from symbolearn.node import add2, Variable, Constant
     >>> # Build: add(x0, 2.5)
     >>> leaf1 = SymbolicNode(node_content=Variable(0))
     >>> leaf2 = SymbolicNode(node_content=Constant(2.5))

@@ -443,7 +443,11 @@ def stratified_train_test_split(
         y_flat = y
         indices = np.arange(len(y))
 
-    if train_size <= 0:
+    if isinstance(train_size, float):
+        if not (0 < train_size < 1):
+            raise ValueError("train_size must be a positive integer or a float in (0, 1).")
+        train_size = max(1, int(train_size * len(y)))
+    elif train_size <= 0:
         raise ValueError("train_size must be a positive integer.")
 
     # --- 2. Filter Valid Samples (Handle ignore_label) ---
@@ -594,8 +598,8 @@ def stratified_train_test_split(
                 test_indices.extend(idx_array.tolist())
             else:
                 # Normal split: first `quota` to train, rest to test
-                train_indices.extend(idx_array[:quota].tolist())
-                test_indices.extend(idx_array[quota:].tolist())
+                train_indices.extend(idx_array[:int(quota)].tolist())
+                test_indices.extend(idx_array[int(quota):].tolist())
 
         train_indices = np.array(train_indices)
         test_indices = np.array(test_indices)

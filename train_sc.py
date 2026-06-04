@@ -47,6 +47,7 @@ Spatial-Spectral Features:
     --spectral_stats : Spectral aggregation functions (default: ['mean', 'min', 'max', 'slope'])
 
 System:
+    --output_dir : Root output directory (default: 'outputs')
     --n_jobs : Parallel jobs (default: 16)
     --verbose : Verbosity level (default: 0)
     --random_state : Random seed (default: 42)
@@ -100,9 +101,9 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import classification_report, accuracy_score
 
 # Custom imports
-from src.base import seconds_to_readable
-from src.utils import stratified_train_test_split
-from src.symbolic_estimators import SymbolicClassifier
+from symbolearn.base import seconds_to_readable
+from symbolearn.utils import stratified_train_test_split
+from symbolearn.symbolic_estimators import SymbolicClassifier
 
 # --- Dataset Configuration ---
 # Format: {Name: [File, Data_Key, GT_File, GT_Key, Dimensions, Num_Classes]}
@@ -208,6 +209,8 @@ def parse_args():
     
     # Computational Settings
     group_sys = parser.add_argument_group('System')
+    group_sys.add_argument('--output_dir', type=str, default='outputs',
+                          help='Root output directory (default: outputs)')
     group_sys.add_argument('--n_jobs', type=int, default=16)
     group_sys.add_argument('--verbose', type=int, default=0)
     group_sys.add_argument('--ndigits', type=int, default=10)
@@ -333,7 +336,7 @@ def main():
 
     # 2. Prepare output directory and paths ahead of time (used inside callback)
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    output_dir = os.path.join(f'outputs/models{args.train_size}/SC', selected_ds)
+    output_dir = os.path.join(f'{args.output_dir}/models{args.train_size}/SC', selected_ds)
     os.makedirs(output_dir, exist_ok=True)
     best_hof_path = os.path.join(output_dir, f'best_hof_{timestamp}.csv')
     best_model_path = os.path.join(output_dir, f'best_hof_{timestamp}.joblib')

@@ -7,14 +7,14 @@ import math
 
 
 
-from src.node import Constant
-from src.tree import PostOrderIter
-from src.halloffame import HallOfFame
-from src.utils import check_random_state
-from src.log import EvolutionLogger, LogAnalyzer
-from src.expression import Expression, ExpressionSet
-from src.gpoperator import ExpressionGP, ExpressionSetGP
-from src.generator import ExprGenerator, ExprSetGenerator
+from symbolearn.node import Constant
+from symbolearn.tree import PostOrderIter
+from symbolearn.halloffame import HallOfFame
+from symbolearn.utils import check_random_state
+from symbolearn.log import EvolutionLogger, LogAnalyzer
+from symbolearn.expression import Expression, ExpressionSet
+from symbolearn.gpoperator import ExpressionGP, ExpressionSetGP
+from symbolearn.generator import ExprGenerator, ExprSetGenerator
 
 
 
@@ -96,9 +96,9 @@ class Population:
 
     Examples
     --------
-    >>> from src.population import Population
-    >>> from src.generator import ExprGenerator
-    >>> from src.gpoperator import ExpressionGP
+    >>> from symbolearn.population import Population
+    >>> from symbolearn.generator import ExprGenerator
+    >>> from symbolearn.gpoperator import ExpressionGP
     >>> generator = ExprGenerator(maxsize=21, operators=['add', 'sub', 'mul', 'div'], ...)
     >>> gpoperator = ExpressionGP(generator, mutation_weights={...})
     >>> pop = Population(population_size=50, generator=generator, gpoperator=gpoperator)

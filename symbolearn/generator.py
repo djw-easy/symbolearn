@@ -6,11 +6,11 @@ from collections import defaultdict
 from typing import Union, Optional, List, Tuple, Callable, Dict
 
 
-from src.node import Operator, Constant, Variable, _operator_map, NodeContent, DynamicAggregation
-from src.tree import count_trees, generate_random_tree, SymbolicNode, PreOrderIter
-from src.expression import Expression, ExpressionSet
-from src.fitness import Fitness, _loss_function_map
-from src.utils import check_random_state
+from symbolearn.node import Operator, Constant, Variable, _operator_map, NodeContent, DynamicAggregation
+from symbolearn.tree import count_trees, generate_random_tree, SymbolicNode, PreOrderIter
+from symbolearn.expression import Expression, ExpressionSet
+from symbolearn.fitness import Fitness, _loss_function_map
+from symbolearn.utils import check_random_state
 
 
 
@@ -108,7 +108,7 @@ class ExprGenerator:
 
     Examples
     --------
-    >>> from src.generator import ExprGenerator
+    >>> from symbolearn.generator import ExprGenerator
     >>> gen = ExprGenerator(
     ...     maxsize=21,
     ...     operators=['add', 'sub', 'mul', 'div'],

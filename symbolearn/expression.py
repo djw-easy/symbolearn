@@ -5,9 +5,9 @@ from scipy import sparse
 from typing import Union, Optional, List
 
 
-from src.fitness import Fitness
-from src.node import Operator, Constant, Variable, DynamicAggregation
-from src.tree import clone_tree, PreOrderIter, PostOrderIter, SymbolicNode
+from symbolearn.fitness import Fitness
+from symbolearn.node import Operator, Constant, Variable, DynamicAggregation
+from symbolearn.tree import clone_tree, PreOrderIter, PostOrderIter, SymbolicNode
 
 
 
@@ -76,8 +76,8 @@ class Expression(object):
 
     Examples
     --------
-    >>> from src.tree import SymbolicNode
-    >>> from src.node import add2, Variable, Constant
+    >>> from symbolearn.tree import SymbolicNode
+    >>> from symbolearn.node import add2, Variable, Constant
     >>> # Create: x0 + 2.5
     >>> const_node = SymbolicNode(node_content=Constant(2.5), degree=0)
     >>> var_node = SymbolicNode(node_content=Variable(0), degree=0)

@@ -4,10 +4,10 @@ import pandas as pd
 from typing import List, Optional, Callable, Union
 
 
-from src.node import _operator_map, Variable, Constant, DynamicAggregation, Operator
-from src.expression import Expression, ExpressionSet
-from src.fitness import Fitness, _loss_function_map
-from src.tree import SymbolicNode
+from symbolearn.node import _operator_map, Variable, Constant, DynamicAggregation, Operator
+from symbolearn.expression import Expression, ExpressionSet
+from symbolearn.fitness import Fitness, _loss_function_map
+from symbolearn.tree import SymbolicNode
 
 
 class TreeParser:

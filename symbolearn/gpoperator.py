@@ -5,11 +5,11 @@ from scipy.optimize import minimize
 from typing import Union, Optional, List, Tuple
 
 
-from src.tree import PreOrderIter, PostOrderIter, SymbolicNode, clone_tree
-from src.node import Operator, Constant, Variable, DynamicAggregation
-from src.generator import ExprGenerator, ExprSetGenerator
-from src.expression import Expression, ExpressionSet
-from src.utils import check_random_state
+from symbolearn.tree import PreOrderIter, PostOrderIter, SymbolicNode, clone_tree
+from symbolearn.node import Operator, Constant, Variable, DynamicAggregation
+from symbolearn.generator import ExprGenerator, ExprSetGenerator
+from symbolearn.expression import Expression, ExpressionSet
+from symbolearn.utils import check_random_state
 
 
 
@@ -101,8 +101,8 @@ class ExpressionGP:
 
     Examples
     --------
-    >>> from src.gpoperator import ExpressionGP
-    >>> from src.generator import ExprGenerator
+    >>> from symbolearn.gpoperator import ExpressionGP
+    >>> from symbolearn.generator import ExprGenerator
     >>> gen = ExprGenerator(maxsize=21, operators=['add', 'sub', 'mul', 'div'], ...)
     >>> gp = ExpressionGP(gen, mutation_weights={'add_node': 2.0, 'mutate_constant': 0.5, ...})
     >>> # Mutate an expression
