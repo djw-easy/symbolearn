@@ -552,6 +552,9 @@ class Population:
     
     def find_top_n(self, n: int, find_best: bool = True) -> np.ndarray:
         """查找最佳/最差的 n 个个体（O(n) 使用 argpartition）"""
+        if n <= 0:
+            return np.array([], dtype=int)
+        n = min(n, len(self.fitnesses))
         if n == 0:
             return np.array([], dtype=int)
         
@@ -559,10 +562,10 @@ class Population:
             if find_best:
                 return np.argpartition(self.fitnesses, -n)[-n:]
             else:
-                return np.argpartition(self.fitnesses, n)[:n]
+                return np.argpartition(self.fitnesses, n - 1)[:n]
         else:
             if find_best:
-                return np.argpartition(self.fitnesses, n)[:n]
+                return np.argpartition(self.fitnesses, n - 1)[:n]
             else:
                 return np.argpartition(self.fitnesses, -n)[-n:]
 

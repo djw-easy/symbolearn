@@ -220,7 +220,26 @@ class SymbolicNode:
             count += 1
             stack.extend(node._children)
         return count
-    
+
+    def replace_child(self, old_child: 'SymbolicNode', new_child: 'SymbolicNode'):
+        for i, child in enumerate(self._children):
+            if child is old_child:
+                self._children[i] = new_child
+                old_child._parent = None
+                new_child._parent = self
+                self._invalidate_size_cache()
+                return
+        raise ValueError(f"Child {old_child.name} not found in {self.name}")
+
+    @property
+    def child_index(self) -> int | None:
+        if self._parent is None:
+            return None
+        for i, child in enumerate(self._parent._children):
+            if child is self:
+                return i
+        return None
+
     def _invalidate_size_cache(self):
         """使当前节点及所有祖先的大小缓存失效"""
         node = self

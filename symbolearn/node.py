@@ -1283,7 +1283,7 @@ def _sigmoid(x: np.ndarray) -> np.ndarray:
         result[x <= EXP_LOWER_BOUND] = 0.0
         result[x >= EXP_UPPER_BOUND] = 1.0
 
-        return result.astype(np.float32)
+        return result
 
 
 def _softplus(x: np.ndarray) -> np.ndarray:

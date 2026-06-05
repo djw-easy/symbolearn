@@ -1079,6 +1079,8 @@ class ExpressionSet(object):
         
         self.expressions = expressions
         
+        self._complexity_cache = None
+        
         # 预分析常量信息
         self._constant_info = None
 
@@ -1101,13 +1103,11 @@ class ExpressionSet(object):
 
     @property
     def complexity(self) -> float:
-        """
-        Total complexity of the expression set.
-
-        Returns the sum of complexities for all non-None expressions.
-        """
+        if self._complexity_cache is not None:
+            return self._complexity_cache
         total = sum(expr.complexity for expr in self.expressions if expr is not None)
-        return round(total)
+        self._complexity_cache = round(total)
+        return self._complexity_cache
 
     @property
     def order(self) -> int:
@@ -1391,6 +1391,7 @@ class ExpressionSet(object):
                 new_expressions.append(expr)
         
         self.expressions = new_expressions
+        self._complexity_cache = None
         return self
 
     def simplify(self, constants_tolerance: float = 1e-5) -> 'Expression':

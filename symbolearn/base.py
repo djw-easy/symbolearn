@@ -1286,9 +1286,6 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
                 best_fitness = best_individual.error
                 self._run_details['best_order'].append(0)
 
-            current_individuals = [
-                ind for pop in self._populations for ind in pop.individuals
-            ]
             all_fitness = np.ma.masked_invalid(
                 np.hstack([pop.fitnesses for pop in self._populations])
             )
@@ -1298,6 +1295,9 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
 
             self._run_details['generation'].append(gen)
             if self.is_multi_output_:
+                current_individuals = [
+                    ind for pop in self._populations for ind in pop.individuals
+                ]
                 all_order = [ind.order for ind in current_individuals]
                 self._run_details['average_order'].append(np.mean(all_order))
             else:
