@@ -23,16 +23,16 @@ from sklearn.exceptions import NotFittedError
 from sklearn.utils.validation import check_is_fitted
 
 
-from symbolearn.halloffame import HallOfFame
-from symbolearn.population import Population
-from symbolearn.log import LogAnalyzer, EvolutionLogger
-from symbolearn.fitness import _loss_function_map, Fitness
-from symbolearn.expression import Expression, ExpressionSet, _UNSET
-from symbolearn.tree_parser import load_expressions_from_csv
-from symbolearn.gpoperator import ExpressionGP, ExpressionSetGP
-from symbolearn.generator import ExprGenerator, ExprSetGenerator
-from symbolearn.node import Operator, _operator_map, op_name_alias, ZScore
-from symbolearn.utils import check_random_state, _idx_model_selection, poisson_sample
+from src.halloffame import HallOfFame
+from src.population import Population
+from src.log import LogAnalyzer, EvolutionLogger
+from src.fitness import _loss_function_map, Fitness
+from src.expression import Expression, ExpressionSet, _UNSET
+from src.tree_parser import load_expressions_from_csv
+from src.gpoperator import ExpressionGP, ExpressionSetGP
+from src.generator import ExprGenerator, ExprSetGenerator
+from src.node import Operator, _operator_map, op_name_alias, ZScore
+from src.utils import check_random_state, _idx_model_selection, poisson_sample
 
 # Minimum per-output standard deviation for z-score normalisation. Output
 # channels with a smaller spread on the training samples are treated as already
@@ -637,7 +637,14 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
         self.random_state = check_random_state(random_state)
         self.ndigits = ndigits
         self.is_multi_output_ = self.order is not None
-        self._zscore_stats: dict = {}  # key: HoF complexity_key → (mean, std)
+        # key: HoF complexity_key → (expression, mean, std)
+        #
+        # Complexity alone does not identify an HoF expression: evolution may
+        # replace an entry with a better expression of exactly the same
+        # complexity. Keeping the expression reference in the cache lets
+        # _get_zscore_override detect that replacement and recompute the
+        # statistics instead of applying those of the previous expression.
+        self._zscore_stats: dict = {}
         self._train_mask_ = None       # bool mask of training samples (set in fit)
         
         # Callback configuration
@@ -1185,12 +1192,19 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
 
     def _finalize_zscore(self, X):
         """Compute global z-score statistics for every HoF entry on the full
-        training data, and store them keyed by complexity_key."""
+        training data.
+
+        Cache entries retain the exact HoF expression object as well as its
+        statistics. A later expression with the same complexity therefore
+        cannot accidentally reuse these statistics.
+        """
+        # Drop entries for expressions that left the HoF during evolution.
+        self._zscore_stats.clear()
         for complexity_key, entry in self.hall_of_fame_.entries.items():
             expr = entry[0]
             if isinstance(expr.out_func, ZScore):
                 mean, std = self._compute_zscore_stats(expr, X)
-                self._zscore_stats[complexity_key] = (mean, std)
+                self._zscore_stats[complexity_key] = (expr, mean, std)
 
     def _get_zscore_override(
         self,
@@ -1229,18 +1243,31 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
             complexity_key = best_row['complexity']
 
         # Statistics may not exist yet when called mid-training (e.g. from a
-        # callback before _finalize_zscore runs). Compute them on demand.
-        if complexity_key not in self._zscore_stats:
+        # callback before _finalize_zscore runs). More importantly, an HoF
+        # entry may have been replaced by a different expression with the same
+        # complexity key. Only reuse statistics when they belong to the exact
+        # expression object currently stored in the HoF.
+        #
+        # The shape check also makes models saved with the old two-item
+        # ``(mean, std)`` cache format self-healing on their next prediction.
+        cached = self._zscore_stats.get(complexity_key)
+        cache_matches = (
+            isinstance(cached, tuple)
+            and len(cached) == 3
+            and cached[0] is expr
+        )
+
+        if not cache_matches:
             if X is None:
                 raise KeyError(
                     f'Z-score statistics for complexity key {complexity_key} '
-                    'are not available and no reference data X was supplied to '
-                    'compute them on demand.'
+                    'are not available for the selected expression and no '
+                    'reference data X was supplied to compute them on demand.'
                 )
             mean, std = self._compute_zscore_stats(expr, X)
-            self._zscore_stats[complexity_key] = (mean, std)
-
-        mean, std = self._zscore_stats[complexity_key]
+            self._zscore_stats[complexity_key] = (expr, mean, std)
+        else:
+            _, mean, std = cached
 
         def fitted_zscore(x):
             x = np.asarray(x, dtype=np.float64)
