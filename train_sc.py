@@ -47,7 +47,6 @@ Spatial-Spectral Features:
     --spectral_stats : Spectral aggregation functions (default: ['mean', 'min', 'max', 'slope'])
 
 System:
-    --output_dir : Root output directory (default: 'outputs')
     --n_jobs : Parallel jobs (default: 16)
     --verbose : Verbosity level (default: 0)
     --random_state : Random seed (default: 42)
@@ -90,6 +89,7 @@ train.py : Generic symbolic regression trainer.
 
 import os
 import io
+import json
 import sys
 import time
 import joblib
@@ -102,7 +102,7 @@ from sklearn.metrics import classification_report, accuracy_score
 
 # Custom imports
 from symbolearn.base import seconds_to_readable
-from symbolearn.utils import stratified_train_test_split
+from symbolearn.utils import stratified_train_test_split, spatially_disjoint_train_test_split
 from symbolearn.symbolic_estimators import SymbolicClassifier
 
 # --- Dataset Configuration ---
@@ -128,8 +128,8 @@ def load_dataset(dataset_name: str):
     info = DATASETS_INFO[dataset_name]
     
     # Load raw image and ground truth
-    img_dict = loadmat(f'./example_data/hyperspectral/{dataset_name}/{info[0]}.mat')
-    gt_dict = loadmat(f'./example_data/hyperspectral/{dataset_name}/{info[2]}.mat')
+    img_dict = loadmat(f'./data/hyperspectral/{dataset_name}/{info[0]}.mat')
+    gt_dict = loadmat(f'./data/hyperspectral/{dataset_name}/{info[2]}.mat')
     
     image = img_dict[info[1]]
     image_gt = gt_dict[info[3]]
@@ -172,6 +172,8 @@ def parse_args():
                           help='Controls the number of training samples')
     group_ds.add_argument('--per_class', type=float, default=True, 
                           help='Determines how `train_size` is interpreted')
+    group_ds.add_argument('--min_test_samples', type=int, default=30,
+                          help='Minimum test samples per class; supplements from training region if needed (default: None)')
     
     # Evolutionary Settings
     group_evo = parser.add_argument_group('Symbolic Engine')
@@ -202,15 +204,15 @@ def parse_args():
     # Spatial/Spectral Settings
     group_spat = parser.add_argument_group('Spatial-Spectral Features')
     group_spat.add_argument('--spatial_stats', type=str, default='mean')
-    group_spat.add_argument('--valid_window_sizes', type=int, default=3)
+    # window_size=1 means no spatial filter process
+    group_spat.add_argument('--valid_window_sizes', type=int, default=1)
     group_spat.add_argument('--spectral_stats', type=str, nargs='+', default=[
         'mean', 'min', 'max', 'slope'
     ])
+    group_spat.add_argument('--valid_spectral_length', type=tuple, default=(5, 50))
     
     # Computational Settings
     group_sys = parser.add_argument_group('System')
-    group_sys.add_argument('--output_dir', type=str, default='outputs',
-                          help='Root output directory (default: outputs)')
     group_sys.add_argument('--n_jobs', type=int, default=16)
     group_sys.add_argument('--verbose', type=int, default=0)
     group_sys.add_argument('--ndigits', type=int, default=10)
@@ -218,7 +220,7 @@ def parse_args():
     group_sys.add_argument('--batching', type=str2bool, default=False)
     group_sys.add_argument('--batch_size', type=int, default=512)
     group_sys.add_argument('--metric', type=str, default='hinge_loss')
-    group_sys.add_argument('--out_func', type=str, default='identity')
+    group_sys.add_argument('--out_func', type=str, default='zscore')
     group_sys.add_argument('--enable_logging', type=str2bool, default=False)
 
     return parser.parse_args()
@@ -315,20 +317,22 @@ def main():
     image_scaled, image_gt, X_valid, y_valid = load_dataset(selected_ds)
     
     if args.per_class:
-        _, _, y_train, y_test = stratified_train_test_split(
+        _, _, y_train, y_test = spatially_disjoint_train_test_split(
             image_scaled, image_gt, train_size=args.train_size,
-            ignore_label=0, random_state=args.random_state, 
-            shuffle=True, preserve_shape=True,
-            per_class=True, balanced=True,
-            allow_insufficient=True
+            ignore_label=0, random_state=args.random_state,
+            min_test_samples=args.min_test_samples,
+            preserve_shape=True, per_class=True,
+            block_size=4, buffer_size=2,
+            allow_insufficient=True,
         )
     else:
-        _, _, y_train, y_test = stratified_train_test_split(
+        _, _, y_train, y_test = spatially_disjoint_train_test_split(
             image_scaled, image_gt, train_size=args.train_size*DATASETS_INFO[selected_ds][-1],
-            ignore_label=0, random_state=args.random_state, 
-            shuffle=True, preserve_shape=True,
-            per_class=False, balanced=True,
-            allow_insufficient=True
+            ignore_label=0, random_state=args.random_state,
+            min_test_samples=args.min_test_samples,
+            preserve_shape=True, per_class=False,
+            block_size=4, buffer_size=2,
+            allow_insufficient=True,
         )
     
     unique_classes, counts = np.unique(y_valid, return_counts=True)
@@ -336,7 +340,12 @@ def main():
 
     # 2. Prepare output directory and paths ahead of time (used inside callback)
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    output_dir = os.path.join(f'{args.output_dir}/models{args.train_size}/SC', selected_ds)
+    output_dir = os.path.join(
+        f'outputs/models{args.train_size}/SC',
+        selected_ds,
+        f'run_{args.random_state}',
+        timestamp
+    )
     os.makedirs(output_dir, exist_ok=True)
     best_hof_path = os.path.join(output_dir, f'best_hof_{timestamp}.csv')
     best_model_path = os.path.join(output_dir, f'best_hof_{timestamp}.joblib')
@@ -375,6 +384,7 @@ def main():
         nested_constraints=args.nested_constraints,
         spatial_stats=args.spatial_stats,
         valid_window_sizes=args.valid_window_sizes,
+        valid_spectral_length=args.valid_spectral_length,
         penalty=args.penalty, C=args.C,
         ncycles_per_iteration=args.ncycles_per_iteration,
         should_optimize_constants=args.should_optimize_constants,
@@ -464,7 +474,21 @@ def main():
         for k, v in sorted(vars(args).items()):
             f.write(f"{k}: {v}\n")
 
-    # 9. Final console summary
+    # 9. Write a structured run summary for easy aggregation across seeds
+    run_summary = {
+        'dataset': selected_ds,
+        'seed': args.random_state,
+        'best_train_acc': best_state['train_acc'],
+        'best_test_acc': best_state['test_acc'],
+        'best_generation': best_state['generation'],
+        'final_train_acc': train_acc,
+        'final_test_acc': test_acc,
+        'duration_seconds': duration,
+    }
+    with open(os.path.join(output_dir, 'run_summary.json'), 'w') as f:
+        json.dump(run_summary, f, indent=2)
+
+    # 10. Final console summary
     print(f"    - Best Generation:   {best_state['generation']}")
     print(f"    - Best Train Acc:    {best_state['train_acc']:.6f}")
     print(f"    - Best Test Acc:     {best_state['test_acc']:.6f}")

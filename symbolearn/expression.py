@@ -2,12 +2,17 @@ import bisect
 import warnings
 import numpy as np
 from scipy import sparse
-from typing import Union, Optional, List
+from typing import Union, Optional, List, Callable
 
 
 from symbolearn.fitness import Fitness
-from symbolearn.node import Operator, Constant, Variable, DynamicAggregation
+from symbolearn.node import Operator, Constant, Variable, DynamicAggregation, ZScore
 from symbolearn.tree import clone_tree, PreOrderIter, PostOrderIter, SymbolicNode
+
+
+# Sentinel: meaning "use self.out_func" when passed as out_func_override.
+# Distinguishes from None (skip out_func) and callable (use this instead).
+_UNSET = object()
 
 
 
@@ -283,6 +288,47 @@ class Expression(object):
                              for i, node in enumerate(PostOrderIter(self.tree)) 
                              if isinstance(node.node_content, Constant)]
         return np.array(current_constants)
+
+    def _get_regularizable_constant_indices(self) -> np.ndarray:
+        """Return indices of constants that should participate in regularisation.
+
+        A constant is considered **bias-like** (and therefore *excluded* from
+        regularisation) when every operator on the path from its parent up to
+        the root is one of ``add``, ``sub``, or ``neg``.  Such constants act as
+        pure additive offsets and, like the bias term :math:`b` in an SVM,
+        should not be penalised by the regularisation term.
+
+        Constants that feed into any non-additive operator (``mul``, ``div``,
+        ``sin``, ``exp``, ``sigmoid``, ``pow``, etc.) **are** regularisable
+        because scaling them changes the model in a non-trivial way.
+
+        Returns
+        -------
+        np.ndarray
+            Integer indices into :attr:`constants` for the constants that
+            are **not** bias-like and should receive the regularisation penalty.
+            May be empty if all constants are bias-like or none exist.
+        """
+        _additive_ops = {'add', 'sub', 'neg'}
+
+        regularizable = []
+        const_counter = [0]  # mutable counter shared across recursive calls
+
+        def _walk(node: SymbolicNode, on_additive_path: bool):
+            content = node.node_content
+            if isinstance(content, Constant):
+                if not on_additive_path:
+                    regularizable.append(const_counter[0])
+                const_counter[0] += 1
+            elif isinstance(content, Operator):
+                op_name = content.name
+                child_additive = on_additive_path and (op_name in _additive_ops)
+                for child in node.children:
+                    _walk(child, child_additive)
+            # Variable / DynamicAggregation are leaves — nothing to collect
+
+        _walk(self.tree, True)
+        return np.array(regularizable, dtype=int)
 
     @property
     def size(self) -> int:
@@ -576,7 +622,7 @@ class Expression(object):
 
     def copy(self) -> 'Expression':
         """Returns a deep copy of the expression."""
-        return Expression(
+        copy = Expression(
             clone_tree(self.tree), 
             out_func=self.out_func, 
             metric=self.metric, ndigits=self.ndigits,
@@ -586,8 +632,9 @@ class Expression(object):
             complexity_of_aggregations=self.complexity_of_aggregations,
             constraints=self.constraints, nested_constraints=self.nested_constraints
         )
+        return copy
 
-    def _execute_tree(self, X: np.ndarray) -> np.ndarray:
+    def _execute_tree(self, X: np.ndarray, out_func_override: Optional[Callable] = None) -> np.ndarray:
         """
         Execute the expression on input data using direct tree evaluation.
 
@@ -595,6 +642,9 @@ class Expression(object):
         ----------
         X : ndarray
             Input features with shape (n_samples, n_features).
+        out_func_override : callable, optional
+            If provided, use this instead of ``self.out_func``.
+            Pass ``None`` to skip out_func entirely (get raw output).
 
         Returns
         -------
@@ -608,13 +658,18 @@ class Expression(object):
             result = np.full(X.shape[:-1], result)
 
         # Apply output function (e.g., softmax for classification)
-        if self.out_func is not None:
-            result = self.out_func(result)
+        if out_func_override is _UNSET:
+            effective = self.out_func
+        else:
+            effective = out_func_override
+        if effective is not None:
+            result = effective(result)
         
         return result
 
     def _execute_postorder(self, X: np.ndarray, valid_mask: Optional[np.ndarray] = None, 
-                           constants: Optional[np.ndarray] = None) -> np.ndarray:
+                           constants: Optional[np.ndarray] = None,
+                           out_func_override = _UNSET) -> np.ndarray:
         """
         Execute the expression using post-order traversal.
 
@@ -667,13 +722,18 @@ class Expression(object):
             result = result[valid_mask] if valid_mask is not None else result
         
         # Apply output function
-        if self.out_func is not None:
-            result = self.out_func(result)
+        if out_func_override is _UNSET:
+            effective = self.out_func
+        else:
+            effective = out_func_override
+        if effective is not None:
+            result = effective(result)
         
         return result
 
     def execute(self, X: np.ndarray, valid_mask: Optional[np.ndarray] = None, 
-                constants: Optional[np.ndarray] = None) -> np.ndarray:
+                constants: Optional[np.ndarray] = None,
+                out_func_override = _UNSET) -> np.ndarray:
         """
         Execute the expression on input data.
 
@@ -688,6 +748,10 @@ class Expression(object):
             Boolean mask for valid samples.
         constants : ndarray, optional
             Pre-computed constant values.
+        out_func_override : callable, None, or _UNSET, optional
+            - _UNSET (default): use ``self.out_func``.
+            - ``None``: skip out_func entirely (get raw output).
+            - callable: use this function instead of ``self.out_func``.
 
         Returns
         -------
@@ -695,9 +759,9 @@ class Expression(object):
             Expression output.
         """
         if constants is None and valid_mask is None:
-            result = self._execute_tree(X)
+            result = self._execute_tree(X, out_func_override=out_func_override)
         else:
-            result = self._execute_postorder(X, valid_mask, constants)
+            result = self._execute_postorder(X, valid_mask, constants, out_func_override=out_func_override)
         
         return result
 
@@ -1079,8 +1143,6 @@ class ExpressionSet(object):
         
         self.expressions = expressions
         
-        self._complexity_cache = None
-        
         # 预分析常量信息
         self._constant_info = None
 
@@ -1103,11 +1165,13 @@ class ExpressionSet(object):
 
     @property
     def complexity(self) -> float:
-        if self._complexity_cache is not None:
-            return self._complexity_cache
+        """
+        Total complexity of the expression set.
+
+        Returns the sum of complexities for all non-None expressions.
+        """
         total = sum(expr.complexity for expr in self.expressions if expr is not None)
-        self._complexity_cache = round(total)
-        return self._complexity_cache
+        return round(total)
 
     @property
     def order(self) -> int:
@@ -1163,10 +1227,11 @@ class ExpressionSet(object):
         return True
 
     def copy(self) -> 'ExpressionSet':
-        return ExpressionSet(
+        copy = ExpressionSet(
             [expr.copy() if expr is not None else None for expr in self.expressions], 
             out_func=self.out_func, metric=self.metric
         )
+        return copy
     
     @property
     def constants(self) -> np.ndarray:
@@ -1179,7 +1244,39 @@ class ExpressionSet(object):
         ])
         return current_constants
 
-    def _execute_tree(self, X: np.ndarray) -> np.ndarray:
+    def _get_regularizable_constant_indices(self) -> np.ndarray:
+        """Return indices of constants that should participate in regularisation.
+
+        Delegates to each non-None expression's
+        :meth:`Expression._get_regularizable_constant_indices` and maps the
+        per-expression local indices to the flat global index space used by
+        :attr:`constants`.
+
+        Returns
+        -------
+        np.ndarray
+            Integer indices into :attr:`constants` for constants that are
+            **not** bias-like.  May be empty.
+        """
+        const_info = self._build_constant_info()
+        if const_info['total_constants'] == 0:
+            return np.array([], dtype=int)
+
+        regularizable = []
+        for expr_idx, expr in enumerate(self.expressions):
+            if expr is None:
+                continue
+            const_range = const_info['ranges'][expr_idx]
+            if const_range is None:
+                continue
+            start, _end = const_range
+            local_indices = expr._get_regularizable_constant_indices()
+            for local_idx in local_indices:
+                regularizable.append(start + local_idx)
+
+        return np.array(regularizable, dtype=int)
+
+    def _execute_tree(self, X: np.ndarray, out_func_override = _UNSET) -> np.ndarray:
         """
         Fast NumPy execution path (without constant parameters).
         Optimized for memory efficiency and 3D input support.
@@ -1213,8 +1310,12 @@ class ExpressionSet(object):
             output_buffer[:, col_idx] = expr._execute_tree(X).ravel()
         
         # 6. Apply output transformation function if defined
-        if self.out_func is not None:
-            output_buffer = self.out_func(output_buffer)
+        if out_func_override is _UNSET:
+            effective = self.out_func
+        else:
+            effective = out_func_override
+        if effective is not None:
+            output_buffer = effective(output_buffer)
         
         # 7. Restore spatial dimensions if input was 3D
         if spatial_shape:
@@ -1223,7 +1324,8 @@ class ExpressionSet(object):
         return output_buffer
 
     def _execute_postorder(self, X: np.ndarray, valid_mask: Optional[np.ndarray] = None, 
-                           constants: Optional[np.ndarray] = None) -> np.ndarray:
+                           constants: Optional[np.ndarray] = None,
+                           out_func_override = _UNSET) -> np.ndarray:
         """
         Execute expression set using post-order traversal (supports constant arrays).
         Optimized for memory efficiency and 3D input support.
@@ -1285,8 +1387,12 @@ class ExpressionSet(object):
             output_buffer[:, col_idx] = result.ravel()
         
         # 7. Apply output transformation function if defined
-        if self.out_func is not None:
-            output_buffer = self.out_func(output_buffer)
+        if out_func_override is _UNSET:
+            effective = self.out_func
+        else:
+            effective = out_func_override
+        if effective is not None:
+            output_buffer = effective(output_buffer)
         
         # 8. Restore spatial dimensions ONLY if input was 3D AND no mask was used
         # If valid_mask was used, spatial structure is broken, output remains 2D.
@@ -1296,12 +1402,13 @@ class ExpressionSet(object):
         return output_buffer
 
     def execute(self, X: np.ndarray, valid_mask: Optional[np.ndarray] = None, 
-                constants: Optional[np.ndarray] = None) -> np.ndarray:
+                constants: Optional[np.ndarray] = None,
+                out_func_override = _UNSET) -> np.ndarray:
         """Execute the expression according to X."""
         if constants is None and valid_mask is None:
-            result = self._execute_tree(X)
+            result = self._execute_tree(X, out_func_override=out_func_override)
         else:
-            result = self._execute_postorder(X, valid_mask, constants)
+            result = self._execute_postorder(X, valid_mask, constants, out_func_override=out_func_override)
         
         return result
 
@@ -1391,7 +1498,6 @@ class ExpressionSet(object):
                 new_expressions.append(expr)
         
         self.expressions = new_expressions
-        self._complexity_cache = None
         return self
 
     def simplify(self, constants_tolerance: float = 1e-5) -> 'Expression':

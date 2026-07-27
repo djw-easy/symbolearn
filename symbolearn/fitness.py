@@ -81,6 +81,15 @@ class Fitness(object):
         values produce stronger regularization; larger values reduce its
         influence on the fitness score. Defaults to ``1.0``.
 
+    regularize_bias : bool, default=False
+        When ``False`` (the default), constants whose contribution to the
+        output is purely additive — i.e. every operator on the path to the
+        root is ``add``, ``sub``, or ``neg`` — are **excluded** from the
+        regularisation penalty, following the same principle that leads an
+        SVM to regularise the weight vector :math:`w` but not the bias
+        :math:`b`.  Set to ``True`` to restore the legacy behaviour where
+        *every* constant is penalised uniformly.
+
     function_kwargs : dict, optional
         Additional keyword arguments to be passed to the ``loss_function``.
         Defaults to an empty dict.
@@ -108,7 +117,8 @@ class Fitness(object):
     Notes
     -----
     The regularization term is computed as ``penalty_value / (C * n_coeffs)``
-    where ``n_coeffs`` is the number of constants in the expression. Dividing
+    where ``n_coeffs`` is the number of *regularisable* constants (bias-like
+    constants are excluded by default — see ``regularize_bias``).  Dividing
     by ``n_coeffs`` normalizes the penalty so that expressions with different
     numbers of constants are penalized on a per-parameter basis, avoiding an
     inherent bias against expressions with more constants.
@@ -116,9 +126,11 @@ class Fitness(object):
 
     def __init__(self, loss_function: Callable, greater_is_better: bool,
                  penalty: Literal['l1', 'l2', 'elasticnet'] | None = None, 
-                 C: float = 1.0, function_kwargs={}):
+                 C: float = 1.0, regularize_bias: bool = False,
+                 function_kwargs={}):
         self.C = C
         self.penalty = penalty
+        self.regularize_bias = regularize_bias
         self.loss_function = loss_function
         self.function_kwargs = function_kwargs
         self.greater_is_better = greater_is_better
@@ -187,6 +199,18 @@ class Fitness(object):
 
             if coeffs is not None and len(coeffs) > 0:
                 coeffs = np.asarray(coeffs, dtype=float)
+
+                # When bias regularisation is disabled, exclude constants whose
+                # path to the root consists solely of add / sub / neg operators
+                # (pure additive offsets analogous to the SVM bias term).
+                if not self.regularize_bias:
+                    reg_indices = expr._get_regularizable_constant_indices()
+                    if len(reg_indices) > 0:
+                        coeffs = coeffs[reg_indices]
+                    else:
+                        coeffs = np.array([], dtype=float)
+
+            if coeffs is not None and len(coeffs) > 0:
 
                 if self.penalty == 'l1':
                     # L1 (Lasso): penalizes sum of absolute values of coefficients

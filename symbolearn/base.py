@@ -27,12 +27,18 @@ from symbolearn.halloffame import HallOfFame
 from symbolearn.population import Population
 from symbolearn.log import LogAnalyzer, EvolutionLogger
 from symbolearn.fitness import _loss_function_map, Fitness
-from symbolearn.expression import Expression, ExpressionSet
+from symbolearn.expression import Expression, ExpressionSet, _UNSET
 from symbolearn.tree_parser import load_expressions_from_csv
 from symbolearn.gpoperator import ExpressionGP, ExpressionSetGP
 from symbolearn.generator import ExprGenerator, ExprSetGenerator
-from symbolearn.node import Operator, _operator_map, op_name_alias
+from symbolearn.node import Operator, _operator_map, op_name_alias, ZScore
 from symbolearn.utils import check_random_state, _idx_model_selection, poisson_sample
+
+# Minimum per-output standard deviation for z-score normalisation. Output
+# channels with a smaller spread on the training samples are treated as already
+# normalised (std = 1, mean = 0) to avoid division by a near-zero value that
+# would otherwise blow up the (x - mean) / std transform.
+ZSCORE_STD_FLOOR = 1e-6
 
 
 MAX_INT = np.iinfo(np.int32).max
@@ -204,6 +210,11 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
 
     C : float, default=1.0
         Regularisation strength used together with ``penalty``.
+
+    regularize_bias : bool, default=False
+        When ``False`` (default), bias-like constants are excluded from
+        regularisation.  See :class:`Fitness` for details.  Set to ``True``
+        to restore the legacy behaviour where every constant is penalised.
 
     constraints : dict of str to int or tuple of int, optional
         Per-operator complexity constraints. Unary operators take an integer;
@@ -477,6 +488,7 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
         metric_params: dict[str, Any] = {},
         penalty: Literal['l1', 'l2', 'elasticnet'] | None = None,
         C: float = 1.0,
+        regularize_bias: bool = False,
         constraints: dict[str, int | tuple[int, int]] | None = None,
         nested_constraints: dict[str, dict[str, int]] | None = None,
         out_func: Optional[Union[str, Operator, callable]] = None,
@@ -568,6 +580,7 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
         self.metric = metric
         self.metric_params = metric_params
         self.penalty, self.C = penalty, C
+        self.regularize_bias = regularize_bias
         self.constraints = constraints
         self.nested_constraints = nested_constraints
         self.out_func = out_func
@@ -624,6 +637,8 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
         self.random_state = check_random_state(random_state)
         self.ndigits = ndigits
         self.is_multi_output_ = self.order is not None
+        self._zscore_stats: dict = {}  # key: HoF complexity_key → (mean, std)
+        self._train_mask_ = None       # bool mask of training samples (set in fit)
         
         # Callback configuration
         # Normalise to a list so the main loop can always iterate uniformly.
@@ -744,6 +759,7 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
                 greater_is_better,
                 penalty=self.penalty,
                 C=self.C,
+                regularize_bias=self.regularize_bias,
                 function_kwargs=self.metric_params,
             )
         else:
@@ -1102,6 +1118,140 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
         )
         return expr_set_generator, expr_set_gpoperator
 
+    def _compute_zscore_stats(self, expr, X):
+        """Compute per-output (mean, std) z-score statistics for *expr*.
+
+        The statistics are computed **only over the training samples** (the
+        pixels/rows actually used during fitness evaluation), identified by
+        ``self._train_mask_``, rather than over the whole forwarded array. This
+        keeps the z-score normalisation consistent with the fitness objective
+        and avoids mixing in test-region or background pixels.
+
+        Parameters
+        ----------
+        expr : Expression or ExpressionSet
+            The expression whose raw (un-normalised) output is used.
+        X : np.ndarray
+            The data forwarded to ``_run`` (full 3D image in spatial mode, or
+            the 2-D training matrix otherwise). Must be the same array used
+            during evolution so its leading dimensions align with
+            ``self._train_mask_``.
+
+        Returns
+        -------
+        (mean, std) : tuple of np.ndarray
+            Each of shape ``(n_outputs,)``.
+        """
+        raw = expr.execute(X, out_func_override=None)
+
+        if self._train_mask_ is None:
+            raise RuntimeError(
+                'Z-score statistics require self._train_mask_, which is set '
+                'during fit(). Ensure the estimator has been fitted before '
+                'calling predict/score with a ZScore out_func.'
+            )
+
+        flat = raw.reshape(-1, raw.shape[-1])
+        mask = np.asarray(self._train_mask_)
+
+        if flat.shape[0] == mask.size:
+            # Full spatial (H, W) output: the training mask is the (H, W)
+            # boolean array; every pixel position maps 1:1 (C-order).
+            sample_mask = mask.ravel()
+        elif flat.shape[0] == int(mask.sum()):
+            # Row-sliced output (pre-fit spatial aggregation or tabular): the
+            # forwarded X already contains only training rows, so every row is a
+            # training sample.
+            sample_mask = np.ones(flat.shape[0], dtype=bool)
+        else:
+            raise ValueError(
+                f'Z-score training mask (size {mask.size}, {int(mask.sum())} '
+                f'true) does not match the {flat.shape[0]} samples produced by '
+                'execute.'
+            )
+
+        sel = flat[sample_mask]
+        mean = np.mean(sel, axis=0)
+        std = np.std(sel, axis=0)
+
+        # Guard against degenerate expressions whose raw output is (near)
+        # constant on the training samples: a vanishing std would make
+        # (x - mean) / std blow up and collapse the predicted class. When the
+        # spread is below the floor, treat that output channel as already
+        # normalised (std = 1, mean = 0) so the z-score is effectively a no-op.
+        std = np.where(std < ZSCORE_STD_FLOOR, 1.0, std)
+        mean = np.where(std < ZSCORE_STD_FLOOR, 0.0, mean)
+        return mean, std
+
+    def _finalize_zscore(self, X):
+        """Compute global z-score statistics for every HoF entry on the full
+        training data, and store them keyed by complexity_key."""
+        for complexity_key, entry in self.hall_of_fame_.entries.items():
+            expr = entry[0]
+            if isinstance(expr.out_func, ZScore):
+                mean, std = self._compute_zscore_stats(expr, X)
+                self._zscore_stats[complexity_key] = (mean, std)
+
+    def _get_zscore_override(
+        self,
+        best_row: pd.Series,
+        X: Optional[np.ndarray] = None,
+    ) -> Optional[Callable]:
+        """Return a callable that applies fitted z-score normalisation, or None.
+
+        Parameters
+        ----------
+        best_row : pd.Series
+            A row from the HoF DataFrame, as returned by :meth:`get_best`.
+            Must contain ``'expression'``, ``'complexity'``, and optionally
+            ``'order'`` (for multi-output).
+        X : ndarray, optional
+            Training / reference data used to compute the z-score statistics
+            on demand when they have not yet been finalised (e.g. when this
+            is called from a callback during evolution, before
+            :meth:`_finalize_zscore` has run).
+
+        Returns
+        -------
+        callable or None
+            A function ``f(x)`` that applies ``(x - mean) / std`` using the
+            globally-computed statistics, or ``None`` when the expression's
+            ``out_func`` is not a :class:`ZScore`.
+        """
+        expr = best_row.expression
+        if not isinstance(expr.out_func, ZScore):
+            return _UNSET
+
+        # Reconstruct the complexity_key (same format used by HallOfFame)
+        if isinstance(expr, ExpressionSet):
+            complexity_key = (best_row['order'], best_row['complexity'])
+        else:
+            complexity_key = best_row['complexity']
+
+        # Statistics may not exist yet when called mid-training (e.g. from a
+        # callback before _finalize_zscore runs). Compute them on demand.
+        if complexity_key not in self._zscore_stats:
+            if X is None:
+                raise KeyError(
+                    f'Z-score statistics for complexity key {complexity_key} '
+                    'are not available and no reference data X was supplied to '
+                    'compute them on demand.'
+                )
+            mean, std = self._compute_zscore_stats(expr, X)
+            self._zscore_stats[complexity_key] = (mean, std)
+
+        mean, std = self._zscore_stats[complexity_key]
+
+        def fitted_zscore(x):
+            x = np.asarray(x, dtype=np.float64)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                out = np.where(std > ZSCORE_STD_FLOOR, (x - mean) / std, 0.0)
+            # Second line of defence: clip to a finite range so a pathological
+            # expression cannot produce values that destabilise the classifier.
+            return np.clip(out, -1e3, 1e3).astype(np.float32)
+
+        return fitted_zscore
+
     # ------------------------------------------------------------------
     # Core training loop
     # ------------------------------------------------------------------
@@ -1286,6 +1436,9 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
                 best_fitness = best_individual.error
                 self._run_details['best_order'].append(0)
 
+            current_individuals = [
+                ind for pop in self._populations for ind in pop.individuals
+            ]
             all_fitness = np.ma.masked_invalid(
                 np.hstack([pop.fitnesses for pop in self._populations])
             )
@@ -1295,9 +1448,6 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
 
             self._run_details['generation'].append(gen)
             if self.is_multi_output_:
-                current_individuals = [
-                    ind for pop in self._populations for ind in pop.individuals
-                ]
                 all_order = [ind.order for ind in current_individuals]
                 self._run_details['average_order'].append(np.mean(all_order))
             else:
@@ -1343,6 +1493,9 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
             if self.enable_logging
             else None
         )
+
+        self._finalize_zscore(X)
+
         return self
 
     # ------------------------------------------------------------------

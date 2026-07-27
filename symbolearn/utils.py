@@ -238,7 +238,7 @@ def _partition_estimators(n_estimators, n_jobs):
 
 
 
-def otsu_threshold(data, bins=256):
+def otsu_threshold_float(data, bins=256):
     """
     通用大津法阈值分割 - 支持任意范围的浮点数数据
     
@@ -317,7 +317,8 @@ def stratified_train_test_split(
     random_state: Optional[int] = None,
     shuffle: bool = True,
     preserve_shape: bool = True,
-    allow_insufficient: bool = False  # New parameter: allow insufficient samples in some classes
+    allow_insufficient: bool = False,
+    min_test_samples: Optional[int] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     General stratified train/test split function.
@@ -384,6 +385,13 @@ def stratified_train_test_split(
         - True: If a class has fewer samples than train_size, use all available
           samples for that class. The class samples will appear in BOTH train
           and test sets (overlap allowed for insufficient classes).
+    min_test_samples : int, optional
+        Minimum number of test samples required for each class. If a class has
+        fewer test samples after the standard split, additional samples from
+        its training portion are also used for testing (creating train/test
+        overlap for that class). By default (None), no minimum is enforced.
+        Only effective when per_class=True or per_class=False with balanced=True
+        (not effective in pure random sampling mode).
 
     Returns
     -------
@@ -409,6 +417,10 @@ def stratified_train_test_split(
     >>> # Per-class mode with allow_insufficient: use all samples if < train_size
     >>> X_tr, X_te, y_tr, y_te = stratified_train_test_split(
     ...     X, y, train_size=50, per_class=True, allow_insufficient=True)
+
+    >>> # Per-class mode with min_test_samples: supplement test set if needed
+    >>> X_tr, X_te, y_tr, y_te = stratified_train_test_split(
+    ...     X, y, train_size=10, per_class=True, min_test_samples=5)
 
     >>> # Total mode, proportional: 100 samples total, proportional to class size
     >>> X_tr, X_te, y_tr, y_te = stratified_train_test_split(
@@ -443,12 +455,15 @@ def stratified_train_test_split(
         y_flat = y
         indices = np.arange(len(y))
 
-    if isinstance(train_size, float):
-        if not (0 < train_size < 1):
-            raise ValueError("train_size must be a positive integer or a float in (0, 1).")
-        train_size = max(1, int(train_size * len(y)))
-    elif train_size <= 0:
+    if train_size <= 0:
         raise ValueError("train_size must be a positive integer.")
+
+    if min_test_samples is not None and (
+        isinstance(min_test_samples, (bool, np.bool_))
+        or not isinstance(min_test_samples, (int, np.integer))
+        or min_test_samples <= 0
+    ):
+        raise ValueError("min_test_samples must be a positive integer or None.")
 
     # --- 2. Filter Valid Samples (Handle ignore_label) ---
     if ignore_label is not None:
@@ -580,6 +595,7 @@ def stratified_train_test_split(
     if quota_per_class is not None:
         train_indices = []
         test_indices = []
+        supplemented_classes = []
 
         for label, idx_list in class_to_indices.items():
             idx_array = np.array(idx_list)
@@ -596,13 +612,35 @@ def stratified_train_test_split(
                 # For insufficient classes: all samples go to BOTH train and test
                 train_indices.extend(idx_array.tolist())
                 test_indices.extend(idx_array.tolist())
+                if min_test_samples is not None and actual_count < min_test_samples:
+                    supplemented_classes.append(label)
             else:
                 # Normal split: first `quota` to train, rest to test
-                train_indices.extend(idx_array[:int(quota)].tolist())
-                test_indices.extend(idx_array[int(quota):].tolist())
+                train_indices.extend(idx_array[:quota].tolist())
+                test_indices.extend(idx_array[quota:].tolist())
+                
+                if min_test_samples is not None:
+                    test_count = actual_count - quota
+                    if test_count < min_test_samples:
+                        deficit = min_test_samples - test_count
+                        n_to_take = min(deficit, quota)
+                        if n_to_take > 0:
+                            supplement = idx_array[:n_to_take].tolist()
+                            test_indices.extend(supplement)
+                            supplemented_classes.append(label)
 
         train_indices = np.array(train_indices)
         test_indices = np.array(test_indices)
+
+        if supplemented_classes:
+            import warnings
+            warnings.warn(
+                f"The following classes had fewer than min_test_samples={min_test_samples} "
+                "test samples after the stratified split. Additional samples from their "
+                "training set were also used as test samples, creating train/test overlap "
+                f"for these classes: {supplemented_classes}.",
+                UserWarning,
+            )
 
     # --- 8. Construct Output ---
     if not is_map_mode:
@@ -674,6 +712,559 @@ def stratified_train_test_split(
     return X_train, X_test, y_train, y_test
 
 
+
+def spatially_disjoint_train_test_split(
+    X,
+    y,
+    train_size,
+    per_class=True,
+    block_size=10,
+    buffer_size=3,
+    ignore_label=None,
+    random_state=None,
+    preserve_shape=True,
+    allow_insufficient=False,
+    adjacency_penalty=0.0,
+    min_test_samples=None,
+):
+    """
+    Split a labeled image into spatially disjoint training and testing samples.
+
+    The image is partitioned into non-overlapping spatial blocks. Complete
+    blocks are selected as the training region, and a buffer zone around the
+    selected region is excluded from testing. Training pixels are sampled from
+    the selected blocks, whereas valid pixels outside the training region and
+    its buffer zone form the test set.
+
+    Parameters
+    ----------
+    X : np.ndarray
+        Feature image with shape (H, W, D) or (H, W).
+    y : np.ndarray
+        Label map with shape (H, W).
+    train_size : int
+        Desired number of training samples. When ``per_class=True``, this is
+        the target number of training samples for each class. Otherwise, this
+        is the total training-sample budget, allocated proportionally to class
+        frequencies.
+    per_class : bool, default=True
+        Whether ``train_size`` denotes a per-class quota.
+    block_size : int, default=10
+        Side length of each square spatial block.
+    buffer_size : int, default=3
+        Width of the buffer zone excluded around selected training blocks.
+    ignore_label : int or float, optional
+        Label value excluded from both training and testing.
+    random_state : int, optional
+        Random seed for reproducible block selection and sample selection.
+    preserve_shape : bool, default=True
+        If True, return full-size arrays with unselected positions filled with
+        NaN. Otherwise, return flattened selected samples only.
+    allow_insufficient : bool, default=False
+        If False, raise an error if a class cannot meet its requested training
+        quota while retaining spatially disjoint testing samples. If True, use
+        all eligible pixels from the selected training region for classes that
+        cannot meet their quotas. Training and testing samples never overlap.
+    adjacency_penalty : float, default=0.0
+        Relative penalty for selecting blocks adjacent to already selected
+        training blocks. A candidate block with ``n`` selected 8-neighbors has
+        its coverage utility divided by
+        ``1 + adjacency_penalty * n``. Set to 0 to select blocks only according
+        to class-coverage gain. Larger values favor more dispersed training
+        blocks, but may reduce the remaining test area because more buffer
+        regions are created.
+    min_test_samples : int, optional
+        Minimum number of test samples required for each class. If a class has
+        fewer test samples than this threshold in the spatially disjoint region,
+        additional samples from the training region of that class are also used
+        for testing (creating train/test overlap for that class). By default
+        (None), no minimum is enforced.
+
+    Returns
+    -------
+    X_train, X_test, y_train, y_test : np.ndarray
+        Spatially disjoint training and testing subsets. Their format is
+        controlled by ``preserve_shape``.
+
+    Notes
+    -----
+    A valid split requires every class to retain at least one labeled test
+    pixel outside the selected training region and its buffer zone.
+    When ``min_test_samples`` is set, classes with insufficient spatially
+    disjoint test samples may have train/test overlap.
+    """
+    import warnings
+
+    X = np.asarray(X)
+    y = np.asarray(y)
+
+    if y.ndim != 2:
+        raise ValueError(
+            "spatially_disjoint_train_test_split requires a 2D label map "
+            "with shape (H, W)."
+        )
+
+    if X.ndim not in (2, 3):
+        raise ValueError(
+            "X must have shape (H, W) or (H, W, D) for spatial splitting."
+        )
+
+    if X.shape[:2] != y.shape:
+        raise ValueError(
+            f"Spatial dimensions of X {X.shape[:2]} do not match y {y.shape}."
+        )
+
+    if (
+        isinstance(train_size, (bool, np.bool_))
+        or not isinstance(train_size, (int, np.integer))
+        or train_size <= 0
+    ):
+        raise ValueError("train_size must be a positive integer.")
+
+    if (
+        isinstance(block_size, (bool, np.bool_))
+        or not isinstance(block_size, (int, np.integer))
+        or block_size <= 0
+    ):
+        raise ValueError("block_size must be a positive integer.")
+
+    if (
+        isinstance(buffer_size, (bool, np.bool_))
+        or not isinstance(buffer_size, (int, np.integer))
+        or buffer_size < 0
+    ):
+        raise ValueError("buffer_size must be a non-negative integer.")
+
+    if (
+        isinstance(adjacency_penalty, (bool, np.bool_))
+        or not isinstance(
+            adjacency_penalty,
+            (int, float, np.integer, np.floating),
+        )
+        or not np.isfinite(adjacency_penalty)
+        or adjacency_penalty < 0
+    ):
+        raise ValueError(
+            "adjacency_penalty must be a finite non-negative number."
+        )
+
+    if min_test_samples is not None and (
+        isinstance(min_test_samples, (bool, np.bool_))
+        or not isinstance(min_test_samples, (int, np.integer))
+        or min_test_samples <= 0
+    ):
+        raise ValueError("min_test_samples must be a positive integer or None.")
+
+    height, width = y.shape
+    flat_y = y.ravel()
+
+    if ignore_label is None:
+        valid_mask = np.ones_like(y, dtype=bool)
+    else:
+        valid_mask = y != ignore_label
+
+    if not np.any(valid_mask):
+        raise ValueError("No valid samples remain after applying ignore_label.")
+
+    labels = np.unique(y[valid_mask])
+    n_classes = len(labels)
+
+    if n_classes == 0:
+        raise ValueError("No valid classes were found.")
+
+    label_to_position = {
+        label: position
+        for position, label in enumerate(labels)
+    }
+
+    total_counts = np.array(
+        [np.sum(valid_mask & (y == label)) for label in labels],
+        dtype=int,
+    )
+
+    if per_class:
+        quotas = np.full(n_classes, train_size, dtype=int)
+    else:
+        total_valid = int(total_counts.sum())
+
+        if train_size > total_valid:
+            raise ValueError(
+                f"train_size={train_size} exceeds the number of valid samples "
+                f"({total_valid})."
+            )
+
+        raw_quotas = total_counts / total_valid * train_size
+        quotas = np.floor(raw_quotas).astype(int)
+        remainder = int(train_size - quotas.sum())
+
+        if remainder > 0:
+            fractional_order = np.argsort(-(raw_quotas - quotas))
+            for position in fractional_order[:remainder]:
+                quotas[position] += 1
+
+    # Each class needs at least one sample for training and one for testing.
+    if np.any(total_counts < 2):
+        invalid_labels = labels[total_counts < 2].tolist()
+        raise ValueError(
+            "Spatially disjoint splitting requires at least two valid samples "
+            f"per class. Insufficient classes: {invalid_labels}."
+        )
+
+    if not allow_insufficient:
+        insufficient = total_counts <= quotas
+
+        if np.any(insufficient):
+            invalid_labels = labels[insufficient].tolist()
+            raise ValueError(
+                "The following classes cannot satisfy the requested training "
+                "quota while retaining at least one spatially disjoint test "
+                f"sample: {invalid_labels}. Set allow_insufficient=True to "
+                "use fewer training samples for these classes."
+            )
+
+    # With allow_insufficient=True, reserve at least one sample in principle
+    # for the spatially disjoint test region.
+    target_region_counts = quotas.copy()
+    if allow_insufficient:
+        target_region_counts = np.minimum(
+            target_region_counts,
+            total_counts - 1,
+        )
+
+    blocks = []
+    grid_to_block = {}
+
+    for row_start in range(0, height, block_size):
+        row_end = min(row_start + block_size, height)
+        row_idx = row_start // block_size
+
+        for col_start in range(0, width, block_size):
+            col_end = min(col_start + block_size, width)
+            col_idx = col_start // block_size
+
+            block_valid = valid_mask[row_start:row_end, col_start:col_end]
+            if not np.any(block_valid):
+                continue
+
+            block_labels = y[row_start:row_end, col_start:col_end]
+            class_counts = np.zeros(n_classes, dtype=int)
+
+            for label, position in label_to_position.items():
+                class_counts[position] = np.sum(
+                    block_valid & (block_labels == label)
+                )
+
+            block_id = len(blocks)
+            blocks.append(
+                {
+                    "row_start": row_start,
+                    "row_end": row_end,
+                    "col_start": col_start,
+                    "col_end": col_end,
+                    "row_idx": row_idx,
+                    "col_idx": col_idx,
+                    "counts": class_counts,
+                }
+            )
+            grid_to_block[(row_idx, col_idx)] = block_id
+
+    if not blocks:
+        raise ValueError("No valid spatial blocks were found.")
+
+    def count_adjacent_selected(block_id, selected_set):
+        """Count selected 8-neighbor blocks of a candidate block."""
+        block = blocks[block_id]
+        row_idx = block["row_idx"]
+        col_idx = block["col_idx"]
+        adjacent_count = 0
+
+        for row_offset in (-1, 0, 1):
+            for col_offset in (-1, 0, 1):
+                if row_offset == 0 and col_offset == 0:
+                    continue
+
+                neighbor_id = grid_to_block.get(
+                    (row_idx + row_offset, col_idx + col_offset)
+                )
+
+                if neighbor_id is not None and neighbor_id in selected_set:
+                    adjacent_count += 1
+
+        return adjacent_count
+
+    def dilate_mask(mask, radius):
+        """Expand a Boolean mask by a Chebyshev-distance square kernel."""
+        if radius == 0:
+            return mask.copy()
+
+        padded = np.pad(mask, radius, mode="constant", constant_values=False)
+        expanded = np.zeros_like(mask, dtype=bool)
+
+        for row_offset in range(2 * radius + 1):
+            for col_offset in range(2 * radius + 1):
+                expanded |= padded[
+                    row_offset:row_offset + height,
+                    col_offset:col_offset + width,
+                ]
+
+        return expanded
+
+    def build_output(train_indices, test_indices):
+        """Build either full-shape maps or flattened sample arrays."""
+        if not preserve_shape:
+            if X.ndim == 3:
+                feature_dim = X.shape[2]
+                X_flat = X.reshape(-1, feature_dim)
+            else:
+                X_flat = X.ravel()
+
+            return (
+                X_flat[train_indices],
+                X_flat[test_indices],
+                flat_y[train_indices],
+                flat_y[test_indices],
+            )
+
+        output_dtype = np.result_type(X.dtype, np.float64)
+        X_train = np.full(X.shape, np.nan, dtype=output_dtype)
+        X_test = np.full(X.shape, np.nan, dtype=output_dtype)
+        y_train = np.full(y.shape, np.nan, dtype=float)
+        y_test = np.full(y.shape, np.nan, dtype=float)
+
+        train_rows, train_cols = np.unravel_index(train_indices, y.shape)
+        test_rows, test_cols = np.unravel_index(test_indices, y.shape)
+
+        y_train[train_rows, train_cols] = y[train_rows, train_cols]
+        y_test[test_rows, test_cols] = y[test_rows, test_cols]
+
+        if X.ndim == 3:
+            X_train[train_rows, train_cols, :] = X[train_rows, train_cols, :]
+            X_test[test_rows, test_cols, :] = X[test_rows, test_cols, :]
+        else:
+            X_train[train_rows, train_cols] = X[train_rows, train_cols]
+            X_test[test_rows, test_cols] = X[test_rows, test_cols]
+
+        return X_train, X_test, y_train, y_test
+
+    max_attempts = 100
+    last_failure = None
+
+    for attempt in range(max_attempts):
+        seed = None if random_state is None else random_state + attempt
+        rng = np.random.RandomState(seed)
+
+        selected_set = set()
+        selected_mask = np.zeros(y.shape, dtype=bool)
+        available_counts = np.zeros(n_classes, dtype=int)
+        remaining_block_ids = list(range(len(blocks)))
+
+        # Select blocks that most efficiently cover unresolved class quotas.
+        while np.any(available_counts < target_region_counts):
+            deficits = np.maximum(
+                target_region_counts - available_counts,
+                0,
+            )
+            candidate_utilities = []
+
+            for block_id in remaining_block_ids:
+                block_counts = blocks[block_id]["counts"]
+
+                # Count only samples that contribute to unresolved quotas.
+                coverage_gain = int(np.minimum(block_counts, deficits).sum())
+                if coverage_gain <= 0:
+                    continue
+
+                adjacent_count = count_adjacent_selected(
+                    block_id,
+                    selected_set,
+                )
+
+                # A relative penalty remains meaningful across block sizes and
+                # datasets, unlike subtracting a fixed number of samples.
+                utility = coverage_gain / (
+                    1.0 + adjacency_penalty * adjacent_count
+                )
+
+                candidate_utilities.append(
+                    (block_id, coverage_gain, adjacent_count, utility)
+                )
+
+            if not candidate_utilities:
+                break
+
+            best_utility = max(
+                utility
+                for _, _, _, utility in candidate_utilities
+            )
+
+            best_candidates = [
+                (block_id, coverage_gain, adjacent_count)
+                for block_id, coverage_gain, adjacent_count, utility
+                in candidate_utilities
+                if np.isclose(utility, best_utility)
+            ]
+
+            # Resolve utility ties by favoring coverage, then spatial separation.
+            max_gain = max(
+                coverage_gain
+                for _, coverage_gain, _ in best_candidates
+            )
+            best_candidates = [
+                (block_id, adjacent_count)
+                for block_id, coverage_gain, adjacent_count in best_candidates
+                if coverage_gain == max_gain
+            ]
+
+            min_adjacency = min(
+                adjacent_count
+                for _, adjacent_count in best_candidates
+            )
+            best_block_ids = [
+                block_id
+                for block_id, adjacent_count in best_candidates
+                if adjacent_count == min_adjacency
+            ]
+
+            chosen_block_id = best_block_ids[
+                rng.randint(len(best_block_ids))
+            ]
+            chosen_block = blocks[chosen_block_id]
+
+            selected_set.add(chosen_block_id)
+            selected_mask[
+                chosen_block["row_start"]:chosen_block["row_end"],
+                chosen_block["col_start"]:chosen_block["col_end"],
+            ] = True
+            available_counts += chosen_block["counts"]
+            remaining_block_ids.remove(chosen_block_id)
+
+        if not selected_set:
+            last_failure = "No training blocks could be selected."
+            continue
+
+        if not allow_insufficient and np.any(available_counts < quotas):
+            invalid_labels = labels[available_counts < quotas].tolist()
+            last_failure = (
+                "Selected training blocks could not meet the requested quotas "
+                f"for classes {invalid_labels}."
+            )
+            continue
+
+        # Buffered pixels are excluded from testing but are not training samples.
+        exclusion_mask = dilate_mask(selected_mask, buffer_size)
+        test_candidate_mask = valid_mask & ~exclusion_mask
+
+        test_counts = np.array(
+            [
+                np.sum(test_candidate_mask & (y == label))
+                for label in labels
+            ],
+            dtype=int,
+        )
+
+        # --- min_test_samples: supplement test set from training region ---
+        supplemented_classes = []
+        if min_test_samples is not None:
+            for position, label in enumerate(labels):
+                deficit = min_test_samples - test_counts[position]
+                if deficit > 0:
+                    class_train_mask = selected_mask & (y == label)
+                    class_train_indices = np.flatnonzero(class_train_mask.ravel())
+                    rng.shuffle(class_train_indices)
+                    n_to_take = min(deficit, len(class_train_indices))
+                    if n_to_take > 0:
+                        supplement = class_train_indices[:n_to_take]
+                        rows, cols = np.unravel_index(supplement, y.shape)
+                        test_candidate_mask[rows, cols] = True
+                        test_counts[position] += n_to_take
+                        supplemented_classes.append(label)
+
+        zero_test_classes = None
+        if np.any(test_counts == 0):
+            invalid_labels = labels[test_counts == 0].tolist()
+            if not allow_insufficient:
+                last_failure = (
+                    "Selected training blocks and buffer zone removed all test "
+                    f"samples for classes {invalid_labels}."
+                )
+                continue
+            zero_test_classes = labels[test_counts == 0]
+
+        train_indices = []
+        insufficient_labels = []
+
+        for position, label in enumerate(labels):
+            candidate_indices = np.flatnonzero(
+                selected_mask.ravel() & (flat_y == label)
+            )
+            rng.shuffle(candidate_indices)
+
+            requested = quotas[position]
+
+            if len(candidate_indices) < requested:
+                if not allow_insufficient:
+                    last_failure = (
+                        f"Class {label} has only {len(candidate_indices)} "
+                        f"eligible training samples, but {requested} are "
+                        "required."
+                    )
+                    break
+
+                insufficient_labels.append(label)
+                requested = len(candidate_indices)
+
+            train_indices.extend(candidate_indices[:requested].tolist())
+
+        else:
+            train_indices = np.asarray(train_indices, dtype=int)
+
+            if zero_test_classes is not None:
+                overlap_mask = test_candidate_mask.copy()
+                for label in zero_test_classes:
+                    overlap_mask |= (y == label)
+                test_indices = np.flatnonzero(overlap_mask.ravel())
+            else:
+                test_indices = np.flatnonzero(test_candidate_mask.ravel())
+
+            if len(train_indices) == 0 or len(test_indices) == 0:
+                last_failure = "The generated split contains an empty subset."
+                continue
+
+            if insufficient_labels:
+                warnings.warn(
+                    "Some classes could not meet their requested training quota "
+                    "under the spatially disjoint constraint. All eligible "
+                    "samples from the selected training region were used for "
+                    f"these classes: {insufficient_labels}.",
+                    UserWarning,
+                )
+
+            if zero_test_classes is not None:
+                warnings.warn(
+                    "All pixels of some classes fall inside the excluded "
+                    "training+buffer region. Their full set of pixels is used "
+                    "for testing, creating train/test overlap for these classes: "
+                    f"{zero_test_classes.tolist()}.",
+                    UserWarning,
+                )
+
+            if supplemented_classes:
+                warnings.warn(
+                    f"The following classes had fewer than min_test_samples={min_test_samples} "
+                    "spatially disjoint test samples. Additional samples from their training "
+                    "region were used as test samples, creating train/test overlap for these "
+                    f"classes: {supplemented_classes}.",
+                    UserWarning,
+                )
+
+            return build_output(train_indices, test_indices)
+
+    raise ValueError(
+        "Unable to construct a valid spatially disjoint split after "
+        f"{max_attempts} attempts. Last failure: {last_failure} "
+        "Consider reducing block_size or buffer_size, changing random_state, "
+        "reducing adjacency_penalty, or setting allow_insufficient=True."
+    )
 
 
 
@@ -780,6 +1371,39 @@ def extract_and_aggregate_spatial(
     # 2.  Dtype promotion — output must be float to hold NaN sentinels
     # ------------------------------------------------------------------
     output_dtype = np.promote_types(X_3d.dtype, np.float32)
+
+    # ------------------------------------------------------------------
+    # 3a.  Short-circuit: window_size == 1 — no spatial aggregation needed
+    # ------------------------------------------------------------------
+    if window_size == 1:
+        features = X_3d.astype(output_dtype, copy=False)
+
+        if y_2d is None:
+            if preserve_shape:
+                return features
+            return features.reshape(-1, D)
+
+        # y_2d is provided — apply validity mask
+        if np.issubdtype(y_2d.dtype, np.integer):
+            valid_mask = np.ones((H, W), dtype=bool)
+        else:
+            valid_mask = ~np.isnan(y_2d)
+        if ignore_label is not None:
+            valid_mask &= (y_2d != ignore_label)
+
+        if preserve_shape:
+            out = np.full((H, W, D), np.nan, dtype=output_dtype)
+            out[valid_mask] = features[valid_mask]
+            y_out = np.full((H, W), np.nan, dtype=np.float64)
+            y_out[valid_mask] = y_2d[valid_mask].astype(np.float64, copy=False)
+            return out, y_out
+
+        # preserve_shape=False
+        valid_rows, valid_cols = np.where(valid_mask)
+        return (
+            features[valid_rows, valid_cols],
+            y_2d[valid_rows, valid_cols].astype(np.float64, copy=False),
+        )
 
     # ------------------------------------------------------------------
     # 3.  Pad and build strided window view

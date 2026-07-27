@@ -113,7 +113,9 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
                              'n_features is %s.'
                              % (self.n_features_in_, n_features))
 
-        y = self.get_best().expression.execute(X)
+        row = self.get_best()
+        z_override = self._get_zscore_override(row, X)
+        y = row.expression.execute(X, out_func_override=z_override)
 
         return y
 
@@ -129,21 +131,19 @@ class SymbolicClassifier(BaseSymbolic, ClassifierMixin):
 
     Parameters
     ----------
-    metric : str, default='hinge_loss'
+    metric : str, default='cross_entropy'
         The fitness metric to use for classification.
-        Supported metrics: 'cross_entropy', 'nll_loss', 'focal_loss',
-        'hinge_loss', 'nca_loss', 'prototype_loss', 'accuracy'
+        Supported metrics: 'cross_entropy', 'nll_loss', 'focal_loss', 'hinge_loss', 'accuracy'
 
     out_func : str, Operator, or callable, default='softmax'
         The output function to apply to the result of the expression.
-        For the 'hinge_loss' metric, it is recommended to use 'identity' 
-        (i.e., no transformation) to ensure correct calculation.
+        For 'hinge_loss' metric, must be 'identity' (no transformation).
 
     **kwargs
         Additional keyword arguments passed to the BaseSymbolic constructor.
     """
 
-    def __init__(self, *, metric='hinge_loss', out_func='identity', **kwargs):
+    def __init__(self, *, metric='cross_entropy', out_func='softmax', **kwargs):
         self.typical_metrics = (
             'cross_entropy', 'nll_loss', 'focal_loss', 'hinge_loss', 'accuracy'
         )
@@ -182,6 +182,13 @@ class SymbolicClassifier(BaseSymbolic, ClassifierMixin):
         if self._is_spatial_mode and X.ndim != 3:
             raise ValueError(
                 f'Spatial aggregation requires a 3D array (H, W, D), got ndim={X.ndim}.'
+            )
+
+        if X.ndim == 3 and not self._is_spatial_mode:
+            raise ValueError(
+                'Received a 3D input array (H, W, D) but spatial_stats is not '
+                'configured. Either set spatial_stats to enable spatial mode, '
+                'or pass a 2D (n_samples, n_features) array for tabular mode.'
             )
 
         if X.ndim == 3:
@@ -227,6 +234,12 @@ class SymbolicClassifier(BaseSymbolic, ClassifierMixin):
         y : np.ndarray
             ``(H, W)`` in spatial-aggregation mode, ``(N_valid,)`` otherwise.
         sample_weight : np.ndarray or None
+        train_mask : np.ndarray
+            Boolean mask identifying the training samples, in the same spatial
+            layout as ``X`` / ``y``: a ``(H, W)`` array for spatial mode (every
+            ``True`` entry is a training pixel) and a ``(N_valid,)`` array for
+            tabular mode (all ``True``). Used to compute z-score statistics over
+            the exact samples used during fitness evaluation.
         """
         n_features = X.shape[-1]
 
@@ -239,6 +252,15 @@ class SymbolicClassifier(BaseSymbolic, ClassifierMixin):
                 and X.ndim != 3:
             raise ValueError(
                 f'Spatial aggregation requires a 3D input array (H, W, D), got ndim={X.ndim}.'
+            )
+
+        if X.ndim == 3 and not (
+            self._use_spatial_aggregation or self._spatial_aggregation_bfit
+        ):
+            raise ValueError(
+                'Received a 3D input array (H, W, D) but spatial_stats is not '
+                'configured. Either set spatial_stats to enable spatial mode, '
+                'or pass a 2D (n_samples, n_features) array for tabular mode.'
             )
 
         # --- Build valid-pixel mask and extract flat arrays for validation ---
@@ -319,9 +341,10 @@ class SymbolicClassifier(BaseSymbolic, ClassifierMixin):
                     method=self.spatial_stats,
                     window_size=self.valid_window_sizes
                 )
-            return X_out, y_out, sample_weight
+            return X_out, y_out, sample_weight, valid_mask
 
-        return X_valid, y_valid, sample_weight
+        train_mask = np.ones(y_valid.shape[0], dtype=bool)
+        return X_valid, y_valid, sample_weight, train_mask
 
     @staticmethod
     def _scores_to_class_indices(scores, metric):
@@ -421,7 +444,13 @@ class SymbolicClassifier(BaseSymbolic, ClassifierMixin):
         -------
         self : object
         """
-        X, y, sample_weight = self._check_X_y_for_fit(X, y, sample_weight, True)
+        X, y, sample_weight, train_mask = self._check_X_y_for_fit(
+            X, y, sample_weight, True
+        )
+        # Boolean mask (same spatial layout as X) of the pixels/rows actually
+        # used for fitness. Stored so z-score statistics can be computed over
+        # exactly the training samples, not the whole forwarded array.
+        self._train_mask_ = train_mask
 
         # In pre-fit aggregation mode the spatial layout is no longer needed
         if self._spatial_aggregation_bfit:
@@ -434,9 +463,9 @@ class SymbolicClassifier(BaseSymbolic, ClassifierMixin):
         self.n_classes_ = self.classes_.shape[0]
         y[finite_mask] = y_encoded
 
-        if self.metric == 'hinge_loss' and self.out_func not in ['identity', None]:
+        if self.metric == 'hinge_loss' and self.out_func not in ['identity', 'zscore', None]:
             warnings.warn(
-                "For hinge_loss, 'out_func' should be 'identity'. "
+                "For hinge_loss, 'out_func' should be 'identity' or 'zscore'. "
                 "The current setting may affect performance.",
                 UserWarning
             )
@@ -494,7 +523,9 @@ class SymbolicClassifier(BaseSymbolic, ClassifierMixin):
             In spatial mode, invalid pixels (all-NaN in X) are set to np.nan.
         """
         X = self._check_X_for_predict(X)
-        scores = self.get_best(index, include_dominated).expression.execute(X)
+        row = self.get_best(index, include_dominated)
+        z_override = self._get_zscore_override(row, X)
+        scores = row.expression.execute(X, out_func_override=z_override)
 
         if self._is_spatial_mode:
             valid_mask = ~np.any(np.isnan(X), axis=2)          # (H, W)
@@ -539,7 +570,9 @@ class SymbolicClassifier(BaseSymbolic, ClassifierMixin):
         For ``hinge_loss`` the values are pseudo-probabilities (not calibrated).
         """
         X = self._check_X_for_predict(X)
-        scores = self.get_best(index, include_dominated).expression.execute(X)
+        row = self.get_best(index, include_dominated)
+        z_override = self._get_zscore_override(row, X)
+        scores = row.expression.execute(X, out_func_override=z_override)
 
         if self._is_spatial_mode:
             valid_mask = ~np.any(np.isnan(X), axis=2)          # (H, W)
@@ -686,6 +719,8 @@ class SymbolicTransformer(BaseSymbolic, TransformerMixin):
                              'n_features is %s.'
                              % (self.n_features_in_, n_features))
         
-        return self.get_best().expression.execute(X).reshape(-1, 1)
+        row = self.get_best()
+        z_override = self._get_zscore_override(row, X)
+        return row.expression.execute(X, out_func_override=z_override).reshape(-1, 1)
 
 

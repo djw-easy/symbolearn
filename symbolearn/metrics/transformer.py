@@ -594,17 +594,17 @@ scaler = MinMaxScaler()
 # Multi dimensional
 def davies_bouldin_loss(y_true, y_pred, sample_weight):
     """计算Davies-Bouldin损失函数。"""
-    y_pred = scaler.fit_transform(y_pred)
+    y_pred = scaler.fit_transform(y_pred.reshape(-1, 1)).ravel()
     return davies_bouldin_score(y_pred, y_true.ravel())
 
 def calinski_harabasz_loss(y_true, y_pred, sample_weight):
     """计算Calinski and Harabasz损失函数。"""
-    y_pred = scaler.fit_transform(y_pred)
+    y_pred = scaler.fit_transform(y_pred.reshape(-1, 1)).ravel()
     return calinski_harabasz_score(y_pred, y_true.ravel())
 
 def silhouette_loss(y_true, y_pred, sample_weight):
     """计算轮廓系数损失函数。"""
-    y_pred = scaler.fit_transform(y_pred)
+    y_pred = scaler.fit_transform(y_pred.reshape(-1, 1)).ravel()
     return silhouette_score(y_pred, y_true.ravel())
 
 # Single dimension
@@ -613,7 +613,7 @@ def bhattacharyya_loss(y_true, y_pred, sample_weight) -> float:
     y_pred = np.squeeze(y_pred)
     if np.all(y_pred == y_pred[0]):
         return -np.inf
-    y_pred = scaler.fit_transform(y_pred)
+    y_pred = scaler.fit_transform(y_pred.reshape(-1, 1)).ravel()
     return _bhattacharyya_loss(y_pred, y_true.ravel())
 
 def hellinger_loss(y_true, y_pred, sample_weight) -> float:
@@ -621,7 +621,7 @@ def hellinger_loss(y_true, y_pred, sample_weight) -> float:
     y_pred = np.squeeze(y_pred)
     if np.all(y_pred == y_pred[0]):
         return -np.inf
-    y_pred = scaler.fit_transform(y_pred)
+    y_pred = scaler.fit_transform(y_pred.reshape(-1, 1)).ravel()
     return _hellinger_loss(y_pred, y_true.ravel())
 
 def js_divergence_loss(y_true, y_pred, sample_weight) -> float:
@@ -629,7 +629,7 @@ def js_divergence_loss(y_true, y_pred, sample_weight) -> float:
     y_pred = np.squeeze(y_pred)
     if np.all(y_pred == y_pred[0]):
         return -np.inf
-    y_pred = scaler.fit_transform(y_pred)
+    y_pred = scaler.fit_transform(y_pred.reshape(-1, 1)).ravel()
     return _js_divergence_loss(y_pred, y_true.ravel())
 
 def wasserstein_loss(y_true, y_pred, sample_weight) -> float:

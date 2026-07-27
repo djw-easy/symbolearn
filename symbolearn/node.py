@@ -1283,7 +1283,7 @@ def _sigmoid(x: np.ndarray) -> np.ndarray:
         result[x <= EXP_LOWER_BOUND] = 0.0
         result[x >= EXP_UPPER_BOUND] = 1.0
 
-        return result
+        return result.astype(np.float32)
 
 
 def _softplus(x: np.ndarray) -> np.ndarray:
@@ -1374,6 +1374,20 @@ def _softmax(x, axis=1):
         return e_x / e_x.sum(axis=axis, keepdims=True)
 
 
+class ZScore:
+    name = "zscore"
+    def __call__(self, x):
+        x = np.asarray(x, dtype=np.float64)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            if x.ndim <= 1:
+                m, s = np.mean(x), np.std(x)
+                return np.where(s > 1e-8, (x - m) / s, 0.0).astype(np.float32)
+            m = np.mean(x, axis=0, keepdims=True)
+            s = np.std(x, axis=0, keepdims=True)
+            return np.where(s > 1e-8, (x - m) / s, 0.0).astype(np.float32)
+
+zscore = ZScore()
+
 def _identity(x): return x
 identity = Operator(function=_identity, name="identity", degree=1)
 add2 = Operator(function=_protected_addition, name='add', degree=2)
@@ -1400,6 +1414,7 @@ expsq1 = Operator(function=_protected_expsq, name='expsq', degree=1)
 sigmoid = Operator(function=_sigmoid, name='sigmoid', degree=1)
 softplus = Operator(function=_softplus, name='softplus', degree=1)
 softmax = Operator(function=_softmax, name='softmax', degree=2)
+
 
 _operator_map = {
     'identity': identity,
@@ -1430,7 +1445,8 @@ _operator_map = {
     'sigmoid': sigmoid, 
     'softmax': softmax,
     'expsq': expsq1,
-    'softplus': softplus
+    'softplus': softplus,
+    'zscore': zscore
 }
 
 

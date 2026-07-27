@@ -1,4 +1,3 @@
-import math
 import warnings
 import numpy as np
 from functools import lru_cache
@@ -209,9 +208,10 @@ class ExpressionGP:
             raise ValueError('Cannot crossover the root node.')
         
         parent_node = parent_subtree.parent
-        if parent_node is None:
-            raise ValueError('Cannot crossover the root node.')
-        parent_node.replace_child(parent_subtree, donor_subtree)
+        children_list = list(parent_node.children)
+        replace_index = children_list.index(parent_subtree)
+        children_list[replace_index] = donor_subtree
+        parent_node.children = children_list
 
     def reproduce(self, parent: Expression) -> Expression:
         """Create a deep-copied expression tree."""
@@ -293,13 +293,19 @@ class ExpressionGP:
             offspring1.tree = point2_clone
         else:
             parent1 = new_point1.parent
-            parent1.replace_child(new_point1, point2_clone)
+            children_list1 = list(parent1.children)
+            replace_index1 = children_list1.index(new_point1)
+            children_list1[replace_index1] = point2_clone
+            parent1.children = children_list1
         
         if new_point2.is_root:
             offspring2.tree = point1_clone
         else:
             parent2 = new_point2.parent
-            parent2.replace_child(new_point2, point1_clone)
+            children_list2 = list(parent2.children)
+            replace_index2 = children_list2.index(new_point2)
+            children_list2[replace_index2] = point1_clone
+            parent2.children = children_list2
 
         # Validate resulting size and structural constraints.
         if not offspring1.is_valid(self.maxsize):
@@ -341,8 +347,10 @@ class ExpressionGP:
         path = []
         current = old_node
         while current.parent is not None:
-            path.append(current.child_index)
-            current = current.parent
+            parent = current.parent
+            child_index = list(parent.children).index(current)
+            path.append(child_index)
+            current = parent
         
         path.reverse()  # Path from root to the target node.
         
@@ -383,7 +391,7 @@ class ExpressionGP:
                 weights['mutate_constant'] = 0.0
             else:
                 weights['mutate_constant'] *= (min(8, n_constants) / 8.0)
-                weights['mutate_constant'] *= (math.log(len(self.generator.constants) + 1) + 1)
+                weights['mutate_constant'] *= (np.log(len(self.generator.constants) + 1) + 1)
         else:
             weights['mutate_constant'] = 0.0
         
@@ -394,7 +402,7 @@ class ExpressionGP:
                 weights['mutate_variable'] = 0.0
             else:
                 weights['mutate_variable'] *= min(8, n_variables) / 8.0
-                weights['mutate_variable'] *= (math.log(len(self.generator.variables) + 1) + 1)
+                weights['mutate_variable'] *= (np.log(len(self.generator.variables) + 1) + 1)
         else:
             weights['mutate_variable'] = 0.0
         
@@ -405,7 +413,7 @@ class ExpressionGP:
                 weights['mutate_aggregation'] = 0.0
             else:
                 weights['mutate_aggregation'] *= min(5, n_aggregations) / 8.0
-                weights['mutate_aggregation'] *= (math.log(len(self.generator.variables)/2.0 + 1) + 1)
+                weights['mutate_aggregation'] *= (np.log(len(self.generator.variables)/2.0 + 1) + 1)
         else:
             weights['mutate_aggregation'] = 0.0
 
@@ -539,7 +547,10 @@ class ExpressionGP:
             self.random_state.shuffle(children)
             new_node.children = children
             
-            leaf_parent.replace_child(leaf_to_replace, new_node)
+            children_list = list(leaf_parent.children)
+            replacement_idx = children_list.index(leaf_to_replace)
+            children_list[replacement_idx] = new_node
+            leaf_parent.children = children_list
 
         return new_expr, True
 
@@ -598,7 +609,10 @@ class ExpressionGP:
         self.random_state.shuffle(children)
         new_node.children = children
         
-        target_parent.replace_child(target_node, new_node)
+        children_list = list(target_parent.children)
+        replacement_idx = children_list.index(target_node)
+        children_list[replacement_idx] = new_node
+        target_parent.children = children_list
 
         return new_expr, True
 
@@ -647,7 +661,11 @@ class ExpressionGP:
                 # If the target is the root, replace the whole tree.
                 new_expr.tree = promoted_child
             else:
-                target_parent.replace_child(target_node, promoted_child)
+                # Otherwise, replace the corresponding child pointer in the parent.
+                children_list = list(target_parent.children)
+                idx = children_list.index(target_node)
+                children_list[idx] = promoted_child
+                target_parent.children = children_list
         
         return new_expr, True
 
@@ -1271,7 +1289,10 @@ class ExpressionGP:
             if original_parent is None:
                 new_expr.tree = new_B
             else:
-                original_parent.replace_child(subtree_root, new_B)
+                children_list = list(original_parent.children)
+                idx = children_list.index(subtree_root)
+                children_list[idx] = new_B
+                original_parent.children = children_list
                 
         else:  # left rotation
             # Left rotation.
@@ -1318,7 +1339,10 @@ class ExpressionGP:
             if original_parent is None:
                 new_expr.tree = new_B
             else:
-                original_parent.replace_child(subtree_root, new_B)
+                children_list = list(original_parent.children)
+                idx = children_list.index(subtree_root)
+                children_list[idx] = new_B
+                original_parent.children = children_list
         
         return new_expr, True
 
@@ -1376,7 +1400,10 @@ class ExpressionGP:
             new_expr.tree = new_subtree
         else:
             target_parent = target_node.parent
-            target_parent.replace_child(target_node, new_subtree)
+            children_list = list(target_parent.children)
+            replacement_idx = children_list.index(target_node)
+            children_list[replacement_idx] = new_subtree
+            target_parent.children = children_list
         
         return new_expr, True
 
@@ -1426,8 +1453,12 @@ class ExpressionGP:
             # If the selected subtree is the root, replace the entire tree.
             new_expr.tree = subsubtree
         else:
+            # Otherwise, replace the corresponding child reference in the parent.
             target_parent = subtree.parent
-            target_parent.replace_child(subtree, subsubtree)
+            children_list = list(target_parent.children)
+            replacement_idx = children_list.index(subtree)
+            children_list[replacement_idx] = subsubtree
+            target_parent.children = children_list
         
         return new_expr, True
 
@@ -1507,9 +1538,11 @@ class ExpressionGP:
 
         # Define optimization objective function (using pre-compiled gradients)
         def objective(constants_np: np.ndarray):
-            loss = -parent.fitness(X, y, sample_weight, constants=constants_np)
-            if not parent.metric.greater_is_better:
-                loss = -loss
+            # Compute loss using fast NumPy execution
+            updated_parent = parent.update_constants(constants_np)
+            fitness = updated_parent.fitness(X, y, sample_weight, constants=constants_np)
+            loss = -fitness if updated_parent.metric.greater_is_better else fitness
+            
             return loss
 
         # Multi-restart optimization
@@ -2482,9 +2515,11 @@ class ExpressionSetGP:
         
         # Define optimization objective
         def objective(constants):
-            loss = -parent.fitness(X, y, sample_weight, constants=constants)
-            if not parent.metric.greater_is_better:
-                loss = -loss
+            # Compute loss using fast NumPy execution
+            updated_parent = parent.update_constants(constants)
+            fitness = updated_parent.fitness(X, y, sample_weight, constants=constants)
+            loss = -fitness if updated_parent.metric.greater_is_better else fitness
+            
             return loss
         
         # Multi-restart optimization
