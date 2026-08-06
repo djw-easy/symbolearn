@@ -30,7 +30,8 @@ from symbolearn.metrics.transformer import (
     wasserstein_loss,
     bhattacharyya_loss,
     js_divergence_loss,
-    separability_loss
+    separability_loss,
+    eta_separability_loss,
 )
 
 
@@ -274,6 +275,7 @@ _loss_function_map = {
     'fisher': (fisher_loss, True),
     'f_statistic': (f_statistic_loss, True),
     'compactness': (compactness_loss, True),
-    'separability': (separability_loss, True)
+    'separability': (separability_loss, True),
+    'eta_separability': (eta_separability_loss, True),
 }
 

@@ -58,7 +58,7 @@ System:
 Outputs
 -------
 The script generates the following output files:
-- best_hof_<timestamp>.csv : Pareto front at best test accuracy
+- best_hof_<timestamp>.csv : Pareto front at best train accuracy
 - best_hof_<timestamp>.joblib : Serialized best model
 - final_hof_<timestamp>.csv : Final Pareto front
 - final_hof_<timestamp>.joblib : Serialized final model
@@ -97,12 +97,14 @@ import argparse
 import numpy as np
 import pandas as pd
 from scipy.io import loadmat
-from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import classification_report, accuracy_score
 
 # Custom imports
 from symbolearn.base import seconds_to_readable
-from symbolearn.utils import stratified_train_test_split, spatially_disjoint_train_test_split
+from symbolearn.utils import (
+    spatially_disjoint_train_test_split,
+    standardize_spatial_image_from_training,
+)
 from symbolearn.symbolic_estimators import SymbolicClassifier
 
 # --- Dataset Configuration ---
@@ -124,7 +126,7 @@ DATASETS_INFO = {
 
 
 def load_dataset(dataset_name: str):
-    """Loads hyperspectral data and applies standard scaling to valid pixels."""
+    """Load raw hyperspectral data while preserving a NaN background."""
     info = DATASETS_INFO[dataset_name]
     
     # Load raw image and ground truth
@@ -141,16 +143,12 @@ def load_dataset(dataset_name: str):
     # Define valid pixels (GT > 0)
     valid_mask = image_gt > 0
 
-    # Perform spectral scaling
-    scaler = StandardScaler()
-    image_valid = image[valid_mask]
-    image_valid_scaled = scaler.fit_transform(image_valid)
-    
-    # Reconstruct 3D cube with NaNs in background to avoid calculation on invalid pixels
-    image_scaled_3d = np.full_like(image, fill_value=np.nan, dtype=np.float32)
-    image_scaled_3d[valid_mask] = image_valid_scaled
-    
-    return image_scaled_3d, image_gt, image_valid_scaled, image_gt[valid_mask]
+    # Reconstruct the raw 3D cube with NaNs in the background. Standardization
+    # is deliberately deferred until after the train/test masks are known.
+    image_raw_3d = np.full_like(image, fill_value=np.nan, dtype=np.float32)
+    image_raw_3d[valid_mask] = image[valid_mask]
+
+    return image_raw_3d, image_gt, image[valid_mask], image_gt[valid_mask]
 
 
 def str2bool(v):
@@ -167,13 +165,20 @@ def parse_args():
     
     # Dataset Settings
     group_ds = parser.add_argument_group('Dataset')
-    group_ds.add_argument('--dataset', type=str, default='Pavia University', choices=DATASETS_INFO.keys())
+    group_ds.add_argument('--dataset', type=str, default='Salinas', choices=DATASETS_INFO.keys())
     group_ds.add_argument('--train_size', type=float, default=100, 
                           help='Controls the number of training samples')
     group_ds.add_argument('--per_class', type=float, default=True, 
                           help='Determines how `train_size` is interpreted')
-    group_ds.add_argument('--min_test_samples', type=int, default=30,
+    group_ds.add_argument('--min_test_samples', type=int, default=20,
                           help='Minimum test samples per class; supplements from training region if needed (default: None)')
+    group_ds.add_argument(
+        '--adjacency_penalty', type=float, default=0.05,
+        help=(
+            'Relative penalty for selecting a block adjacent to an already '
+            'selected training block. 0 disables adjacency control.'
+        )
+    )
     
     # Evolutionary Settings
     group_evo = parser.add_argument_group('Symbolic Engine')
@@ -181,7 +186,7 @@ def parse_args():
     group_evo.add_argument('--niterations', type=int, default=100)
     group_evo.add_argument('--populations', type=int, default=31)
     group_evo.add_argument('--population_size', type=int, default=27)
-    group_evo.add_argument('--ncycles_per_iteration', type=int, default=380)
+    group_evo.add_argument('--ncycles_per_iteration', type=int, default=760)
     group_evo.add_argument('--operators', type=str, nargs='+', default=[
         '+', '-', '*', '/', 'sigmoid', 'tanh', 'softplus'
     ])
@@ -314,27 +319,36 @@ def main():
     
     # 1. Data Preparation
     print(f">>> Loading Dataset: {selected_ds}")
-    image_scaled, image_gt, X_valid, y_valid = load_dataset(selected_ds)
+    image_raw, image_gt, _, y_valid = load_dataset(selected_ds)
     
     if args.per_class:
         _, _, y_train, y_test = spatially_disjoint_train_test_split(
-            image_scaled, image_gt, train_size=args.train_size,
+            image_raw, image_gt, train_size=args.train_size,
             ignore_label=0, random_state=args.random_state,
-            min_test_samples=args.min_test_samples,
             preserve_shape=True, per_class=True,
             block_size=4, buffer_size=2,
+            adjacency_penalty=args.adjacency_penalty,
             allow_insufficient=True,
+            min_test_samples=args.min_test_samples,
         )
     else:
         _, _, y_train, y_test = spatially_disjoint_train_test_split(
-            image_scaled, image_gt, train_size=args.train_size*DATASETS_INFO[selected_ds][-1],
+            image_raw, image_gt, train_size=args.train_size*DATASETS_INFO[selected_ds][-1],
             ignore_label=0, random_state=args.random_state,
-            min_test_samples=args.min_test_samples,
             preserve_shape=True, per_class=False,
             block_size=4, buffer_size=2,
+            adjacency_penalty=args.adjacency_penalty,
             allow_insufficient=True,
+            min_test_samples=args.min_test_samples,
         )
-    
+    train_mask = ~np.isnan(y_train)
+    valid_mask = image_gt > 0
+    image_scaled, input_scaler = standardize_spatial_image_from_training(
+        image_raw,
+        train_mask,
+        valid_mask,
+    )
+
     unique_classes, counts = np.unique(y_valid, return_counts=True)
     class_dist = dict(zip(unique_classes, counts))
 
@@ -353,13 +367,13 @@ def main():
     # 3. Track best state via closure to avoid global variables
     best_state = {'train_acc': -1.0, 'test_acc': -1.0, 'generation': -1}
 
-    def eval_test_score(estimator: SymbolicClassifier, run_details: dict):
+    def eval_train_score(estimator: SymbolicClassifier, run_details: dict):
         gen       = run_details['generation'][-1]
         train_acc = estimator.score(image_scaled, y_train)
         test_acc  = estimator.score(image_scaled, y_test)
 
-        # Overwrite best HOF whenever test accuracy improves
-        if test_acc > best_state['test_acc']:
+        # Overwrite best HOF whenever TRAIN accuracy improves
+        if train_acc > best_state['train_acc']:
             best_state['train_acc']   = train_acc
             best_state['test_acc']   = test_acc
             best_state['generation'] = gen
@@ -396,8 +410,10 @@ def main():
         operators=tuple(args.operators),
         spectral_stats=tuple(args.spectral_stats),
         enable_logging=args.enable_logging,
-        callbacks=eval_test_score, callback_every=1
+        callbacks=eval_train_score, callback_every=1
     )
+    # Persist the training-only input scaler with saved estimator snapshots.
+    sc_classifier.input_scaler_ = input_scaler
 
     # 5. Training
     # Redirect stdout to a tee stream so that all output produced by fit()

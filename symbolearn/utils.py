@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from joblib import cpu_count
+from sklearn.preprocessing import StandardScaler
 from numpy.random import Generator
 from collections import defaultdict
 from typing import Union, Tuple, Optional, Any, Literal
@@ -62,6 +63,70 @@ def check_random_generator(random_state):
         return np.random.default_rng(seed)
 
     raise ValueError(f"Cannot convert {type(random_state)} to np.random.Generator")
+
+
+def standardize_spatial_image_from_training(
+    X: np.ndarray,
+    train_mask: np.ndarray,
+    valid_mask: Optional[np.ndarray] = None,
+    output_dtype=np.float32,
+):
+    """Standardize a spatial feature cube using training pixels only.
+
+    Parameters
+    ----------
+    X : ndarray of shape (H, W, D)
+        Raw spatial feature cube.
+    train_mask : ndarray of shape (H, W)
+        Boolean mask identifying pixels allowed to fit the scaler.
+    valid_mask : ndarray of shape (H, W), optional
+        Pixels to transform in the returned cube. By default, pixels whose
+        complete feature vector is finite are considered valid.
+    output_dtype : numpy dtype, default=np.float32
+        Data type of the transformed cube.
+
+    Returns
+    -------
+    X_scaled : ndarray of shape (H, W, D)
+        Standardized cube with NaN outside ``valid_mask``.
+    scaler : sklearn.preprocessing.StandardScaler
+        Fitted training-only scaler.
+    """
+    X = np.asarray(X)
+    train_mask = np.asarray(train_mask, dtype=bool)
+
+    if X.ndim != 3:
+        raise ValueError(f'X must have shape (H, W, D), got ndim={X.ndim}.')
+    if train_mask.shape != X.shape[:2]:
+        raise ValueError(
+            f'train_mask shape {train_mask.shape} does not match '
+            f'X spatial shape {X.shape[:2]}.'
+        )
+
+    if valid_mask is None:
+        valid_mask = np.all(np.isfinite(X), axis=-1)
+    else:
+        valid_mask = np.asarray(valid_mask, dtype=bool)
+        if valid_mask.shape != X.shape[:2]:
+            raise ValueError(
+                f'valid_mask shape {valid_mask.shape} does not match '
+                f'X spatial shape {X.shape[:2]}.'
+            )
+
+    if np.any(train_mask & ~valid_mask):
+        raise ValueError('train_mask must be a subset of valid_mask.')
+    if not np.any(train_mask):
+        raise ValueError('train_mask must contain at least one training pixel.')
+
+    scaler = StandardScaler()
+    scaler.fit(X[train_mask])
+
+    X_scaled = np.full(X.shape, np.nan, dtype=output_dtype)
+    X_scaled[valid_mask] = scaler.transform(X[valid_mask]).astype(
+        output_dtype,
+        copy=False,
+    )
+    return X_scaled, scaler
 
 
 def poisson_sample(lambda_val: float, random_state: np.random.RandomState) -> int:
@@ -713,6 +778,37 @@ def stratified_train_test_split(
 
 
 
+def _choose_spatial_block(
+    candidate_utilities,
+    rng,
+):
+    """Choose one block from pre-computed coverage/adjacency utilities.
+
+    Adjacency has already been incorporated into each candidate's utility.
+    Consequently, ties must be resolved without applying a second, implicit
+    adjacency preference; otherwise any positive penalty behaves almost like a
+    hard on/off switch instead of a continuous trade-off.
+    """
+    best_utility = max(
+        utility
+        for _, _, _, utility in candidate_utilities
+    )
+
+    best_candidates = [
+        (block_id, coverage_gain, adjacent_count)
+        for block_id, coverage_gain, adjacent_count, utility
+        in candidate_utilities
+        if np.isclose(utility, best_utility, rtol=1e-12, atol=1e-12)
+    ]
+
+    best_block_ids = [
+        block_id
+        for block_id, _, _ in best_candidates
+    ]
+
+    return best_block_ids[rng.randint(len(best_block_ids))]
+
+
 def spatially_disjoint_train_test_split(
     X,
     y,
@@ -1092,42 +1188,10 @@ def spatially_disjoint_train_test_split(
             if not candidate_utilities:
                 break
 
-            best_utility = max(
-                utility
-                for _, _, _, utility in candidate_utilities
+            chosen_block_id = _choose_spatial_block(
+                candidate_utilities,
+                rng,
             )
-
-            best_candidates = [
-                (block_id, coverage_gain, adjacent_count)
-                for block_id, coverage_gain, adjacent_count, utility
-                in candidate_utilities
-                if np.isclose(utility, best_utility)
-            ]
-
-            # Resolve utility ties by favoring coverage, then spatial separation.
-            max_gain = max(
-                coverage_gain
-                for _, coverage_gain, _ in best_candidates
-            )
-            best_candidates = [
-                (block_id, adjacent_count)
-                for block_id, coverage_gain, adjacent_count in best_candidates
-                if coverage_gain == max_gain
-            ]
-
-            min_adjacency = min(
-                adjacent_count
-                for _, adjacent_count in best_candidates
-            )
-            best_block_ids = [
-                block_id
-                for block_id, adjacent_count in best_candidates
-                if adjacent_count == min_adjacency
-            ]
-
-            chosen_block_id = best_block_ids[
-                rng.randint(len(best_block_ids))
-            ]
             chosen_block = blocks[chosen_block_id]
 
             selected_set.add(chosen_block_id)

@@ -497,6 +497,41 @@ def _compactness_loss(prediction: np.ndarray, target: np.ndarray) -> float:
 
 
 
+def label_conditioned_eta(prediction: np.ndarray, target: np.ndarray) -> float:
+    """Return binary label-conditioned normalized between-class variance.
+
+    The two groups are defined by the supplied labels rather than by searching
+    over response thresholds.  This is the ``eta`` component used by
+    :func:`directional_otsu_separability`, exposed separately so experiments
+    can distinguish the supervised projection objective from deployment-time
+    Otsu threshold estimation.
+    """
+    prediction = np.asarray(prediction, dtype=np.float64).ravel()
+    target = np.asarray(target).ravel()
+
+    if prediction.shape[0] != target.shape[0]:
+        return -np.inf
+    if len(np.unique(target)) != 2 or set(np.unique(target)) != {0, 1}:
+        return -np.inf
+    if not np.all(np.isfinite(prediction)):
+        return -np.inf
+
+    z_0 = prediction[target == 0]
+    z_1 = prediction[target == 1]
+    if z_0.size < 2 or z_1.size < 2:
+        return -np.inf
+
+    total_variance = np.var(prediction)
+    if total_variance <= 0:
+        return -np.inf
+
+    n = prediction.size
+    w_0 = z_0.size / n
+    w_1 = z_1.size / n
+    between_variance = w_0 * w_1 * (np.mean(z_0) - np.mean(z_1)) ** 2
+    return float(np.clip(between_variance / total_variance, 0.0, 1.0))
+
+
 def directional_otsu_separability(prediction: np.ndarray, target: np.ndarray) -> float:
     """
     Calculates the Directional Otsu Separability Fitness for spectral index evaluation.
@@ -655,6 +690,16 @@ def separability_loss(y_true, y_pred, sample_weight) -> float:
         return -np.inf
     y_pred = scaler.fit_transform(y_pred.reshape(-1, 1)).ravel()
     return directional_otsu_separability(y_pred, y_true.ravel())
+
+
+def eta_separability_loss(y_true, y_pred, sample_weight) -> float:
+    """Fitness wrapper for label-conditioned ``eta`` without AUC direction."""
+    y_true = np.squeeze(y_true)
+    y_pred = np.squeeze(y_pred)
+    if y_pred.ndim == 0 or np.all(y_pred == y_pred.flat[0]):
+        return -np.inf
+    y_pred = scaler.fit_transform(y_pred.reshape(-1, 1)).ravel()
+    return label_conditioned_eta(y_pred, y_true.ravel())
 
 def fisher_loss(y_true, y_pred, sample_weight) -> float:
     y_true = np.squeeze(y_true)

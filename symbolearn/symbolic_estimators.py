@@ -655,7 +655,9 @@ class SymbolicTransformer(BaseSymbolic, TransformerMixin):
     def __init__(self, *, metric='pearson', out_func=None, **kwargs):
         self.typical_metrics = (
             'pearson', 'spearman', 'silhouette', 'davies_bouldin', 'calinski_harabasz', 
-            'separability', 'compactness', 'fisher', 'f_statistic', 'hellinger', 'bhattacharyya', 'js_divergence', 'wasserstein', 'earth_movers'
+            'separability', 'eta_separability', 'compactness', 'fisher',
+            'f_statistic', 'hellinger', 'bhattacharyya', 'js_divergence',
+            'wasserstein', 'earth_movers'
         )
         super().__init__(metric=metric, out_func=out_func, **kwargs)
 

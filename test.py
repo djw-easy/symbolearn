@@ -1,18 +1,12 @@
-from sklearn.metrics import classification_report, accuracy_score
-from sklearn.utils.random import check_random_state
-from sklearn.preprocessing import StandardScaler
-from matplotlib.colors import ListedColormap
-from mpl_toolkits.mplot3d import Axes3D
-import matplotlib.pyplot as plt
-from scipy.io import loadmat
-import pandas as pd
+from symbolearn.utils import (
+    spatially_disjoint_train_test_split,
+    standardize_spatial_image_from_training,
+)
+from symbolearn.symbolic_estimators import SymbolicClassifier
+
+
 import numpy as np
-import os
-
-
-from symbolearn.fitness import Fitness
-from symbolearn.utils import stratified_train_test_split, extract_and_aggregate_spatial
-from symbolearn.symbolic_estimators import SymbolicRegressor, SymbolicClassifier, SymbolicTransformer
+from scipy.io import loadmat
 
 
 datasets_info = {
@@ -32,12 +26,12 @@ datasets_info = {
 
 
 def load_dataset(dataset_name: str):
-    """Loads hyperspectral data and applies standard scaling to valid pixels."""
+    """Load raw hyperspectral data while preserving a NaN background."""
     info = datasets_info[dataset_name]
     
     # Load raw image and ground truth
-    img_dict = loadmat(f'./example_data/hyperspectral/{dataset_name}/{info[0]}.mat')
-    gt_dict = loadmat(f'./example_data/hyperspectral/{dataset_name}/{info[2]}.mat')
+    img_dict = loadmat(f'./data/hyperspectral/{dataset_name}/{info[0]}.mat')
+    gt_dict = loadmat(f'./data/hyperspectral/{dataset_name}/{info[2]}.mat')
     
     image = img_dict[info[1]]
     image_gt = gt_dict[info[3]]
@@ -49,29 +43,33 @@ def load_dataset(dataset_name: str):
     # Define valid pixels (GT > 0)
     valid_mask = image_gt > 0
 
-    # Perform spectral scaling
-    scaler = StandardScaler()
-    image_valid = image[valid_mask]
-    image_valid_scaled = scaler.fit_transform(image_valid)
-    
-    # Reconstruct 3D cube with NaNs in background to avoid calculation on invalid pixels
-    image_scaled_3d = np.full_like(image, fill_value=np.nan, dtype=np.float32)
-    image_scaled_3d[valid_mask] = image_valid_scaled
-    
-    return image_scaled_3d, image_gt, image_valid_scaled, image_gt[valid_mask]
+    # Reconstruct the raw 3D cube with NaNs in the background. Standardization
+    # is deliberately deferred until after the train/test masks are known.
+    image_raw_3d = np.full_like(image, fill_value=np.nan, dtype=np.float32)
+    image_raw_3d[valid_mask] = image[valid_mask]
+
+    return image_raw_3d, image_gt, image[valid_mask], image_gt[valid_mask]
 
 
 
 if __name__ == '__main__':
     print(f"{'-'*34} Testing ExpressionSet for Symbolic Classifier {'-'*35}")
 
-    dataset_name = 'Pavia University'
-    image_scaled, image_gt, X, y = load_dataset(dataset_name)
-    _, _, y_train, y_test = stratified_train_test_split(
-        image_scaled, image_gt, train_size=100, preserve_shape=True,
-        ignore_label=0, random_state=42, shuffle=True, 
-        per_class=True, balanced=True,
-        allow_insufficient=True
+    dataset_name = 'Salinas'
+    image_raw, image_gt, X, y = load_dataset(dataset_name)
+    _, _, y_train, y_test = spatially_disjoint_train_test_split(
+        image_raw, image_gt, train_size=100, preserve_shape=True,
+        per_class=True, block_size=4, buffer_size=2,
+        ignore_label=0, random_state=42,
+        allow_insufficient=True,
+        adjacency_penalty=0.05,
+        min_test_samples=20
+    )
+    image_scaled_train, _ = standardize_spatial_image_from_training(
+        image_raw, ~np.isnan(y_train), image_gt>0
+    )
+    image_scaled_test, _ = standardize_spatial_image_from_training(
+        image_raw, ~np.isnan(y_test), image_gt>0
     )
     
     sc_classifier = SymbolicClassifier(
@@ -82,29 +80,26 @@ if __name__ == '__main__':
         use_constant=True,
         use_variable=True,
         penalty=None, C=1.0,
-        enable_logging=True,
+        enable_logging=False,
         ncycles_per_iteration=38,
-        valid_spectral_length=(5, 10),
+        operators=('+', '-', '*'),
         batching=False, batch_size=512,
         should_optimize_constants=False,
         should_optimize_aggregations=True,
         n_jobs=8, verbose=1, random_state=42,
-        # metric='accuracy', out_func='softmax',
-        # metric='focal_loss', out_func='softmax',
-        metric='hinge_loss', out_func='identity',
-        spatial_stats='mean', valid_window_sizes=3,
-        spectral_stats=('mean', 'min', 'max', 'slope'),
-        operators=('+', '-', '*', '/', 'sigmoid', 'tanh', 'softplus'),
+        metric='hinge_loss', out_func='zscore',
+        spatial_stats='mean', valid_window_sizes=1,
+        valid_spectral_length=(5, 30), spectral_stats=('mean',),
         constraints={'/': (5, 5)}, nested_constraints={
             'sigmoid': {'sigmoid': 0, 'tanh': 1, 'softplus': 1}, 
             'tanh': {'sigmoid': 1, 'tanh': 0, 'softplus': 1}, 
             'softplus': {'sigmoid': 1, 'tanh': 1, 'softplus': 0}
         }
     )
-    sc_classifier.fit(image_scaled, y_train)
+    sc_classifier.fit(image_scaled_train, y_train)
 
-    print("TrainSet Accuracy: ", sc_classifier.score(image_scaled, y_train))
-    print("TestSet Accuracy: ", sc_classifier.score(image_scaled, y_test))
+    print("TrainSet Accuracy: ", sc_classifier.score(image_scaled_train, y_train))
+    print("TestSet Accuracy: ", sc_classifier.score(image_scaled_test, y_test))
     print("\nPareto Front:")
     df = sc_classifier.get_hof()
     print(df)
