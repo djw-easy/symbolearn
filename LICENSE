@@ -1,0 +1,45 @@
+ACADEMIC-USE LICENSE
+
+Copyright (c) 2026 Junwu Dong and co-authors.
+
+Reference paper (please cite when using this software):
+
+    Junwu Dong, Tao Pei, Ci Song, Xi Wang, Yahui Qi, Dayu Cheng, Yanmin Jiang,
+    "Symbolic Discovery of Explicit and Auditable Spectral Models for Land
+    Cover Mapping," IEEE Transactions on Geoscience and Remote Sensing, 2026.
+    doi: 10.1109/TGRS.2026.3731741
+
+
+PERMISSION IS GRANTED TO USE, COPY, MODIFY, AND DISTRIBUTE THIS SOFTWARE AND
+ITS DOCUMENTATION FOR ACADEMIC, NON-COMMERCIAL RESEARCH AND EDUCATIONAL
+PURPOSES ONLY, ON THE FOLLOWING CONDITIONS:
+
+1. The above copyright notice, this permission notice, and the reference
+   paper citation must appear in all copies or substantial portions of the
+   Software.
+
+2. Any modification or derivative work must clearly indicate that it is a
+   modified version and must not be misrepresented as the original work.
+
+3. The Software is provided for academic research and education. Any
+   commercial use (including but not limited to: selling, licensing for
+   revenue, integrating into a commercial product or service, using to
+   provide paid consulting or commercial analysis) requires prior written
+   permission from the corresponding author. Please contact
+   djw@lreis.ac.cn for commercial licensing inquiries.
+
+4. No warranty. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+   KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+   IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+   CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+   TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+   SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+5. Patent grant. If the Software (or any portion of it) is covered by any
+   patent right of any contributor, that contributor hereby grants a
+   non-exclusive, royalty-free, worldwide, non-transferable license under
+   such patent right solely for academic, non-commercial purposes as
+   described above.
+
+END OF TERMS.

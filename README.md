@@ -165,4 +165,13 @@ BibTeX:
 
 ## 📄 License
 
-This project is for academic use. Please contact the authors for commercial licensing.
+This project is released under an academic-use license — see the [`LICENSE`](./LICENSE)
+file in this repository for the full terms. In short:
+
+- Free for academic research and educational use, with attribution to the
+  IEEE TGRS paper below.
+- Commercial use requires prior written permission from the corresponding
+  author (`djw@lreis.ac.cn`).
+
+A machine-readable citation for GitHub's "Cite this repository" feature is
+provided in [`CITATION.cff`](./CITATION.cff).
