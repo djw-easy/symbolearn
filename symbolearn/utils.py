@@ -599,14 +599,28 @@ def stratified_train_test_split(
             class_sizes = {label: len(idxs) for label, idxs in class_to_indices.items()}
             total_valid = sum(class_sizes.values())
 
+            # Resolve train_size: interpret values <= 1 as a proportion of the
+            # valid pool, otherwise as an absolute sample count.
+            if train_size <= 1.0:
+                total_train = int(round(train_size * total_valid))
+            else:
+                total_train = int(round(train_size))
+
+            if total_train > total_valid:
+                raise ValueError(
+                    f"train_size={train_size} (resolved to {total_train} samples) "
+                    f"exceeds the total number of valid samples ({total_valid})."
+                )
+
             # Compute raw (float) quotas then floor them.
             raw_quotas = {
-                label: (size / total_valid) * train_size
+                label: (size / total_valid) * total_train
                 for label, size in class_sizes.items()
             }
             floored_quotas = {label: int(q) for label, q in raw_quotas.items()}
             allocated = sum(floored_quotas.values())
-            remainder = train_size - allocated
+            # Remaining samples to distribute (integer count).
+            remainder = total_train - allocated
 
             # Distribute remaining samples by largest fractional parts.
             if remainder > 0:

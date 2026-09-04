@@ -58,19 +58,19 @@ def test_greater_is_better_non_negated():
 
 def test_l2_penalty_larger():
     fn_none = Fitness(mean_square_error, greater_is_better=False, penalty=None, C=1.0)
-    fn_l2 = Fitness(mean_square_error, greater_is_better=False, penalty='l2', C=0.1)
+    fn_l2 = Fitness(mean_square_error, greater_is_better=False, penalty='l2', C=0.1, regularize_bias=True)
     assert fn_l2(expr, X, y) > fn_none(expr, X, y)
 
 
 def test_l1_penalty_larger():
     fn_none = Fitness(mean_square_error, greater_is_better=False, penalty=None, C=1.0)
-    fn_l1 = Fitness(mean_square_error, greater_is_better=False, penalty='l1', C=0.1)
+    fn_l1 = Fitness(mean_square_error, greater_is_better=False, penalty='l1', C=0.1, regularize_bias=True)
     assert fn_l1(expr, X, y) > fn_none(expr, X, y)
 
 
 def test_elasticnet_penalty_larger():
     fn_none = Fitness(mean_square_error, greater_is_better=False, penalty=None, C=1.0)
-    fn_en = Fitness(mean_square_error, greater_is_better=False, penalty='elasticnet', C=0.1)
+    fn_en = Fitness(mean_square_error, greater_is_better=False, penalty='elasticnet', C=0.1, regularize_bias=True)
     assert fn_en(expr, X, y) > fn_none(expr, X, y)
 
 
