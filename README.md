@@ -44,10 +44,13 @@ Performance is lower than a compiled Julia implementation, but the NumPy/Numba b
 
 ```bash
 pip install -e .                    # development (editable)
-pip install -e .[acceleration]      # + numba for JIT speedup
 ```
 
-The core library requires only NumPy, pandas, scipy, scikit-learn, joblib, and tqdm. Numba is optional — if installed, computationally intensive fitness functions are JIT-compiled for a significant speedup; if absent, the pure-NumPy fallback is used transparently.
+The core library requires NumPy, pandas, scipy, scikit-learn, joblib, tqdm, and
+Numba (used by `node.py`, `fitness.py`, and `symbolearn/metrics/` for JIT
+acceleration). There is no non-Numba fallback path — Numba is mandatory for
+this codebase, but its install footprint is small and the JIT compile cost is
+amortized after the first call to each fitness function.
 
 ---
 

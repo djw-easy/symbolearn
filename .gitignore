@@ -5,3 +5,8 @@ data/
 .pytest_cache/
 .workbuddy/
 outputs/
+# PEP 517 / 518 build artefacts from `pip install -e .` or `python -m build`.
+*.egg-info/
+*.egg
+build/
+dist/
