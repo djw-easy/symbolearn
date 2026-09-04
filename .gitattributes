@@ -1,0 +1,27 @@
+# Normalize line endings: store as LF in the index, normalize text files
+# automatically, but never modify binary content. Prevents the recurring
+# "LF will be replaced by CRLF" warnings when contributors on Windows
+# push files that originated on macOS/Linux (and vice versa).
+
+*               text=auto eol=lf
+
+# Python source must use LF (PEP 8 / .editorconfig-standard).
+*.py            text eol=lf
+
+# Markdown is conventionally LF.
+*.md            text eol=lf
+
+# YAML / TOML / CFF / shell / dotenv / config files: LF.
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.toml          text eol=lf
+*.cff           text eol=lf
+*.sh            text eol=lf
+*.cfg           text eol=lf
+*.ini           text eol=lf
+*.gitignore     text eol=lf
+*.gitattributes text eol=lf
+
+# Jupyter notebooks: leave them as-is (line endings inside the notebook
+# are JSON-controlled and `nbstripout` would be the right tool for those).
+*.ipynb         text eol=lf
