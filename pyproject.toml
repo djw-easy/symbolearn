@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "symbolearn"
 version = "0.1.0"
-description = "Symbolic discovery of transparent class-specific spectral indices for interpretable land cover mapping"
+description = "Symbolic discovery of explicit and auditable spectral models for land cover mapping"
 requires-python = ">=3.9"
 dependencies = [
     "numpy>=2.0",

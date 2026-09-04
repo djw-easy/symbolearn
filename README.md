@@ -12,7 +12,7 @@ This repository provides the official implementation of the paper:
 
 **"Symbolic Discovery of Explicit and Auditable Spectral Models for Land Cover Mapping."**
 
-The code implements our data-driven symbolic learning framework for discovering transparent, class-specific spectral indices that support both single-index threshold segmentation and multiclass land-cover classification.
+The code implements our data-driven symbolic learning framework for discovering explicit and auditable spectral models—class-specific spectral indices—that support both single-index threshold segmentation and multiclass land-cover classification.
 
 ![](./figs/framework.jpg)
 
@@ -23,7 +23,7 @@ The code implements our data-driven symbolic learning framework for discovering 
 ## ⭐ Features
 
 - End-to-end symbolic discovery framework based on genetic programming
-- Class-specific spectral indices with full interpretability
+- Explicit and auditable class-specific spectral indices with full interpretability
 - **Dynamic Spectral Aggregation Terminals (DSATs)** — terminal nodes that aggregate adjacent spectral bands on demand
 - **Complexity-guided population initialization** — seeds the initial population with expressions spanning a wide range of structural complexity
 - **Hinge Loss-based expression-set optimization** — jointly optimizes a set of expressions, a key distinguishing feature of this algorithm that enables coherent multiclass discrimination
