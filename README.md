@@ -1,4 +1,4 @@
-# **Symbolic Discovery of Transparent Class-Specific Spectral Indices for Interpretable Land Cover Mapping**
+# **Symbolic Discovery of Explicit and Auditable Spectral Models for Land Cover Mapping**
 
 **Authors:** [Junwu Dong](https://orcid.org/0000-0003-4226-5042), [Tao Pei](https://orcid.org/0000-0002-5311-8761), [Ci Song](https://orcid.org/0000-0003-2146-6259), [Xi Wang](https://orcid.org/0000-0003-1859-9958), [Yahui Qi](https://orcid.org/0000-0002-7927-7605), [Dayu Cheng](https://orcid.org/0009-0006-5483-1274), and Yanmin Jiang
 
@@ -6,7 +6,7 @@
 
 This repository provides the official implementation of the paper:
 
-**"Symbolic Discovery of Transparent Class-Specific Spectral Indices for Interpretable Land Cover Mapping."**
+**"Symbolic Discovery of Explicit and Auditable Spectral Models for Land Cover Mapping."**
 
 The code implements our data-driven symbolic learning framework for discovering transparent, class-specific spectral indices that support both single-index threshold segmentation and multiclass land-cover classification.
 
