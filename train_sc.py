@@ -323,7 +323,7 @@ def main():
     
     if args.per_class:
         _, _, y_train, y_test = spatially_disjoint_train_test_split(
-            image_raw, image_gt, train_size=args.train_size,
+            image_raw, image_gt, train_size=int(args.train_size),
             ignore_label=0, random_state=args.random_state,
             preserve_shape=True, per_class=True,
             block_size=4, buffer_size=2,
@@ -333,7 +333,7 @@ def main():
         )
     else:
         _, _, y_train, y_test = spatially_disjoint_train_test_split(
-            image_raw, image_gt, train_size=args.train_size*DATASETS_INFO[selected_ds][-1],
+            image_raw, image_gt, train_size=int(args.train_size*DATASETS_INFO[selected_ds][-1]),
             ignore_label=0, random_state=args.random_state,
             preserve_shape=True, per_class=False,
             block_size=4, buffer_size=2,

@@ -4,3 +4,4 @@ data/
 .codegraph/
 .pytest_cache/
 .workbuddy/
+outputs/
