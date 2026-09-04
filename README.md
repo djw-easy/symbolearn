@@ -1,6 +1,10 @@
 # **Symbolic Discovery of Explicit and Auditable Spectral Models for Land Cover Mapping**
 
+![IEEE TGRS](https://img.shields.io/badge/IEEE%20TGRS-Published%202026-blue) ![DOI](https://img.shields.io/badge/DOI-10.1109%2FTGRS.2026.3731741-blue)
+
 **Authors:** [Junwu Dong](https://orcid.org/0000-0003-4226-5042), [Tao Pei](https://orcid.org/0000-0002-5311-8761), [Ci Song](https://orcid.org/0000-0003-2146-6259), [Xi Wang](https://orcid.org/0000-0003-1859-9958), [Yahui Qi](https://orcid.org/0000-0002-7927-7605), [Dayu Cheng](https://orcid.org/0009-0006-5483-1274), and Yanmin Jiang
+
+> 📄 **Published in** *IEEE Transactions on Geoscience and Remote Sensing* (2026). DOI: [10.1109/TGRS.2026.3731741](https://doi.org/10.1109/TGRS.2026.3731741)
 
 ---
 
