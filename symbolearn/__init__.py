@@ -8,6 +8,9 @@ from .symbolic_estimators import (
     SymbolicTransformer,
 )
 
+# Keep in sync with [project] version in pyproject.toml.
+__version__ = "0.1.0"
+
 __all__ = [
     "Expression",
     "ExpressionSet",
@@ -15,4 +18,5 @@ __all__ = [
     "SymbolicClassifier",
     "SymbolicRegressor",
     "SymbolicTransformer",
+    "__version__",
 ]
