@@ -108,6 +108,7 @@ Due to data size limitations, a preview of the Pavia University dataset is inclu
 ├── example_data/               # Example multispectral & hyperspectral data
 ├── figs/                       # Figures and diagrams used in README/paper
 ├── symbolearn/                 # Core implementation
+│   ├── __init__.py             # Public API exports (SymbolicClassifier, etc.)
 │   ├── base.py                 # Base estimator class
 │   ├── expression.py           # Expression and ExpressionSet (chromosome) representation
 │   ├── fitness.py              # Fitness evaluation
