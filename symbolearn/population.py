@@ -547,16 +547,29 @@ class Population:
 
     def find_oldest_n(self, n: int) -> np.ndarray:
         """查找最老的 n 个个体（O(n) 使用 argpartition）"""
-        if n <= 0:
+        total = len(self.individuals)
+        if n <= 0 or total == 0:
             return np.array([], dtype=int)
-        n = min(n, len(self.individuals))
+        n = min(n, total)
+        # np.argpartition 合法 kth 范围 [-len, len-1]:n == len 时 -n == -len 仍合法,
+        # 但此处统一短路,确保对任何 n <= total 都能稳定返回。
+        if n >= total:
+            return np.arange(total)
         return np.argpartition(self.birthes, -n)[-n:]
-    
+
     def find_top_n(self, n: int, find_best: bool = True) -> np.ndarray:
         """查找最佳/最差的 n 个个体（O(n) 使用 argpartition）"""
         if n == 0:
             return np.array([], dtype=int)
-        
+        total = len(self.fitnesses)
+        if total == 0:
+            return np.array([], dtype=int)
+        n = min(n, total)
+        # kth 必须在 [-total, total-1] 范围内;n == total 时正向 argpartition
+        # 会因 kth==total 越界而崩溃,故统一短路。
+        if n >= total:
+            return np.arange(total)
+
         if self.greater_is_better:
             if find_best:
                 return np.argpartition(self.fitnesses, -n)[-n:]
