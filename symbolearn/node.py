@@ -179,7 +179,7 @@ contains only NaN the output pixel is also NaN.
 #   5 = nanrange   (nanmax - nanmin)
 
 
-@njit(fastmath=True)
+@njit(fastmath=True, cache=True)
 def _window_agg_single(X, valid_mask, window_size, stat_code, feat_idx):
     """
     Sliding rectangular-window aggregation for a **single** feature channel,
@@ -288,7 +288,7 @@ def _window_agg_single(X, valid_mask, window_size, stat_code, feat_idx):
     return result
 
 
-@njit(fastmath=True)
+@njit(fastmath=True, cache=True)
 def _window_agg_all(X, valid_mask, window_size, stat_code):
     """
     Sliding rectangular-window aggregation across **all** feature channels,
@@ -383,6 +383,186 @@ def _window_agg_all(X, valid_mask, window_size, stat_code):
                         if buf[k] > mx:
                             mx = buf[k]
                     result[i, j, f] = mx - mn
+
+    return result
+
+
+def _spatial_data_mask(X, valid_mask=None):
+    """Return the NaN-free spatial mask, scanning only requested rows.
+
+    During training, hyperspectral labels are usually very sparse.  Building
+    ``~np.any(np.isnan(X), axis=-1)`` would scan the entire cube for every
+    candidate expression.  When a label/ROI mask is available, checking only
+    those rows is equivalent and reduces the work from ``H * W * C`` to
+    ``n_valid * C``.
+    """
+    if X.ndim != 3:
+        return None
+
+    spatial_shape = X.shape[:2]
+    if valid_mask is None:
+        return np.ascontiguousarray(~np.any(np.isnan(X), axis=-1))
+
+    if valid_mask.shape != spatial_shape:
+        raise ValueError(
+            f"valid_mask.shape {valid_mask.shape} does not match "
+            f"the spatial dimensions of X {spatial_shape}."
+        )
+
+    valid_mask = np.ascontiguousarray(valid_mask, dtype=bool)
+    data_mask = np.zeros(spatial_shape, dtype=bool)
+    if np.any(valid_mask):
+        data_mask[valid_mask] = ~np.any(np.isnan(X[valid_mask]), axis=-1)
+    return data_mask
+
+
+@njit(fastmath=True, cache=True)
+def _window_agg_single_masked(
+    X, flat_indices, window_size, stat_code, feat_idx
+):
+    """Compact counterpart of ``_window_agg_single`` for sparse masks."""
+    H, W, _ = X.shape
+    result = np.full(flat_indices.size, np.nan, dtype=np.float64)
+    max_win = (2 * window_size + 1) ** 2
+    buf = np.empty(max_win, dtype=np.float64)
+
+    for point_idx in range(flat_indices.size):
+        flat_idx = flat_indices[point_idx]
+        i = flat_idx // W
+        j = flat_idx - i * W
+        r_lo = max(0, i - window_size)
+        r_hi = min(H - 1, i + window_size)
+        c_lo = max(0, j - window_size)
+        c_hi = min(W - 1, j + window_size)
+
+        count = 0
+        for r in range(r_lo, r_hi + 1):
+            for c in range(c_lo, c_hi + 1):
+                value = X[r, c, feat_idx]
+                if not np.isnan(value):
+                    buf[count] = value
+                    count += 1
+
+        if count == 0:
+            continue
+        if stat_code == 0 or stat_code == 3:
+            total = 0.0
+            for k in range(count):
+                total += buf[k]
+            result[point_idx] = total / count if stat_code == 0 else total
+        elif stat_code == 1:
+            value = -np.inf
+            for k in range(count):
+                if buf[k] > value:
+                    value = buf[k]
+            result[point_idx] = value
+        elif stat_code == 2:
+            value = np.inf
+            for k in range(count):
+                if buf[k] < value:
+                    value = buf[k]
+            result[point_idx] = value
+        elif stat_code == 4:
+            for a in range(1, count):
+                key = buf[a]
+                b = a - 1
+                while b >= 0 and buf[b] > key:
+                    buf[b + 1] = buf[b]
+                    b -= 1
+                buf[b + 1] = key
+            mid = count // 2
+            result[point_idx] = (
+                buf[mid] if count % 2 == 1
+                else (buf[mid - 1] + buf[mid]) / 2.0
+            )
+        elif stat_code == 5:
+            minimum = np.inf
+            maximum = -np.inf
+            for k in range(count):
+                if buf[k] < minimum:
+                    minimum = buf[k]
+                if buf[k] > maximum:
+                    maximum = buf[k]
+            result[point_idx] = maximum - minimum
+
+    return result
+
+
+@njit(fastmath=True, cache=True)
+def _window_agg_range_masked(
+    X, flat_indices, window_size, stat_code, feat_start, feat_end
+):
+    """Aggregate a contiguous feature range directly into compact rows."""
+    H, W, _ = X.shape
+    n_features = feat_end - feat_start
+    result = np.full(
+        (flat_indices.size, n_features), np.nan, dtype=np.float64
+    )
+    max_win = (2 * window_size + 1) ** 2
+    buf = np.empty(max_win, dtype=np.float64)
+
+    for point_idx in range(flat_indices.size):
+        flat_idx = flat_indices[point_idx]
+        i = flat_idx // W
+        j = flat_idx - i * W
+        r_lo = max(0, i - window_size)
+        r_hi = min(H - 1, i + window_size)
+        c_lo = max(0, j - window_size)
+        c_hi = min(W - 1, j + window_size)
+
+        for output_feature in range(n_features):
+            feature = feat_start + output_feature
+            count = 0
+            for r in range(r_lo, r_hi + 1):
+                for c in range(c_lo, c_hi + 1):
+                    value = X[r, c, feature]
+                    if not np.isnan(value):
+                        buf[count] = value
+                        count += 1
+
+            if count == 0:
+                continue
+            if stat_code == 0 or stat_code == 3:
+                total = 0.0
+                for k in range(count):
+                    total += buf[k]
+                result[point_idx, output_feature] = (
+                    total / count if stat_code == 0 else total
+                )
+            elif stat_code == 1:
+                value = -np.inf
+                for k in range(count):
+                    if buf[k] > value:
+                        value = buf[k]
+                result[point_idx, output_feature] = value
+            elif stat_code == 2:
+                value = np.inf
+                for k in range(count):
+                    if buf[k] < value:
+                        value = buf[k]
+                result[point_idx, output_feature] = value
+            elif stat_code == 4:
+                for a in range(1, count):
+                    key = buf[a]
+                    b = a - 1
+                    while b >= 0 and buf[b] > key:
+                        buf[b + 1] = buf[b]
+                        b -= 1
+                    buf[b + 1] = key
+                mid = count // 2
+                result[point_idx, output_feature] = (
+                    buf[mid] if count % 2 == 1
+                    else (buf[mid - 1] + buf[mid]) / 2.0
+                )
+            elif stat_code == 5:
+                minimum = np.inf
+                maximum = -np.inf
+                for k in range(count):
+                    if buf[k] < minimum:
+                        minimum = buf[k]
+                    if buf[k] > maximum:
+                        maximum = buf[k]
+                result[point_idx, output_feature] = maximum - minimum
 
     return result
 
@@ -676,6 +856,8 @@ class DynamicAggregation(NodeContent):
         self,
         X: np.ndarray,
         valid_mask: Optional[np.ndarray] = None,
+        data_mask: Optional[np.ndarray] = None,
+        flat_indices: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
         Execute the aggregation pipeline on X.
@@ -745,18 +927,29 @@ class DynamicAggregation(NodeContent):
         # are excluded even when no valid_mask is supplied.
         # ------------------------------------------------------------------
         if input_is_3d:
-            data_mask = ~np.any(np.isnan(X), axis=-1)   # (H, W), bool
+            H, W = X.shape[:2]
             if valid_mask is not None:
-                H, W = X.shape[:2]
                 if valid_mask.shape != (H, W):
                     raise ValueError(
                         f"valid_mask.shape {valid_mask.shape} does not match "
                         f"the spatial dimensions of X ({H}, {W})."
                     )
                 valid_mask  = np.ascontiguousarray(valid_mask, dtype=bool)
-                kernel_mask = valid_mask & data_mask     # labelled AND non-NaN
+
+            if data_mask is None:
+                data_mask = _spatial_data_mask(X, valid_mask)
             else:
-                kernel_mask = data_mask                  # all non-NaN pixels
+                if data_mask.shape != (H, W):
+                    raise ValueError(
+                        f"data_mask.shape {data_mask.shape} does not match "
+                        f"the spatial dimensions of X ({H}, {W})."
+                    )
+                data_mask = np.ascontiguousarray(data_mask, dtype=bool)
+
+            kernel_mask = (
+                data_mask if valid_mask is None or valid_mask is data_mask
+                else valid_mask & data_mask
+            )
         else:
             # 2-D path: kernel_mask is unused; valid_mask is silently ignored.
             kernel_mask = None
@@ -775,38 +968,58 @@ class DynamicAggregation(NodeContent):
                     f"got shape {current.shape}."
                 )
 
-            # Optionally restrict to the spectral slice before the spatial
-            # pass to avoid aggregating bands that will be discarded.
-            if self._spectral_active:
-                spatial_input  = np.ascontiguousarray(
-                    current[:, :, self.v_start: self.v_end + 1],
-                    dtype=np.float64,
-                )
-                already_sliced = True
-            else:
-                spatial_input = np.ascontiguousarray(current, dtype=np.float64)
+            compact_input = current
+            if (current.dtype not in (np.dtype(np.float32), np.dtype(np.float64))
+                    or not current.flags.c_contiguous):
+                compact_input = np.ascontiguousarray(current, dtype=np.float64)
+
+            # Sparse training masks should produce compact output directly.
+            # This avoids allocating an H x W x bands float64 cube only to
+            # immediately discard almost all rows.
+            if valid_mask is not None:
+                if flat_indices is None:
+                    flat_indices = np.flatnonzero(kernel_mask).astype(np.int64)
+                else:
+                    flat_indices = np.asarray(flat_indices, dtype=np.int64)
 
             if self.target_feature is not None:
-                # Single-channel mode → Numba returns (H, W).
-                current = _window_agg_single(
-                    spatial_input,
-                    kernel_mask,
-                    self.window_size,
-                    self.stat_code_spatial,
-                    self.target_feature,
-                )
-                # Flatten if the caller supplied valid_mask; otherwise keep (H, W).
                 if valid_mask is not None:
-                    return current[kernel_mask]   # (n_valid,)
-                return current                    # (H, W)
-            else:
-                # All-channels mode → Numba returns (H, W, n_bands_or_C).
-                current = _window_agg_all(
-                    spatial_input,
-                    kernel_mask,
-                    self.window_size,
-                    self.stat_code_spatial,
+                    return _window_agg_single_masked(
+                        compact_input, flat_indices, self.window_size,
+                        self.stat_code_spatial, self.target_feature,
+                    )
+                spatial_input = np.ascontiguousarray(current, dtype=np.float64)
+                return _window_agg_single(
+                    spatial_input, kernel_mask, self.window_size,
+                    self.stat_code_spatial, self.target_feature,
                 )
+            else:
+                if valid_mask is not None:
+                    feature_start = self.v_start if self._spectral_active else 0
+                    feature_end = (
+                        self.v_end + 1 if self._spectral_active
+                        else current.shape[-1]
+                    )
+                    current = _window_agg_range_masked(
+                        compact_input, flat_indices, self.window_size,
+                        self.stat_code_spatial, feature_start, feature_end,
+                    )
+                    already_sliced = self._spectral_active
+                else:
+                    if self._spectral_active:
+                        spatial_input = np.ascontiguousarray(
+                            current[:, :, self.v_start: self.v_end + 1],
+                            dtype=np.float64,
+                        )
+                        already_sliced = True
+                    else:
+                        spatial_input = np.ascontiguousarray(
+                            current, dtype=np.float64
+                        )
+                    current = _window_agg_all(
+                        spatial_input, kernel_mask, self.window_size,
+                        self.stat_code_spatial,
+                    )
 
         # ==================================================================
         # Step 2 — Spectral aggregation (last-axis reduction)
@@ -829,7 +1042,7 @@ class DynamicAggregation(NodeContent):
             #       rather than the sparse (H, W, n_bands) cube, which is both
             #       faster and avoids allocating a full (H, W) intermediate.
             # After indexing, band_data is 2-D: (n_valid, n_bands).
-            if kernel_mask is not None:
+            if kernel_mask is not None and current.ndim == 3:
                 band_data = band_data[kernel_mask]   # (n_valid, n_bands)
 
             # Optional finite-difference derivative along the band axis.
@@ -867,7 +1080,7 @@ class DynamicAggregation(NodeContent):
         #   (a) Spatial-only (no target_feature) → current is (H, W, C).
         #   (b) Identity (both inactive)         → current is the original X.
         # In both cases the shape has spatial axes as the leading dimensions.
-        if valid_mask is not None:
+        if valid_mask is not None and current.ndim >= 3:
             # Flatten: (H, W, C) → (n_valid, C)  or  (H, W) → (n_valid,)
             return current[kernel_mask]   # (n_valid, C) or (n_valid,)
         return current
@@ -1317,7 +1530,7 @@ def _softplus(x: np.ndarray) -> np.ndarray:
 
 # Softmax core implementation (handles 2D arrays only)
 # Optimized for float32, also compatible with float64
-@njit(fastmath=True)
+@njit(fastmath=True, cache=True)
 def _softmax_2d_impl(x):
     rows, cols = x.shape
     result = np.empty_like(x)

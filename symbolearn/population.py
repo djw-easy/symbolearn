@@ -512,7 +512,8 @@ class Population:
 
     def init_population(self, X: np.array, y: np.array, 
                         seed: int | np.random.RandomState, 
-                        sample_weight: Optional[np.ndarray] = None) -> None:
+                        sample_weight: Optional[np.ndarray] = None,
+                        data_mask: Optional[np.ndarray] = None) -> None:
         """初始化种群。"""
         self.individuals = []
         random_state = check_random_state(seed)
@@ -527,7 +528,8 @@ class Population:
             else:
                 new_individual = self.generator.generate_random_expr()
             raw_fitness_ = new_individual.fitness(
-                X_batch, y_batch, sample_weight=sample_weight_batch
+                X_batch, y_batch, sample_weight=sample_weight_batch,
+                data_mask=None if self.batching else data_mask,
             )
             self.individuals.append(new_individual)
             self.complexitys[i] = new_individual.complexity
@@ -685,7 +687,8 @@ class Population:
 
     def evolve(self, X, y, seed, ncycles, crossover_probability, 
                tournament_selection_n, tournament_selection_p, 
-               sample_weight: Optional[np.ndarray] = None) -> 'Population':
+               sample_weight: Optional[np.ndarray] = None,
+               data_mask: Optional[np.ndarray] = None) -> 'Population':
         """单个岛屿内部的稳态进化过程。"""
         max_temp, min_temp = (1.0, 0.0) if self.annealing else (1.0, 1.0)
         all_temperatures = np.linspace(max_temp, min_temp, ncycles) if ncycles > 1 else [max_temp]
@@ -720,10 +723,12 @@ class Population:
                         
                         # 计算适应度
                         offspring1_fitness = offspring1.fitness(
-                            X_batch, y_batch, sample_weight=sample_weight_batch
+                            X_batch, y_batch, sample_weight=sample_weight_batch,
+                            data_mask=None if self.batching else data_mask,
                         )
                         offspring2_fitness = offspring2.fitness(
-                            X_batch, y_batch, sample_weight=sample_weight_batch
+                            X_batch, y_batch, sample_weight=sample_weight_batch,
+                            data_mask=None if self.batching else data_mask,
                         )
                         
                         # 记录日志
@@ -766,7 +771,8 @@ class Population:
                     # 2. 执行突变
                     offspring, mutation_accepted, offspring_fitness, mutation_name, accept_prob = self._mutation(
                         X_batch, y_batch, parent1, parent1_index, temperature, random_state, 
-                        sample_weight=sample_weight_batch
+                        sample_weight=sample_weight_batch,
+                        data_mask=None if self.batching else data_mask,
                     )
                     
                     # 3. 记录日志（无论是否接受）
@@ -801,14 +807,14 @@ class Population:
             self._optimize_constants_in_population(
                 X, y, random_state, self.optimizer_algorithm, 
                 self.optimizer_probability, self.optimizer_nrestarts, 
-                self.optimizer_iterations, sample_weight
+                self.optimizer_iterations, sample_weight, data_mask
             )
             self._update_constants_in_population(self.topn, random_state)
         
         if self.generator.use_aggregation and self.should_optimize_aggregations:
             self._optimize_aggregations_in_population(
                 X, y, random_state, self.optimizer_probability, 
-                self.optimizer_iterations, sample_weight
+                self.optimizer_iterations, sample_weight, data_mask
             )
         
         # 应用简化和常量突变
@@ -820,7 +826,8 @@ class Population:
                 )
                 if simplify_accepted:
                     raw_fitness = simplified_ind.fitness(
-                        X_batch, y_batch, sample_weight=sample_weight_batch
+                        X_batch, y_batch, sample_weight=sample_weight_batch,
+                        data_mask=None if self.batching else data_mask,
                     )
                 else:
                     raw_fitness = None
@@ -855,7 +862,8 @@ class Population:
     
     def _mutation(self, X: np.ndarray, y: np.ndarray, parent: Expression | ExpressionSet, 
                   parent_idx: int, temperature: float, random_state: np.random.RandomState, 
-                  sample_weight: Optional[np.ndarray] = None):
+                  sample_weight: Optional[np.ndarray] = None,
+                  data_mask: Optional[np.ndarray] = None):
         """执行突变操作"""
         # 1. 记录父代适应度
         parent_fitness = self.fitnesses[parent_idx]
@@ -877,7 +885,7 @@ class Population:
 
         # 4. Evaluate the offspring's fitness
         offspring_fitness = offspring.fitness(
-            X, y, sample_weight=sample_weight
+            X, y, sample_weight=sample_weight, data_mask=data_mask
         )
         
         # 5. Calculate cost change (delta) for acceptance probability
@@ -916,7 +924,8 @@ class Population:
 
     def _optimize_constants_in_population(self, X, y, random_state, optimizer_algorithm, 
                                           optimize_probability, optimizer_nrestarts, optimizer_iterations, 
-                                          sample_weight: Optional[np.ndarray] = None):
+                                          sample_weight: Optional[np.ndarray] = None,
+                                          data_mask: Optional[np.ndarray] = None):
         """Optimizes the constants in the population."""
         for i in range(len(self.individuals)):
             if random_state.uniform() < optimize_probability:
@@ -926,7 +935,9 @@ class Population:
                 )
                 offspring, optimize_accepted, raw_fitness = self.gpoperator.optimize_constants(
                     parent, X_batch, y_batch, sample_weight_batch, 
-                    optimizer_algorithm, optimizer_nrestarts, optimizer_iterations
+                    optimizer_algorithm, optimizer_nrestarts,
+                    optimizer_iterations,
+                    data_mask=None if self.batching else data_mask,
                 )
                 
                 # 记录常量优化日志
@@ -1008,7 +1019,8 @@ class Population:
 
     def _optimize_aggregations_in_population(self, X, y, random_state, 
                                              optimize_probability, optimizer_iterations, 
-                                             sample_weight: Optional[np.ndarray] = None):
+                                             sample_weight: Optional[np.ndarray] = None,
+                                             data_mask: Optional[np.ndarray] = None):
         """Optimizes the aggregations in the population."""
         for i in range(len(self.individuals)):
             if random_state.uniform() < optimize_probability:
@@ -1017,7 +1029,9 @@ class Population:
                     X, y, random_state, sample_weight
                 )
                 offspring, optimize_accepted, raw_fitness = self.gpoperator.optimize_aggregations(
-                    parent, X_batch, y_batch, sample_weight_batch, optimizer_iterations
+                    parent, X_batch, y_batch, sample_weight_batch,
+                    optimizer_iterations,
+                    data_mask=None if self.batching else data_mask,
                 )
                 
                 # 记录聚合优化日志

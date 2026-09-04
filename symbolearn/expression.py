@@ -6,7 +6,10 @@ from typing import Union, Optional, List, Callable
 
 
 from symbolearn.fitness import Fitness
-from symbolearn.node import Operator, Constant, Variable, DynamicAggregation, ZScore
+from symbolearn.node import (
+    Operator, Constant, Variable, DynamicAggregation, ZScore,
+    _spatial_data_mask,
+)
 from symbolearn.tree import clone_tree, PreOrderIter, PostOrderIter, SymbolicNode
 
 
@@ -128,6 +131,7 @@ class Expression(object):
         
         # 预分析表达式结构
         self._constant_indices = None
+        self._aggregation_count = None
         
         self._should_calc_complexity = False
         # 检查操作符复杂度
@@ -240,11 +244,12 @@ class Expression(object):
     
     def _count_scalar_aggregations(self) -> int:
         """Recursively counts the number of scalar aggregations in the tree."""
-        count = 0
-        for node in PreOrderIter(self.tree):
-            if isinstance(node.node_content, DynamicAggregation):
-                count += 1
-        return count
+        if self._aggregation_count is None:
+            self._aggregation_count = sum(
+                isinstance(node.node_content, DynamicAggregation)
+                for node in PreOrderIter(self.tree)
+            )
+        return self._aggregation_count
 
     def _has_constants(self) -> bool:
         """Check if the tree contains any constants."""
@@ -262,10 +267,7 @@ class Expression(object):
 
     def _has_aggregations(self) -> bool:
         """Check if the tree contains any aggregations."""
-        for node in PostOrderIter(self.tree):
-            if isinstance(node.node_content, DynamicAggregation):
-                return True
-        return False
+        return self._count_scalar_aggregations() > 0
 
     def _has_binary_operator(self) -> bool:
         """Checks if the tree contains any binary operators."""
@@ -669,7 +671,9 @@ class Expression(object):
 
     def _execute_postorder(self, X: np.ndarray, valid_mask: Optional[np.ndarray] = None, 
                            constants: Optional[np.ndarray] = None,
-                           out_func_override = _UNSET) -> np.ndarray:
+                           out_func_override = _UNSET,
+                           data_mask: Optional[np.ndarray] = None,
+                           flat_indices: Optional[np.ndarray] = None) -> np.ndarray:
         """
         Execute the expression using post-order traversal.
 
@@ -691,6 +695,16 @@ class Expression(object):
             Expression output for valid samples only.
         """
         stack = []
+        execution_mask = valid_mask
+        resolved_data_mask = data_mask
+        has_aggregations = X.ndim == 3 and self._has_aggregations()
+        if has_aggregations and valid_mask is not None:
+            if resolved_data_mask is None:
+                resolved_data_mask = _spatial_data_mask(X, valid_mask)
+            execution_mask = np.ascontiguousarray(valid_mask, dtype=bool)
+            execution_mask = execution_mask & resolved_data_mask
+            if flat_indices is None:
+                flat_indices = np.flatnonzero(execution_mask).astype(np.int64)
         
         constant_counter = 0
         for node in PostOrderIter(self.tree):
@@ -702,8 +716,19 @@ class Expression(object):
                     else:
                         result = node.node_content.value
                     constant_counter += 1
-                elif isinstance(node.node_content, (Variable, DynamicAggregation)):
-                    result = node.node_content(X, valid_mask=valid_mask)
+                elif isinstance(node.node_content, Variable):
+                    result = node.node_content(X, valid_mask=execution_mask)
+                elif isinstance(node.node_content, DynamicAggregation):
+                    if X.ndim == 3 and resolved_data_mask is None:
+                        resolved_data_mask = _spatial_data_mask(X, valid_mask)
+                    result = node.node_content(
+                        X, valid_mask=execution_mask,
+                        data_mask=(
+                            execution_mask if execution_mask is not None
+                            else resolved_data_mask
+                        ),
+                        flat_indices=flat_indices,
+                    )
                 else:
                     result = node.node_content(X)
                 stack.append(result)
@@ -719,7 +744,7 @@ class Expression(object):
         # Handle scalar results
         if np.isscalar(result) or result.ndim == 0:
             result = np.full(X.shape[:-1], result)
-            result = result[valid_mask] if valid_mask is not None else result
+            result = result[execution_mask] if execution_mask is not None else result
         
         # Apply output function
         if out_func_override is _UNSET:
@@ -733,7 +758,8 @@ class Expression(object):
 
     def execute(self, X: np.ndarray, valid_mask: Optional[np.ndarray] = None, 
                 constants: Optional[np.ndarray] = None,
-                out_func_override = _UNSET) -> np.ndarray:
+                out_func_override = _UNSET,
+                data_mask: Optional[np.ndarray] = None) -> np.ndarray:
         """
         Execute the expression on input data.
 
@@ -758,16 +784,22 @@ class Expression(object):
         ndarray
             Expression output.
         """
-        if constants is None and valid_mask is None:
+        if (constants is None and valid_mask is None and data_mask is None
+                and not (X.ndim == 3 and self._has_aggregations())):
             result = self._execute_tree(X, out_func_override=out_func_override)
         else:
-            result = self._execute_postorder(X, valid_mask, constants, out_func_override=out_func_override)
+            result = self._execute_postorder(
+                X, valid_mask, constants,
+                out_func_override=out_func_override,
+                data_mask=data_mask,
+            )
         
         return result
 
     def fitness(self, X: np.ndarray, y: np.ndarray, 
                sample_weight: Optional[np.ndarray] = None,
-               constants: Optional[np.ndarray] = None) -> np.float32:
+               constants: Optional[np.ndarray] = None,
+               data_mask: Optional[np.ndarray] = None) -> np.float32:
         """
         Evaluate the fitness of the expression on given data.
 
@@ -787,8 +819,10 @@ class Expression(object):
         np.float32
             Fitness value (higher is better if metric.greater_is_better).
         """
-        raw_fitness = self.metric(self, X, y, constants=constants,
-                                  sample_weight=sample_weight)
+        raw_fitness = self.metric(
+            self, X, y, constants=constants,
+            sample_weight=sample_weight, data_mask=data_mask,
+        )
 
         return np.float32(raw_fitness)
     
@@ -1303,11 +1337,19 @@ class ExpressionSet(object):
         # Using float dtype to accommodate potential continuous values
         output_buffer = np.empty((n_samples, n_valid), dtype=float)
         
+        # Compute the expensive cube-validity mask once for the whole set.
+        has_aggregations = X.ndim == 3 and any(
+            self.expressions[i]._has_aggregations() for i in valid_indices
+        )
+        data_mask = _spatial_data_mask(X) if has_aggregations else None
+
         # 5. Execute each expression and fill the buffer column-wise
         for col_idx, expr_idx in enumerate(valid_indices):
             expr = self.expressions[expr_idx]
             # Execute and flatten result directly into the buffer column
-            output_buffer[:, col_idx] = expr._execute_tree(X).ravel()
+            output_buffer[:, col_idx] = expr.execute(
+                X, data_mask=data_mask
+            ).ravel()
         
         # 6. Apply output transformation function if defined
         if out_func_override is _UNSET:
@@ -1325,7 +1367,8 @@ class ExpressionSet(object):
 
     def _execute_postorder(self, X: np.ndarray, valid_mask: Optional[np.ndarray] = None, 
                            constants: Optional[np.ndarray] = None,
-                           out_func_override = _UNSET) -> np.ndarray:
+                           out_func_override = _UNSET,
+                           data_mask: Optional[np.ndarray] = None) -> np.ndarray:
         """
         Execute expression set using post-order traversal (supports constant arrays).
         Optimized for memory efficiency and 3D input support.
@@ -1333,11 +1376,31 @@ class ExpressionSet(object):
         Note: If valid_mask is provided, the output will be 2D (n_valid_samples, n_expressions),
         regardless of whether X is 3D.
         """
+        # Resolve one shared cube-validity mask for all expressions.  Combining
+        # it with the caller mask also keeps Variable and DynamicAggregation
+        # terminals aligned when a labelled pixel itself contains NaNs.
+        valid_indices = [i for i, expr in enumerate(self.expressions) if expr is not None]
+        has_aggregations = X.ndim == 3 and any(
+            self.expressions[i]._has_aggregations() for i in valid_indices
+        )
+        execution_mask = valid_mask
+        if has_aggregations:
+            if data_mask is None:
+                data_mask = _spatial_data_mask(X, valid_mask)
+            if valid_mask is not None:
+                execution_mask = (
+                    np.ascontiguousarray(valid_mask, dtype=bool) & data_mask
+                )
+        flat_indices = (
+            np.flatnonzero(execution_mask).astype(np.int64)
+            if has_aggregations and execution_mask is not None else None
+        )
+
         # 1. Determine input shape and number of samples
         # Priority: valid_mask > X.ndim
-        if valid_mask is not None:
+        if execution_mask is not None:
             # If mask is provided, output is a list of valid points (2D)
-            n_samples = int(np.sum(valid_mask))
+            n_samples = int(np.sum(execution_mask))
             spatial_shape = None
         elif X.ndim == 3:
             # No mask, 3D input -> treat as spatial grid
@@ -1352,7 +1415,6 @@ class ExpressionSet(object):
         const_info = self._build_constant_info()
         
         # 3. Identify valid expressions (filter out None)
-        valid_indices = [i for i, expr in enumerate(self.expressions) if expr is not None]
         n_valid = len(valid_indices)
         
         # 4. Handle empty case
@@ -1376,10 +1438,16 @@ class ExpressionSet(object):
             # Determine execution strategy
             if const_range is not None and constants is not None:
                 expr_constants = constants[const_range[0]:const_range[1]]
-                result = expr._execute_postorder(X, valid_mask, expr_constants)
+                result = expr._execute_postorder(
+                    X, execution_mask, expr_constants, data_mask=data_mask,
+                    flat_indices=flat_indices,
+                )
             else:
                 # Even if no constants, use postorder to support mask
-                result = expr._execute_postorder(X, valid_mask, None)
+                result = expr._execute_postorder(
+                    X, execution_mask, None, data_mask=data_mask,
+                    flat_indices=flat_indices,
+                )
             
             # Flatten and assign to buffer column
             # If masked, result is already 1D (n_valid_samples).
@@ -1403,21 +1471,29 @@ class ExpressionSet(object):
 
     def execute(self, X: np.ndarray, valid_mask: Optional[np.ndarray] = None, 
                 constants: Optional[np.ndarray] = None,
-                out_func_override = _UNSET) -> np.ndarray:
+                out_func_override = _UNSET,
+                data_mask: Optional[np.ndarray] = None) -> np.ndarray:
         """Execute the expression according to X."""
-        if constants is None and valid_mask is None:
+        if constants is None and valid_mask is None and data_mask is None:
             result = self._execute_tree(X, out_func_override=out_func_override)
         else:
-            result = self._execute_postorder(X, valid_mask, constants, out_func_override=out_func_override)
+            result = self._execute_postorder(
+                X, valid_mask, constants,
+                out_func_override=out_func_override,
+                data_mask=data_mask,
+            )
         
         return result
 
     def fitness(self, X: np.ndarray, y: np.ndarray,
                 sample_weight: Optional[np.ndarray] = None, 
-                constants: Optional[np.ndarray] = None) -> np.float32:
+                constants: Optional[np.ndarray] = None,
+                data_mask: Optional[np.ndarray] = None) -> np.float32:
         """Evaluate the raw fitness of the expressionset according to X, y."""
-        raw_fitness = self.metric(self, X, y, constants=constants,
-                                  sample_weight=sample_weight)
+        raw_fitness = self.metric(
+            self, X, y, constants=constants,
+            sample_weight=sample_weight, data_mask=data_mask,
+        )
         
         return np.float32(raw_fitness)
 

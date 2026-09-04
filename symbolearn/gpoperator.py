@@ -1491,7 +1491,8 @@ class ExpressionGP:
         self, parent: Expression, 
         X: np.ndarray, y: np.ndarray, 
         sample_weight: Optional[np.ndarray] = None,
-        optimizer_algorithm='L-BFGS-B', optimizer_nrestarts=3, optimizer_iterations=10
+        optimizer_algorithm='L-BFGS-B', optimizer_nrestarts=3,
+        optimizer_iterations=10, data_mask: Optional[np.ndarray] = None,
     ):
         """
         Optimize constant values in an expression using numerical optimization.
@@ -1540,7 +1541,10 @@ class ExpressionGP:
         def objective(constants_np: np.ndarray):
             # Compute loss using fast NumPy execution
             updated_parent = parent.update_constants(constants_np)
-            fitness = updated_parent.fitness(X, y, sample_weight, constants=constants_np)
+            fitness = updated_parent.fitness(
+                X, y, sample_weight, constants=constants_np,
+                data_mask=data_mask,
+            )
             loss = -fitness if updated_parent.metric.greater_is_better else fitness
             
             return loss
@@ -1587,7 +1591,8 @@ class ExpressionGP:
                               sample_weight: Optional[np.ndarray] = None,
                               optimizer_iterations=10, max_shift_ratio=0.1, 
                               early_exaggeration_iter=3, early_stopping_patience=4, 
-                              exaggeration_factor=2.5) -> Tuple[Optional['Expression'], bool]:
+                              exaggeration_factor=2.5,
+                              data_mask: Optional[np.ndarray] = None) -> Tuple[Optional['Expression'], bool]:
         """
         Optimize DynamicAggregation node parameters using local search (greedy hill climbing).
 
@@ -1659,7 +1664,9 @@ class ExpressionGP:
             })
         
         # Step 3: Compute initial fitness
-        best_fitness = new_expr.fitness(X, y)
+        best_fitness = new_expr.fitness(
+            X, y, sample_weight, data_mask=data_mask
+        )
         best_states = [s.copy() for s in initial_states]
         
         # Step 4: Define fast state application function
@@ -1702,7 +1709,9 @@ class ExpressionGP:
             for neighbor_states in neighbors:
                 apply_states(neighbor_states)
                 
-                neighbor_fitness = new_expr.fitness(X, y, sample_weight)
+                neighbor_fitness = new_expr.fitness(
+                    X, y, sample_weight, data_mask=data_mask
+                )
                 
                 # Check for improvement
                 is_better = (neighbor_fitness > current_fitness 
@@ -2468,7 +2477,8 @@ class ExpressionSetGP:
         self, parent: ExpressionSet, 
         X: np.ndarray, y: np.ndarray, 
         sample_weight: Optional[np.ndarray] = None, 
-        optimizer_algorithm='L-BFGS-B', optimizer_nrestarts=3, optimizer_iterations=10
+        optimizer_algorithm='L-BFGS-B', optimizer_nrestarts=3,
+        optimizer_iterations=10, data_mask: Optional[np.ndarray] = None,
     ) -> Tuple[Optional['ExpressionSet'], bool]:
         """
         Optimize constant values across all expressions in the set.
@@ -2517,7 +2527,10 @@ class ExpressionSetGP:
         def objective(constants):
             # Compute loss using fast NumPy execution
             updated_parent = parent.update_constants(constants)
-            fitness = updated_parent.fitness(X, y, sample_weight, constants=constants)
+            fitness = updated_parent.fitness(
+                X, y, sample_weight, constants=constants,
+                data_mask=data_mask,
+            )
             loss = -fitness if updated_parent.metric.greater_is_better else fitness
             
             return loss
@@ -2566,7 +2579,8 @@ class ExpressionSetGP:
         X: np.ndarray, y: np.ndarray, 
         sample_weight: Optional[np.ndarray] = None, 
         optimizer_iterations=10, max_shift_ratio=0.1, 
-        early_exaggeration_iter=3, early_stopping_patience=4, exaggeration_factor=2.5
+        early_exaggeration_iter=3, early_stopping_patience=4,
+        exaggeration_factor=2.5, data_mask: Optional[np.ndarray] = None,
     ) -> Tuple[Optional['ExpressionSet'], bool]:
         """
         Optimize DynamicAggregation parameters across all expressions in the set.
@@ -2649,7 +2663,9 @@ class ExpressionSetGP:
             })
         
         # Compute initial fitness
-        best_fitness = new_expr_set.fitness(X, y)
+        best_fitness = new_expr_set.fitness(
+            X, y, sample_weight, data_mask=data_mask
+        )
         best_states = [s.copy() for s in initial_states]
         
         # Fast state application function (closure optimization)
@@ -2691,7 +2707,9 @@ class ExpressionSetGP:
             for neighbor_states in neighbors:
                 apply_states(neighbor_states)
                 
-                neighbor_fitness = new_expr_set.fitness(X, y, sample_weight)
+                neighbor_fitness = new_expr_set.fitness(
+                    X, y, sample_weight, data_mask=data_mask
+                )
                 
                 # Check for improvement
                 is_better = (neighbor_fitness > current_fitness 

@@ -31,7 +31,9 @@ from symbolearn.expression import Expression, ExpressionSet, _UNSET
 from symbolearn.tree_parser import load_expressions_from_csv
 from symbolearn.gpoperator import ExpressionGP, ExpressionSetGP
 from symbolearn.generator import ExprGenerator, ExprSetGenerator
-from symbolearn.node import Operator, _operator_map, op_name_alias, ZScore
+from symbolearn.node import (
+    Operator, _operator_map, op_name_alias, ZScore, _spatial_data_mask,
+)
 from symbolearn.utils import check_random_state, _idx_model_selection, poisson_sample
 
 # Minimum per-output standard deviation for z-score normalisation. Output
@@ -915,9 +917,12 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
         y,
         seed,
         sample_weight: Optional[np.ndarray] = None,
+        data_mask: Optional[np.ndarray] = None,
     ) -> Population:
         """Static wrapper used to initialise a single Population in parallel."""
-        return population.init_population(X, y, seed, sample_weight)
+        return population.init_population(
+            X, y, seed, sample_weight, data_mask=data_mask
+        )
 
     @staticmethod
     def _evolve_population(
@@ -930,11 +935,13 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
         tournament_selection_n,
         tournament_selection_p,
         sample_weight: Optional[np.ndarray] = None,
+        data_mask: Optional[np.ndarray] = None,
     ) -> Population:
         """Static wrapper used to evolve a single Population in parallel."""
         return population.evolve(
             X, y, seed, ncycles_per_iteration, crossover_probability,
             tournament_selection_n, tournament_selection_p, sample_weight,
+            data_mask=data_mask,
         )
 
     # ------------------------------------------------------------------
@@ -1308,6 +1315,9 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
         self
         """
         random_state = check_random_state(self.random_state)
+        data_mask = (
+            _spatial_data_mask(X, ~np.isnan(y)) if X.ndim == 3 else None
+        )
 
         # Validate warm-start preconditions
         if self.warm_start:
@@ -1377,7 +1387,10 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
                 )
 
             evolve_tasks = [
-                (self._populations[i], X, y, seeds[i], sample_weight)
+                (
+                    self._populations[i], X, y, seeds[i], sample_weight,
+                    data_mask,
+                )
                 for i in range(self.populations)
             ]
             self._populations = Parallel(n_jobs=self.n_jobs)(
@@ -1425,7 +1438,7 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
                     self._populations[i], X, y, seeds[i],
                     self.ncycles_per_iteration, self.crossover_probability,
                     self.tournament_selection_n, self.tournament_selection_p,
-                    sample_weight,
+                    sample_weight, data_mask,
                 )
                 for i in range(self.populations)
             ]

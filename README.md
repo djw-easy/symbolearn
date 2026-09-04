@@ -1,6 +1,6 @@
 # **Symbolic Discovery of Transparent Class-Specific Spectral Indices for Interpretable Land Cover Mapping**
 
-**Authors:** Junwu Dong, Tao Pei, Ci Song, Xi Wang, Yahui Qi, Dayu Cheng, Yanmin Jiang
+**Authors:** [Junwu Dong](https://orcid.org/0000-0003-4226-5042), [Tao Pei](https://orcid.org/0000-0002-5311-8761), [Ci Song](https://orcid.org/0000-0003-2146-6259), [Xi Wang](https://orcid.org/0000-0003-1859-9958), [Yahui Qi](https://orcid.org/0000-0002-7927-7605), [Dayu Cheng](https://orcid.org/0009-0006-5483-1274), and Yanmin Jiang
 
 ---
 
@@ -141,8 +141,18 @@ Email: *[djw@lreis.ac.cn](mailto:djw@lreis.ac.cn)*
 
 If you use this code in your research, please cite our paper:
 
-```
-TBD — bibtex entry will be added upon publication
+> Junwu Dong, Tao Pei, Ci Song, Xi Wang, Yahui Qi, Dayu Cheng, and Yanmin Jiang, "Symbolic Discovery of Explicit and Auditable Spectral Models for Land Cover Mapping," *IEEE Transactions on Geoscience and Remote Sensing*, 2026. doi: [10.1109/TGRS.2026.3731741](https://doi.org/10.1109/TGRS.2026.3731741)
+
+BibTeX:
+
+```bibtex
+@article{dong2026symbolic,
+  author  = {Junwu Dong and Tao Pei and Ci Song and Xi Wang and Yahui Qi and Dayu Cheng and Yanmin Jiang},
+  title   = {Symbolic Discovery of Explicit and Auditable Spectral Models for Land Cover Mapping},
+  journal = {IEEE Transactions on Geoscience and Remote Sensing},
+  year    = {2026},
+  doi     = {10.1109/TGRS.2026.3731741}
+}
 ```
 
 ---

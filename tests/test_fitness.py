@@ -5,7 +5,7 @@ import numpy as np
 from symbolearn.fitness import Fitness
 from symbolearn.expression import Expression
 from symbolearn.tree import SymbolicNode
-from symbolearn.node import add2, Constant, Variable
+from symbolearn.node import add2, Constant, Variable, DynamicAggregation
 from symbolearn.metrics.regression import mean_square_error
 
 tree = SymbolicNode(add2, children=[
@@ -103,3 +103,27 @@ def test_default_c():
 def test_c_stored():
     fn = Fitness(mean_square_error, greater_is_better=False, penalty='l2', C=0.1)
     assert fn.C == 0.1
+
+
+def test_tabular_sample_weight_is_forwarded():
+    fn = Fitness(mean_square_error, greater_is_better=False)
+    weighted_y = y.copy()
+    weighted_y[-1] = 9.0
+    sample_weight = np.array([1.0, 1.0, 1.0, 0.0])
+
+    assert np.isclose(fn(expr, X, weighted_y, sample_weight=sample_weight), 0.0)
+
+
+def test_spatial_fitness_excludes_labelled_rows_with_nan_features():
+    cube = np.arange(12, dtype=float).reshape(2, 2, 3)
+    cube[0, 1, 1] = np.nan
+    labels = np.array([[1.0, 2.0], [np.nan, np.nan]])
+    aggregation = DynamicAggregation(
+        v_start=0, v_end=2, stat_name_spectral='mean', n_variables=3,
+    )
+    spatial_expr = Expression(
+        SymbolicNode(aggregation),
+        metric=Fitness(mean_square_error, greater_is_better=False),
+    )
+
+    assert np.isclose(spatial_expr.fitness(cube, labels), 0.0)

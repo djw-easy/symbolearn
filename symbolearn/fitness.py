@@ -1,6 +1,8 @@
 import numpy as np
 from typing import Literal, Union, Optional, TYPE_CHECKING, Callable
 
+from symbolearn.node import _spatial_data_mask
+
 
 if TYPE_CHECKING:
     from symbolearn.expression import Expression, ExpressionSet
@@ -139,7 +141,8 @@ class Fitness(object):
     def __call__(self, expr: Union['Expression', 'ExpressionSet'],
                  X: np.ndarray, y: np.ndarray,
                  constants: Optional[np.ndarray] = None, 
-                 sample_weight: Optional[np.ndarray] = None):
+                 sample_weight: Optional[np.ndarray] = None,
+                 data_mask: Optional[np.ndarray] = None):
         """Execute the expression and calculate its fitness score.
 
         Parameters
@@ -163,17 +166,26 @@ class Fitness(object):
         # Determine data dimensionality
         is_3d = X.ndim == 3
         
-        # Create validity mask for execution (NaNs invalid in 3D, all valid in 2D)
-        exec_mask = (~np.isnan(y)) if is_3d else None
+        # Build the combined label/data mask once per candidate.  The sparse
+        # path only inspects labelled rows, rather than scanning the full cube
+        # once for every DynamicAggregation terminal.
+        if is_3d:
+            label_mask = ~np.isnan(y)
+            if data_mask is None:
+                data_mask = _spatial_data_mask(X, label_mask)
+            exec_mask = label_mask & data_mask
+        else:
+            exec_mask = None
         
         # Execute expression to get predictions
-        y_pred_valid = expr.execute(X, exec_mask, constants)
+        y_pred_valid = expr.execute(
+            X, exec_mask, constants, data_mask=data_mask
+        )
         
         # Flatten data and mask for loss calculation
         if is_3d:
-            y_flat = y.ravel()
-            loss_mask = (~np.isnan(y_flat)) if is_3d else np.ones_like(y_flat, dtype=bool)
-            y_valid = y_flat[loss_mask]
+            loss_mask = exec_mask.ravel()
+            y_valid = y.ravel()[loss_mask]
         else:
             y_valid = y
         
@@ -186,6 +198,8 @@ class Fitness(object):
                     sample_weight_valid = w_flat
                 else:
                     sample_weight_valid = w_flat[loss_mask]
+            else:
+                sample_weight_valid = sample_weight
         else:
             sample_weight_valid = None
         

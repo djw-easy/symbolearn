@@ -189,3 +189,45 @@ def test_spatial_no_mask():
     agg = DynamicAggregation(stat_name_spatial='mean', target_feature=1, window_size=3, n_variables=5)
     out = agg(X_3d)
     assert out is not None and out.size > 0
+
+
+@pytest.mark.parametrize("stat_name", [
+    'mean', 'max', 'min', 'sum', 'median', 'range',
+])
+def test_sparse_spatial_spectral_matches_full_result(stat_name):
+    rng = np.random.RandomState(7)
+    X_3d = rng.normal(size=(9, 8, 6)).astype(np.float32)
+    mask = rng.random_sample((9, 8)) < 0.3
+    mask[0, 0] = False
+    X_3d[0, 0, 2] = np.nan
+    agg = DynamicAggregation(
+        v_start=1, v_end=4, stat_name_spectral='mean',
+        stat_name_spatial=stat_name, window_size=2, n_variables=6,
+    )
+
+    expected = agg(X_3d)[mask]
+    actual = agg(X_3d, mask)
+
+    assert actual.shape == expected.shape
+    assert np.allclose(actual, expected, equal_nan=True)
+
+
+@pytest.mark.parametrize("stat_name", [
+    'mean', 'max', 'min', 'sum', 'median', 'range',
+])
+def test_sparse_single_channel_spatial_matches_full_result(stat_name):
+    rng = np.random.RandomState(11)
+    X_3d = rng.normal(size=(8, 7, 5)).astype(np.float32)
+    mask = rng.random_sample((8, 7)) < 0.4
+    mask[0, 0] = False
+    X_3d[0, 0, 2] = np.nan
+    agg = DynamicAggregation(
+        stat_name_spatial=stat_name, target_feature=2,
+        window_size=1, n_variables=5,
+    )
+
+    expected = agg(X_3d)[mask]
+    actual = agg(X_3d, mask)
+
+    assert actual.shape == expected.shape
+    assert np.allclose(actual, expected, equal_nan=True)
